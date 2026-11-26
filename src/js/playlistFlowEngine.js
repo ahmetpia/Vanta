@@ -41,7 +41,9 @@ export function getTrackIdentityKey(track) {
 }
 
 function normalizePathForCompare(rawPath) {
-  return String(rawPath || '').trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  let clean = String(rawPath || '').trim().replace(/\\/g, '/').toLowerCase();
+  while (clean.endsWith('/')) clean = clean.slice(0, -1);
+  return clean;
 }
 
 function extractParentFolderName(filePath) {

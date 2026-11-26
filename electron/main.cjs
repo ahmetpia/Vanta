@@ -1078,7 +1078,10 @@ function registerIpcHandlers() {
     }
 
     const rawName = String(payload?.playlistName || 'VANTA_Flow').trim();
-    const safeSlug = rawName.replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'VANTA_Flow';
+    let safeSlug = rawName.replace(/[^a-zA-Z0-9._-]+/g, '_');
+    while (safeSlug.startsWith('_')) safeSlug = safeSlug.slice(1);
+    while (safeSlug.endsWith('_')) safeSlug = safeSlug.slice(0, -1);
+    if (!safeSlug) safeSlug = 'VANTA_Flow';
     const exportsDir = path.join(VAULT_ROOT, 'Exports');
     fs.mkdirSync(exportsDir, { recursive: true });
 

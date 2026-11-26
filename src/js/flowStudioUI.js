@@ -329,8 +329,11 @@ export class FlowStudioController {
   _syncNextSeq() {
     let maxNum = 0;
     for (const id of Object.keys(this.nodes)) {
-      const m = /(\d+)$/.exec(id);
-      if (m) maxNum = Math.max(maxNum, Number(m[1]));
+      let i = id.length;
+      while (i > 0 && id.charCodeAt(i - 1) >= 48 && id.charCodeAt(i - 1) <= 57) {
+        i--;
+      }
+      if (i < id.length) maxNum = Math.max(maxNum, Number(id.slice(i)));
     }
     this.nextSeq = maxNum + 1;
   }
