@@ -1219,10 +1219,12 @@ function registerIpcHandlers() {
         if (!safeVideoPath) return { ok: false, error: 'Video path rejected by security policy' };
         const ffmpegBin = resolveFfmpegBinary();
         if (!ffmpegBin) return { ok: false, error: 'FFmpeg unavailable' };
+        const safeSubIdx = Number(payload.relSubIdx) & 0x3f;
+        const mapSpec = `0:s:${safeSubIdx}`;
         return await new Promise((resolve) => {
           execFile(
             ffmpegBin,
-            ['-hide_banner', '-loglevel', 'error', '-i', safeVideoPath, '-map', `0:s:${payload.relSubIdx}`, '-f', 'webvtt', '-'],
+            ['-hide_banner', '-loglevel', 'error', '-i', safeVideoPath, '-map', mapSpec, '-f', 'webvtt', '-'],
             { timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
             (err, stdout) => {
               if (err || !stdout) resolve({ ok: false, error: err?.message || 'Subtitle extraction failed' });
