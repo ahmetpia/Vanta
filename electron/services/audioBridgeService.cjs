@@ -1520,10 +1520,11 @@ class NativeWasapiPlayer {
         try {
           const evt = JSON.parse(line);
           const activeProbe = this.currentProbe || probe;
-          if (evt.event === 'spectrum') {
-            evt.positionSec = this.seekOffsetSec + (evt.positionMs || 0) / 1000;
+          if (Number.isFinite(Number(evt.positionMs))) {
+            evt.positionSec = this.seekOffsetSec + Number(evt.positionMs) / 1000;
             evt.durationSec = activeProbe.durationSec || 0;
-          } else if (evt.event === 'ready') {
+          }
+          if (evt.event === 'ready') {
             receivedReady = true;
             this.activeSampleRate = Number(evt.sampleRate) || 0;
             this.activeChannels = Number(evt.channels) || 0;

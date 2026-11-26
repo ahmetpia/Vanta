@@ -2310,4 +2310,56 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
     assert.match(convPath.stages[2].detail, /FFT Convolver \(RoomCorrection\.wav · 85%\)/);
     assert.equal(convPath.bitAudit.truePeakText, '-0.4 dBTP');
   });
+
+  it('24. Audio & Video Timeline Sync: Native Range vs FFmpeg Stream Routing & Clean Media Element Rebinding', async () => {
+    const { VantaAudioEngine, requiresStudioFfmpegStream } = await import('../src/js/audioEngine.js');
+
+    // 1. Chromium-native formats (MP3/FLAC/WAV/M4A/OGG/OPUS & direct MP4) must NOT route seeks through FFmpeg pipes
+    assert.equal(requiresStudioFfmpegStream({ filePath: 'D:\\Music\\Soy el Eco.mp3', isVideo: false }), false);
+    assert.equal(requiresStudioFfmpegStream({ filePath: 'D:\\Music\\Track.flac', isVideo: false }), false);
+    assert.equal(requiresStudioFfmpegStream({ filePath: 'D:\\Music\\Track.wav', isVideo: false }), false);
+    assert.equal(requiresStudioFfmpegStream({ filePath: 'D:\\Video\\Clip.mp4', isVideo: true }, 'direct'), false);
+
+    // Lossless/DSD non-native audio, SACD ISO, and FFmpeg-remuxed/transcoded video must use FFmpeg streams
+    assert.equal(requiresStudioFfmpegStream({ filePath: 'D:\\Music\\Master.dsf', isVideo: false }), true);
+    assert.equal(requiresStudioFfmpegStream({ filePath: 'D:\\Music\\Master.alac', isVideo: false }), true);
+    assert.equal(requiresStudioFfmpegStream({ filePath: 'D:\\Music\\Disc.iso', sacdTrack: 1, isVideo: false }), true);
+    assert.equal(requiresStudioFfmpegStream({ filePath: 'D:\\Video\\Movie.mkv', isVideo: true }, 'remux-copy'), true);
+    assert.equal(requiresStudioFfmpegStream({ filePath: 'D:\\Video\\Movie.avi', isVideo: true }, 'transcode-h264'), true);
+
+    // 2. Media element cloning during WASAPI teardown must strip stale vantaBound flags & notify rebind callback
+    const makeMockMediaEl = (initialAttrs = {}) => {
+      const attrs = { ...initialAttrs };
+      const el = {
+        paused: false,
+        src: 'vanta-media://local?path=a.mp3',
+        parentNode: {},
+        pause() { this.paused = true; },
+        removeAttribute(k) { delete attrs[k]; if (k === 'src') this.src = ''; },
+        getAttribute(k) { return attrs[k]; },
+        cloneNode() { return makeMockMediaEl({ ...attrs }); },
+        replaceWith(nextEl) { this._replacedBy = nextEl; }
+      };
+      return el;
+    };
+
+    const deckA = makeMockMediaEl({ 'data-vanta-bound': '1' });
+    const deckB = makeMockMediaEl({ 'data-vanta-bound': '1' });
+    const video = makeMockMediaEl({ 'data-vanta-bound': '1', 'data-vanta-theater-bound': '1' });
+
+    const eng = new VantaAudioEngine();
+    eng.bindElements(deckA, video, deckB);
+    let recreatedPayload = null;
+    eng.onElementsRecreated = (payload) => { recreatedPayload = payload; };
+    eng._recreateMediaElements(true);
+
+    assert.ok(recreatedPayload, 'Expected onElementsRecreated callback after cloning');
+    assert.notEqual(recreatedPayload.deckAEl, deckA);
+    assert.notEqual(recreatedPayload.videoEl, video);
+    assert.equal(recreatedPayload.deckAEl.getAttribute('data-vanta-bound'), undefined);
+    assert.equal(recreatedPayload.deckBEl.getAttribute('data-vanta-bound'), undefined);
+    assert.equal(recreatedPayload.videoEl.getAttribute('data-vanta-bound'), undefined);
+    assert.equal(recreatedPayload.videoEl.getAttribute('data-vanta-theater-bound'), undefined);
+    assert.equal(recreatedPayload.deckAEl.src, '');
+  });
 });

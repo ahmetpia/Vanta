@@ -10,6 +10,7 @@ import {
   EQ_PRESETS,
   DEVICE_EQ_PROFILES,
   requiresStudioDsp,
+  requiresStudioFfmpegStream,
   serializeNativeDspSpecFromState,
   buildSignalPathDescriptor,
   computeWasapiGainFactor,
@@ -180,6 +181,10 @@ class VantaStudioApp {
     this._playbackSeq = 0;
     this.repeatMode = 'queue'; // 'off' | 'queue' | 'one'
     this.studioSeekOffsetSec = 0;
+    this._videoSeekOffsetSec = 0;
+    this._pendingStudioSeekSec = null;
+    this._boundDeckElements = new WeakSet();
+    this._boundTheaterVideoElements = new WeakSet();
     this.theaterOpen = false;
     this.theaterAmbilight = true;
     this.activeVideoProbe = null;
@@ -1357,6 +1362,127 @@ class VantaStudioApp {
   }
 
   /**
+   * Resolves the total duration in seconds for a track or loaded HTML5 media element.
+   * @param {object|null} track - Active or previewed track.
+   * @param {HTMLMediaElement|null} [mediaEl=null] - Associated media element.
+   * @returns {number} Duration in seconds (0 if unknown).
+   */
+  _resolveEffectiveDurationSec(track, mediaEl = null) {
+    if (track?.isVideo && this.activeVideoProbe?.durationSec > 0) {
+      return Number(this.activeVideoProbe.durationSec);
+    }
+    if (!track?.isVideo && this.activeTrackProbe?.durationSec > 0) {
+      return Number(this.activeTrackProbe.durationSec);
+    }
+    if (mediaEl && Number.isFinite(mediaEl.duration) && mediaEl.duration > 0) {
+      const baseOff = track?.isVideo ? this._videoSeekOffsetSec : this.studioSeekOffsetSec;
+      return baseOff + mediaEl.duration;
+    }
+    return Math.max(0, Number(track?.durationSec) || 0);
+  }
+
+  /**
+   * Returns the active FFmpeg seek offset (isolated per media domain: audio vs video).
+   * @param {object|null} track - Active track object.
+   * @returns {number} Active seek offset in seconds.
+   */
+  _getMediaSeekOffsetSec(track) {
+    return track?.isVideo ? this._videoSeekOffsetSec : this.studioSeekOffsetSec;
+  }
+
+  /**
+   * Sets the active FFmpeg seek offset for audio or video cleanly without cross-polluting the other stage.
+   * @param {object|null} track - Active track object.
+   * @param {number} sec - Seek offset in seconds.
+   */
+  _setMediaSeekOffsetSec(track, sec) {
+    const val = Math.max(0, Number(sec) || 0);
+    if (track?.isVideo) {
+      this._videoSeekOffsetSec = val;
+    } else {
+      this.studioSeekOffsetSec = val;
+    }
+  }
+
+  /**
+   * Applies a seek offset safely on a native Chromium byte-range media element (immediate or on loadedmetadata).
+   * @param {HTMLMediaElement|null} mediaEl - Target audio or video element.
+   * @param {number} targetSec - Target timeline offset in seconds.
+   */
+  _applyNativeSeekOnElement(mediaEl, targetSec) {
+    if (!mediaEl) return;
+    const desired = Math.max(0, Number(targetSec) || 0);
+    const apply = () => {
+      if (Number.isFinite(mediaEl.duration) && mediaEl.duration > 0) {
+        mediaEl.currentTime = Math.min(Math.max(0, mediaEl.duration - 0.05), desired);
+      } else {
+        mediaEl.currentTime = desired;
+      }
+    };
+    if (mediaEl.readyState >= 1) {
+      apply();
+    } else {
+      mediaEl.addEventListener('loadedmetadata', apply, { once: true });
+    }
+  }
+
+  /**
+   * Unified seek dispatcher for Studio DSP audio & video playback (handles both native range & FFmpeg pipes).
+   * @param {object} track - Target audio or video track.
+   * @param {number} targetSec - Target timeline timestamp in seconds.
+   * @param {boolean} triggerPlay - Whether playback should continue/restart when active.
+   * @param {object} [opts={}] - Optional video strategy/element overrides.
+   */
+  _seekStudioMedia(track, targetSec, triggerPlay = true, opts = {}) {
+    if (!track) return;
+    const isVideoTrack = Boolean(track.isVideo);
+    const activeDeck = this.audioEngine.getActiveDeckElement() || this.audioEl;
+    const mediaEl = opts.mediaEl || (isVideoTrack ? this.videoEl : activeDeck);
+    const strategy = opts.strategyOverride || this.activeVideoStrategy;
+    const usesFfmpeg = Boolean(track.filePath) && requiresStudioFfmpegStream(track, strategy);
+    const safeSec = Math.max(0, Number(targetSec) || 0);
+
+    if (usesFfmpeg) {
+      const nextOffset = safeSec > 0.5 ? safeSec : 0;
+      this._setMediaSeekOffsetSec(track, nextOffset);
+      if (!opts.independentVideo) {
+        this._pendingStudioSeekSec = nextOffset;
+      }
+      const activelyPlaying = Boolean(
+        isVideoTrack && opts.independentVideo
+          ? (mediaEl && !mediaEl.paused)
+          : this.isPlaying
+      );
+      if (triggerPlay && activelyPlaying) {
+        if (opts.independentVideo && mediaEl) {
+          const seekUrl = this.buildVideoStreamUrl(track, this.activeVideoAudioIdx, nextOffset);
+          mediaEl.src = seekUrl;
+          this._lastLoadedVideoUrl = seekUrl;
+          mediaEl.play().catch(() => {});
+        } else {
+          void this.startPlayback(safeSec).catch(() => {});
+        }
+      } else if (isVideoTrack && mediaEl && track.filePath) {
+        const pausedSeekUrl = this.buildVideoStreamUrl(track, this.activeVideoAudioIdx, nextOffset);
+        mediaEl.src = pausedSeekUrl;
+        this._lastLoadedVideoUrl = pausedSeekUrl;
+      }
+      return;
+    }
+
+    this._setMediaSeekOffsetSec(track, 0);
+    if (mediaEl && (mediaEl.currentSrc || mediaEl.src) && mediaEl.readyState >= 1) {
+      if (!opts.independentVideo) this._pendingStudioSeekSec = null;
+      this._applyNativeSeekOnElement(mediaEl, safeSec);
+    } else {
+      if (!opts.independentVideo) this._pendingStudioSeekSec = safeSec;
+      if (triggerPlay && this.isPlaying && !opts.independentVideo) {
+        void this.startPlayback(safeSec).catch(() => {});
+      }
+    }
+  }
+
+  /**
    * Seeks relatively forward or backward by `deltaSec` across active WASAPI or Studio DSP playback.
    * @param {number} deltaSec - Relative seconds offset (e.g., -10 or +10).
    */
@@ -1364,26 +1490,29 @@ class VantaStudioApp {
     const track = this.displayedTracks[this.activeTrackIndex];
     if (!track) return;
     if (this.engineMode === 'wasapi' && window.vantaAPI && track.filePath && !track.isVideo) {
-      const totalSec = this.activeTrackProbe?.durationSec || Number(track.durationSec) || 232;
+      const totalSec = this._resolveEffectiveDurationSec(track, null) || 232;
       const targetSec = Math.max(0, Math.min(Math.max(1, totalSec - 1), (this.wasapiCurrentPositionSec || 0) + deltaSec));
       this.updateTimelineUi(targetSec, totalSec);
       if (this.isPlaying) {
         void this.startPlayback(targetSec).catch(() => {});
       } else {
         this.wasapiCurrentPositionSec = targetSec;
+        this.wasapiResumeSec = targetSec;
+        this.wasapiPausedTrackKey = this._getTrackUniqueKey(track);
       }
       return;
     }
 
     const activeDeck = this.audioEngine.getActiveDeckElement() || this.audioEl;
-    const activeMedia = track.isVideo && this.videoEl?.duration ? this.videoEl : activeDeck;
-    const totalSec = this.activeTrackProbe?.durationSec || (activeMedia?.duration && Number.isFinite(activeMedia.duration) ? activeMedia.duration + this.studioSeekOffsetSec : 232);
-    const currentActual = this.studioSeekOffsetSec + (activeMedia?.currentTime || 0);
+    const activeMedia = track.isVideo ? this.videoEl : activeDeck;
+    const totalSec = this._resolveEffectiveDurationSec(track, activeMedia) || 232;
+    const currentActual =
+      this._pendingStudioSeekSec !== null && !this.isPlaying
+        ? this._pendingStudioSeekSec
+        : (this._getMediaSeekOffsetSec(track) + (activeMedia?.currentTime || 0));
     const nextSec = Math.max(0, Math.min(Math.max(1, totalSec - 0.5), currentActual + deltaSec));
     this.updateTimelineUi(nextSec, totalSec);
-    if (this.isPlaying) {
-      void this.startPlayback(nextSec).catch(() => {});
-    }
+    this._seekStudioMedia(track, nextSec, this.isPlaying);
   }
 
   /**
@@ -1891,16 +2020,18 @@ class VantaStudioApp {
    */
   updateTimelineUi(positionSec, durationSec) {
     if (!Number.isFinite(durationSec) || durationSec <= 0) return;
-    const totalSec = Math.max(durationSec, positionSec);
-    const ratio = Math.max(0, Math.min(1, positionSec / totalSec));
+    const safePos = Math.max(0, Number(positionSec) || 0);
+    const totalSec = Math.max(durationSec, safePos);
+    const ratio = Math.max(0, Math.min(1, safePos / totalSec));
     this.visualizer.setProgress(ratio);
     const pctStr = `${(ratio * 100).toFixed(2)}%`;
     const fillEl = document.getElementById('masterTimelineFill');
     const thumbEl = document.getElementById('masterTimelineThumb');
     if (fillEl) fillEl.style.width = pctStr;
     if (thumbEl) thumbEl.style.left = `clamp(6px, ${pctStr}, calc(100% - 6px))`;
-    const cur = Math.max(0, Math.floor(positionSec));
-    const rem = Math.max(0, Math.floor(totalSec - cur));
+    const totalWhole = Math.max(0, Math.floor(totalSec));
+    const cur = ratio >= 0.9999 ? totalWhole : Math.max(0, Math.min(totalWhole, Math.floor(safePos)));
+    const rem = Math.max(0, totalWhole - cur);
     const elEl = document.getElementById('timeElapsedLabel');
     const remEl = document.getElementById('timeRemainingLabel');
     if (elEl) elEl.textContent = `${String(Math.floor(cur / 60)).padStart(2, '0')}:${String(cur % 60).padStart(2, '0')}`;
@@ -1952,7 +2083,7 @@ class VantaStudioApp {
     }
     const wasPlaying = this.isPlaying;
     const resumeSec = isVideoTrack
-      ? (this.studioSeekOffsetSec + (this.videoEl?.currentTime || 0))
+      ? (this._videoSeekOffsetSec + (this.videoEl?.currentTime || 0))
       : (targetMode === 'dsp'
         ? this.wasapiCurrentPositionSec
         : (this.studioSeekOffsetSec + (this.audioEngine.getActiveDeckElement()?.currentTime || 0)));
@@ -1975,6 +2106,8 @@ class VantaStudioApp {
       this.updateStreamTelemetry();
       if (wasPlaying && track?.filePath) {
         await this.startPlayback(resumeSec);
+      } else if (track?.filePath && resumeSec > 0.5) {
+        this._pendingStudioSeekSec = resumeSec;
       }
       window.vantaAPI?.logClientEvent('INFO', '[EngineSwitch] Studio DSP switch completed');
     } else {
@@ -1984,6 +2117,10 @@ class VantaStudioApp {
       await this.audioEngine.suspendEngine();
       if (wasPlaying && track?.filePath && !track.isVideo) {
         await this.startPlayback(resumeSec);
+      } else if (track?.filePath && !track.isVideo && resumeSec > 0.5) {
+        this.wasapiPausedTrackKey = this._getTrackUniqueKey(track);
+        this.wasapiResumeSec = resumeSec;
+        this.wasapiCurrentPositionSec = resumeSec;
       }
     }
 
@@ -2231,8 +2368,13 @@ class VantaStudioApp {
     }
     if (evt.event === 'paused' || evt.event === 'resumed') {
       if (evt.xrunCount !== undefined) this.wasapiXrunCount = Number(evt.xrunCount) || 0;
-      if (Number.isFinite(Number(evt.positionMs))) {
-        this.wasapiCurrentPositionSec = (Number(evt.positionMs) || 0) / 1000;
+      const reportedPos = Number.isFinite(Number(evt.positionSec))
+        ? Number(evt.positionSec)
+        : ((Number(evt.positionMs) || 0) / 1000);
+      if (Number.isFinite(reportedPos)) {
+        this.wasapiCurrentPositionSec = Math.max(0, reportedPos);
+        const totalSec = Number(evt.durationSec) || this._resolveEffectiveDurationSec(this.currentLoadedTrack, null);
+        if (totalSec > 0) this.updateTimelineUi(this.wasapiCurrentPositionSec, totalSec);
       }
       this.updateStreamTelemetry();
       return;
@@ -2253,7 +2395,7 @@ class VantaStudioApp {
           this.audioEngine.setExternalSpectrum(evt.bars, evt);
         }
         this.wasapiCurrentPositionSec = Number(evt.positionSec) || 0;
-        const totalSec = Number(evt.durationSec) || this.activeTrackProbe?.durationSec || 0;
+        const totalSec = Number(evt.durationSec) || this._resolveEffectiveDurationSec(this.currentLoadedTrack, null);
         this.updateTimelineUi(this.wasapiCurrentPositionSec, totalSec);
         this._maybeQueueGaplessWasapiNext(this.wasapiCurrentPositionSec, totalSec);
         const spModal = document.getElementById('signalPathModal');
@@ -2271,10 +2413,17 @@ class VantaStudioApp {
       this.wasapiPausedHeld = false;
       if (evt.xrunCount !== undefined) this.wasapiXrunCount = Number(evt.xrunCount) || 0;
       if (this.engineMode === 'wasapi' && this.isPlaying) {
+        const finalTotalSec = Number(evt.durationSec) || this._resolveEffectiveDurationSec(this.currentLoadedTrack, null);
         this.wasapiCurrentPositionSec = 0;
         this.wasapiPausedTrackKey = null;
         this.wasapiResumeSec = 0;
         this.handleTrackEnded();
+        if (!this.isPlaying) {
+          this.wasapiCurrentPositionSec = 0;
+          this.wasapiPausedTrackKey = null;
+          this.wasapiResumeSec = 0;
+          if (finalTotalSec > 0) this.updateTimelineUi(finalTotalSec, finalTotalSec);
+        }
       }
       return;
     }
@@ -2313,6 +2462,14 @@ class VantaStudioApp {
       this.audioEngine.setReplayGainLinear(gain);
       if (this.engineMode === 'wasapi' && this.isPlaying) {
         window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
+      }
+      if (!current.isVideo && info.probe?.durationSec > 0) {
+        const curPos = this.engineMode === 'wasapi'
+          ? (this.wasapiCurrentPositionSec || 0)
+          : (this._pendingStudioSeekSec !== null && !this.isPlaying
+            ? this._pendingStudioSeekSec
+            : this.studioSeekOffsetSec + (this.audioEngine.getActiveDeckElement()?.currentTime || 0));
+        this.updateTimelineUi(curPos, info.probe.durationSec);
       }
       this.updateStreamTelemetry();
     } catch {
@@ -2354,6 +2511,7 @@ class VantaStudioApp {
     this.wasapiResumeSec = 0;
     this.wasapiCurrentPositionSec = 0;
     this.studioSeekOffsetSec = 0;
+    this._pendingStudioSeekSec = null;
     this.playbackHistory = [];
     this._savePlaybackHistory();
     this._updateLastPlayedButton();
@@ -3781,6 +3939,7 @@ class VantaStudioApp {
     this.wasapiResumeSec = 0;
     this.wasapiCurrentPositionSec = 0;
     this.studioSeekOffsetSec = 0;
+    this._pendingStudioSeekSec = null;
 
     // Reset timeline & telemetry for incoming track
     this.visualizer.setProgress(0);
@@ -3859,9 +4018,9 @@ class VantaStudioApp {
 
   /**
    * Starts audio/video playback via Native WASAPI Exclusive or Dual-Deck Studio DSP.
-   * @param {number} [seekSecOverride] - Optional seek offset in seconds.
+   * @param {number|null} [seekSecOverride=null] - Optional seek offset in seconds (`null` resumes paused state).
    */
-  async startPlayback(seekSecOverride = 0) {
+  async startPlayback(seekSecOverride = null) {
     const track = this.displayedTracks[this.activeTrackIndex];
     if (!track) {
       this.setToast('No tracks loaded — open "Computer Explorer", drop files/folders, or paste a YouTube URL');
@@ -3887,6 +4046,7 @@ class VantaStudioApp {
       Math.abs(this.audioEngine.state.playbackRate - 1.0) < 0.001;
 
     if (track.filePath && useNativeWasapi) {
+      this._pendingStudioSeekSec = null;
       this.audioEngine.stopProceduralSynthPreview();
       this.audioEl.pause();
       this.deckBEl?.pause();
@@ -3897,7 +4057,7 @@ class VantaStudioApp {
       const isHeldResume =
         Boolean(this.wasapiPausedHeld) &&
         this.wasapiPausedTrackKey === trackKey &&
-        seekSecOverride === 0;
+        seekSecOverride === null;
       if (isHeldResume) {
         this.wasapiPausedHeld = false;
         this.wasapiPausedTrackKey = null;
@@ -3915,9 +4075,9 @@ class VantaStudioApp {
       }
 
       const resumeOffset =
-        this.wasapiPausedTrackKey === trackKey && seekSecOverride === 0
+        seekSecOverride === null && this.wasapiPausedTrackKey === trackKey
           ? this.wasapiResumeSec
-          : (Number(seekSecOverride) || 0);
+          : Math.max(0, Number(seekSecOverride) || 0);
       this.wasapiPausedTrackKey = null;
       this.wasapiPausedHeld = false;
       this.wasapiResumeSec = 0;
@@ -3989,31 +4149,47 @@ class VantaStudioApp {
       const targetEl = track.isVideo
         ? this.videoEl
         : (this.audioEngine.getActiveDeckElement() || this.audioEl);
-      const isDirectVideo = track.isVideo && this.activeVideoStrategy === 'direct';
-      const usesFfmpegStream = (!track.isVideo && seekSecOverride > 0.5) || (track.isVideo && !isDirectVideo);
-      this.studioSeekOffsetSec = (usesFfmpegStream && seekSecOverride > 0.5) ? Number(seekSecOverride) : 0;
-      const expectedUrl = track.isVideo
-        ? this.buildVideoStreamUrl(track, this.activeVideoAudioIdx, this.studioSeekOffsetSec)
-        : this._buildLocalMediaUrl(track, usesFfmpegStream ? this.studioSeekOffsetSec : 0);
-      const sacdMismatch = Number(track.sacdTrack) >= 1 && !String(targetEl.src || '').includes(`sacdTrack=${Number(track.sacdTrack)}`);
-      if (
-        (track.isVideo && (this._lastLoadedVideoUrl !== expectedUrl || !targetEl.src)) ||
-        (!track.isVideo && (usesFfmpegStream || !targetEl.src || !targetEl.src.includes(encodeURIComponent(track.filePath)) || targetEl.src.includes('&ss=') || sacdMismatch))
-      ) {
-        targetEl.src = expectedUrl;
-        if (track.isVideo) this._lastLoadedVideoUrl = expectedUrl;
+      const hasExplicitSeek = seekSecOverride !== null || this._pendingStudioSeekSec !== null;
+      const effectiveSeek = seekSecOverride !== null
+        ? Math.max(0, Number(seekSecOverride) || 0)
+        : (this._pendingStudioSeekSec !== null ? Math.max(0, Number(this._pendingStudioSeekSec) || 0) : 0);
+      this._pendingStudioSeekSec = null;
+
+      const usesFfmpegStream = requiresStudioFfmpegStream(track, this.activeVideoStrategy);
+      const currentSrc = String(targetEl.src || '');
+      const sacdMismatch = Number(track.sacdTrack) >= 1 && !currentSrc.includes(`sacdTrack=${Number(track.sacdTrack)}`);
+      const sameTrackLoaded = Boolean(currentSrc) && (
+        track.isVideo
+          ? (this._lastLoadedVideoUrl && currentSrc === this._lastLoadedVideoUrl)
+          : (currentSrc.includes(encodeURIComponent(track.filePath)) && !sacdMismatch)
+      );
+
+      if (usesFfmpegStream) {
+        if (hasExplicitSeek || !sameTrackLoaded) {
+          const ffOffset = effectiveSeek > 0.5 ? effectiveSeek : 0;
+          this._setMediaSeekOffsetSec(track, ffOffset);
+          const streamUrl = track.isVideo
+            ? this.buildVideoStreamUrl(track, this.activeVideoAudioIdx, ffOffset)
+            : this._buildLocalMediaUrl(track, ffOffset);
+          targetEl.src = streamUrl;
+          if (track.isVideo) this._lastLoadedVideoUrl = streamUrl;
+        }
+      } else {
+        this._setMediaSeekOffsetSec(track, 0);
+        const directUrl = track.isVideo
+          ? this.buildVideoStreamUrl(track, this.activeVideoAudioIdx, 0)
+          : this._buildLocalMediaUrl(track, 0);
+        if (!sameTrackLoaded || currentSrc.includes('&ss=')) {
+          targetEl.src = directUrl;
+          if (track.isVideo) this._lastLoadedVideoUrl = directUrl;
+        }
+        if (hasExplicitSeek) {
+          this._applyNativeSeekOnElement(targetEl, effectiveSeek);
+        }
       }
+
       targetEl.playbackRate = this.audioEngine.state.playbackRate;
       targetEl.preservesPitch = Math.abs(targetEl.playbackRate - 1.0) < 0.001;
-      if (isDirectVideo && seekSecOverride > 0) {
-        const applySeek = () => {
-          if (Number.isFinite(targetEl.duration) && seekSecOverride < targetEl.duration) {
-            targetEl.currentTime = seekSecOverride;
-          }
-        };
-        if (targetEl.readyState >= 2) applySeek();
-        else targetEl.addEventListener('canplay', applySeek, { once: true });
-      }
       try {
         await targetEl.play();
       } catch (err) {
@@ -6679,6 +6855,10 @@ class VantaStudioApp {
     this.activeVideoProbe = null;
     this.activeVideoStrategy = 'direct';
     this.activeVideoAudioIdx = 0;
+    this._videoSeekOffsetSec = 0;
+    if (this.displayedTracks[this.activeTrackIndex] === track) {
+      this._pendingStudioSeekSec = null;
+    }
     this.siblingSubtitles = [];
     this.clearActiveSubtitles();
 
@@ -6697,11 +6877,15 @@ class VantaStudioApp {
       if (mySeq !== this._videoProbeSeq) return;
 
       this._refreshVideoTrackControls(track, probeRes);
-      this._updateTheaterTimelineUi();
       const nextUrl = this.buildVideoStreamUrl(track, this.activeVideoAudioIdx, 0);
       if (this._lastLoadedVideoUrl !== nextUrl || !this.videoEl.src) {
         this.videoEl.src = nextUrl;
         this._lastLoadedVideoUrl = nextUrl;
+      }
+      const probedDur = probeRes?.probe?.durationSec || Number(track.durationSec) || 0;
+      this._updateTheaterTimelineUi(0);
+      if (this.displayedTracks[this.activeTrackIndex] === track && probedDur > 0) {
+        this.updateTimelineUi(0, probedDur);
       }
     };
 
@@ -6857,7 +7041,7 @@ class VantaStudioApp {
     if (nextIdx > 0 && this.activeVideoStrategy === 'direct') {
       this.activeVideoStrategy = 'remux-copy';
     }
-    const curPos = this.studioSeekOffsetSec + (this.videoEl?.currentTime || 0);
+    const curPos = this._videoSeekOffsetSec + (this.videoEl?.currentTime || 0);
     this._refreshVideoTrackControls(track, {
       probe: this.activeVideoProbe,
       strategy: this.activeVideoStrategy,
@@ -6867,9 +7051,15 @@ class VantaStudioApp {
     if (isPrimaryVideo && this.isPlaying) {
       void this.startPlayback(curPos).catch(() => {});
     } else {
-      const nextUrl = this.buildVideoStreamUrl(track, nextIdx, curPos);
+      const nextOffset = this.activeVideoStrategy !== 'direct' && curPos > 0.5 ? curPos : 0;
+      this._videoSeekOffsetSec = nextOffset;
+      if (isPrimaryVideo) this._pendingStudioSeekSec = curPos;
+      const nextUrl = this.buildVideoStreamUrl(track, nextIdx, nextOffset);
       this.videoEl.src = nextUrl;
       this._lastLoadedVideoUrl = nextUrl;
+      if (this.activeVideoStrategy === 'direct' && curPos > 0.5) {
+        this._applyNativeSeekOnElement(this.videoEl, curPos);
+      }
       if (wasVideoPlaying) {
         this.videoEl.play().catch(() => {});
       }
@@ -6980,15 +7170,16 @@ class VantaStudioApp {
 
   _updateTheaterTimelineUi(overrideCurSec = null) {
     if (!this.theaterOpen || !this.videoEl) return;
-    const total =
+    const rawTotal =
       this.activeVideoProbe?.durationSec ||
-      (Number.isFinite(this.videoEl.duration) ? this.studioSeekOffsetSec + this.videoEl.duration : 0) ||
+      (Number.isFinite(this.videoEl.duration) ? this._videoSeekOffsetSec + this.videoEl.duration : 0) ||
       Number(this._resolveLoadedVideoTrack()?.durationSec) ||
       0;
     const cur =
       overrideCurSec !== null
         ? Math.max(0, Number(overrideCurSec) || 0)
-        : this.studioSeekOffsetSec + (this.videoEl.currentTime || 0);
+        : this._videoSeekOffsetSec + (this.videoEl.currentTime || 0);
+    const total = rawTotal > 0 ? Math.max(rawTotal, cur) : 0;
     const pct = total > 0 ? Math.max(0, Math.min(100, (cur / total) * 100)) : 0;
 
     const curEl = document.getElementById('theaterCurrentTime');
@@ -7002,10 +7193,14 @@ class VantaStudioApp {
     if (fillEl) fillEl.style.width = `${pct.toFixed(2)}%`;
     if (thumbEl) thumbEl.style.left = `${pct.toFixed(2)}%`;
 
-    if (bufEl && total > 0 && this.videoEl.buffered?.length) {
-      const bufEnd = this.studioSeekOffsetSec + this.videoEl.buffered.end(this.videoEl.buffered.length - 1);
-      const bufPct = Math.max(0, Math.min(100, (bufEnd / total) * 100));
-      bufEl.style.width = `${bufPct.toFixed(2)}%`;
+    if (bufEl) {
+      if (total > 0 && this.videoEl.buffered?.length) {
+        const bufEnd = this._videoSeekOffsetSec + this.videoEl.buffered.end(this.videoEl.buffered.length - 1);
+        const bufPct = Math.max(0, Math.min(100, (bufEnd / total) * 100));
+        bufEl.style.width = `${bufPct.toFixed(2)}%`;
+      } else {
+        bufEl.style.width = '0%';
+      }
     }
   }
 
@@ -7030,7 +7225,7 @@ class VantaStudioApp {
     }
 
     if (!this._hasLoadedVideo() && videoTrack?.filePath) {
-      const url = this.buildVideoStreamUrl(videoTrack, this.activeVideoAudioIdx, this.studioSeekOffsetSec);
+      const url = this.buildVideoStreamUrl(videoTrack, this.activeVideoAudioIdx, this._videoSeekOffsetSec);
       this.videoEl.src = url;
       this._lastLoadedVideoUrl = url;
     }
@@ -7098,29 +7293,23 @@ class VantaStudioApp {
       const activeTrack = this.displayedTracks[this.activeTrackIndex];
       const videoTrack = this._resolveLoadedVideoTrack();
       if (!this._hasLoadedVideo() && !videoTrack) return;
-      const total =
-        this.activeVideoProbe?.durationSec ||
-        (Number.isFinite(this.videoEl?.duration) ? this.studioSeekOffsetSec + this.videoEl.duration : 0);
+      const total = this._resolveEffectiveDurationSec(videoTrack, this.videoEl);
       const clamped = Math.max(0, total > 0 ? Math.min(total - 0.5, targetSec) : targetSec);
       this._updateTheaterTimelineUi(clamped);
-
-      if (this.activeVideoStrategy === 'direct' && Number.isFinite(this.videoEl?.duration)) {
-        this.videoEl.currentTime = clamped;
-      } else if (activeTrack?.isVideo && this.isPlaying) {
-        this.studioSeekOffsetSec = clamped > 0.5 ? clamped : 0;
-        void this.startPlayback(clamped).catch(() => {});
-      } else if (videoTrack?.filePath) {
-        const wasPlaying = Boolean(this.videoEl && !this.videoEl.paused);
-        this.studioSeekOffsetSec = clamped > 0.5 ? clamped : 0;
-        const seekUrl = this.buildVideoStreamUrl(videoTrack, this.activeVideoAudioIdx, this.studioSeekOffsetSec);
-        this.videoEl.src = seekUrl;
-        this._lastLoadedVideoUrl = seekUrl;
-        if (wasPlaying) this.videoEl.play().catch(() => {});
+      if (activeTrack?.isVideo && total > 0) {
+        this.updateTimelineUi(clamped, total);
       }
+
+      const targetVideo = videoTrack || { isVideo: true, filePath: '' };
+      const isPrimaryActive = Boolean(activeTrack?.isVideo);
+      this._seekStudioMedia(targetVideo, clamped, true, {
+        mediaEl: this.videoEl,
+        independentVideo: !isPrimaryActive
+      });
     };
 
     const nudgeVideo = (deltaSec) => {
-      const cur = this.studioSeekOffsetSec + (this.videoEl?.currentTime || 0);
+      const cur = this._videoSeekOffsetSec + (this.videoEl?.currentTime || 0);
       seekVideoToSec(cur + deltaSec);
       this._flashTheaterFeedback(deltaSec >= 0 ? `⏩ +${deltaSec}s` : `⏪ ${deltaSec}s`);
     };
@@ -7175,7 +7364,7 @@ class VantaStudioApp {
     };
     const getTotalVideoSec = () =>
       this.activeVideoProbe?.durationSec ||
-      (Number.isFinite(this.videoEl?.duration) ? this.studioSeekOffsetSec + this.videoEl.duration : 0) ||
+      (Number.isFinite(this.videoEl?.duration) ? this._videoSeekOffsetSec + this.videoEl.duration : 0) ||
       Number(this._resolveLoadedVideoTrack()?.durationSec) ||
       0;
 
@@ -7320,8 +7509,8 @@ class VantaStudioApp {
       }
     };
     this._bindVideoTheaterEvents = () => {
-      if (!this.videoEl || this.videoEl.dataset.vantaTheaterBound) return;
-      this.videoEl.dataset.vantaTheaterBound = '1';
+      if (!this.videoEl || this._boundTheaterVideoElements.has(this.videoEl)) return;
+      this._boundTheaterVideoElements.add(this.videoEl);
       this.videoEl.addEventListener('play', () => {
         syncTheaterPlayBtn();
         this._pokeTheaterOsd();
@@ -7335,6 +7524,14 @@ class VantaStudioApp {
       });
       ['loadedmetadata', 'durationchange', 'progress', 'seeked'].forEach((evtName) => {
         this.videoEl.addEventListener(evtName, () => this._updateTheaterTimelineUi());
+      });
+      this.videoEl.addEventListener('ended', () => {
+        syncTheaterPlayBtn();
+        document.getElementById('theaterVideoStage')?.classList.remove('osd-idle');
+        if (!this.videoEl.loop) {
+          const vTotal = this._resolveEffectiveDurationSec(this._resolveLoadedVideoTrack(), this.videoEl);
+          if (vTotal > 0) this._updateTheaterTimelineUi(vTotal);
+        }
       });
     };
     this._bindVideoTheaterEvents();
@@ -8106,20 +8303,12 @@ class VantaStudioApp {
     // 14. Pro Interactive Scrubber (Drag Seek + Hover Preview Tip) & Wave Canvas Scrubbing
     const getActiveTotalDuration = () => {
       const track = this.displayedTracks[this.activeTrackIndex];
-      if (track?.isVideo && this.activeVideoProbe?.durationSec) {
-        return this.activeVideoProbe.durationSec;
-      }
-      if (this.activeTrackProbe?.durationSec) {
-        return this.activeTrackProbe.durationSec;
-      }
-      if (this.engineMode === 'wasapi' && track?.filePath && !track.isVideo) {
-        return Number(track.durationSec) || 232;
-      }
       const activeDeck = this.audioEngine.getActiveDeckElement() || this.audioEl;
-      const activeMedia = track?.isVideo && this.videoEl?.duration ? this.videoEl : activeDeck;
-      return activeMedia?.duration && Number.isFinite(activeMedia.duration)
-        ? this.studioSeekOffsetSec + activeMedia.duration
-        : (Number(track?.durationSec) || 232);
+      const activeMedia = track?.isVideo ? this.videoEl : activeDeck;
+      if (this.engineMode === 'wasapi' && track?.filePath && !track.isVideo) {
+        return this._resolveEffectiveDurationSec(track, null) || 232;
+      }
+      return this._resolveEffectiveDurationSec(track, activeMedia) || 232;
     };
 
     const seekToRatio = (ratio, triggerPlay = true) => {
@@ -8132,28 +8321,15 @@ class VantaStudioApp {
       if (this.engineMode === 'wasapi' && window.vantaAPI && track?.filePath && !track.isVideo) {
         this.wasapiCurrentPositionSec = targetSec;
         this.wasapiResumeSec = targetSec;
+        this.wasapiPausedTrackKey = this._getTrackUniqueKey(track);
         if (triggerPlay && this.isPlaying) {
           void this.startPlayback(targetSec).catch(() => {});
         }
         return;
       }
 
-      if (track?.filePath && (!track.isVideo || this.activeVideoStrategy !== 'direct')) {
-        this.studioSeekOffsetSec = targetSec > 0.5 ? targetSec : 0;
-        if (triggerPlay && this.isPlaying) {
-          void this.startPlayback(targetSec).catch(() => {});
-        } else if (!this.isPlaying && track.isVideo) {
-          const pausedSeekUrl = this.buildVideoStreamUrl(track, this.activeVideoAudioIdx, this.studioSeekOffsetSec);
-          this.videoEl.src = pausedSeekUrl;
-          this._lastLoadedVideoUrl = pausedSeekUrl;
-        }
-        return;
-      }
-
-      const activeDeck = this.audioEngine.getActiveDeckElement() || this.audioEl;
-      const activeMedia = track?.isVideo && this.videoEl.duration ? this.videoEl : activeDeck;
-      if (activeMedia?.duration && Number.isFinite(activeMedia.duration)) {
-        activeMedia.currentTime = targetSec;
+      if (track) {
+        this._seekStudioMedia(track, targetSec, triggerPlay);
       }
     };
 
@@ -8211,19 +8387,20 @@ class VantaStudioApp {
     });
 
     const bindDeckTimeline = (mediaEl) => {
-      if (!mediaEl || mediaEl.dataset.vantaBound) return;
-      mediaEl.dataset.vantaBound = '1';
-      mediaEl.addEventListener('timeupdate', () => {
-        if (isDraggingTimeline) return;
+      if (!mediaEl || this._boundDeckElements.has(mediaEl)) return;
+      this._boundDeckElements.add(mediaEl);
+
+      const syncDeckProgress = () => {
         const track = this.displayedTracks[this.activeTrackIndex];
         const expectedDeck = track?.isVideo ? this.videoEl : (this.audioEngine.getActiveDeckElement() || this.audioEl);
         if (mediaEl !== expectedDeck) return;
+        if (!track?.isVideo && this.engineMode === 'wasapi') return;
 
-        const actualCur = this.studioSeekOffsetSec + (mediaEl.currentTime || 0);
-        const totalDur =
-          (track?.isVideo ? this.activeVideoProbe?.durationSec : 0) ||
-          this.activeTrackProbe?.durationSec ||
-          (mediaEl.duration && Number.isFinite(mediaEl.duration) ? this.studioSeekOffsetSec + mediaEl.duration : 0);
+        const actualCur =
+          this._pendingStudioSeekSec !== null && !this.isPlaying
+            ? this._pendingStudioSeekSec
+            : (this._getMediaSeekOffsetSec(track) + (mediaEl.currentTime || 0));
+        const totalDur = this._resolveEffectiveDurationSec(track, mediaEl);
         if (!totalDur) return;
 
         this.updateTimelineUi(actualCur, totalDur);
@@ -8232,6 +8409,7 @@ class VantaStudioApp {
         const fadeSec = this.audioEngine.state.crossfadeSeconds || 0;
         const remaining = totalDur - actualCur;
         if (
+          this.isPlaying &&
           fadeSec > 0 &&
           !track?.isVideo &&
           !this.crossfadeTriggeredForTrack &&
@@ -8249,6 +8427,7 @@ class VantaStudioApp {
             this.activeTrackProbe = null;
             this.activeTrackR128 = null;
             this.studioSeekOffsetSec = 0;
+            this._pendingStudioSeekSec = null;
             document.getElementById('dockTrackTitle').textContent = nextTrack.title;
             document.getElementById('dockTrackSubtitle').textContent = `${nextTrack.artist} · ${nextTrack.bpm} BPM · ${nextTrack.key}`;
             this.renderQueue();
@@ -8259,13 +8438,28 @@ class VantaStudioApp {
             }, Math.max(500, fadeSec * 1000));
           }
         }
+      };
+
+      mediaEl.addEventListener('timeupdate', () => {
+        if (!isDraggingTimeline) syncDeckProgress();
+      });
+      ['loadedmetadata', 'durationchange', 'seeked'].forEach((evtName) => {
+        mediaEl.addEventListener(evtName, () => {
+          if (!isDraggingTimeline) syncDeckProgress();
+        });
       });
 
       mediaEl.addEventListener('ended', () => {
         const track = this.displayedTracks[this.activeTrackIndex];
         const expectedDeck = track?.isVideo ? this.videoEl : (this.audioEngine.getActiveDeckElement() || this.audioEl);
         if (mediaEl === expectedDeck && !this.crossfadeTriggeredForTrack) {
+          const totalDur = this._resolveEffectiveDurationSec(track, mediaEl);
           this.handleTrackEnded();
+          if (!this.isPlaying) {
+            this._setMediaSeekOffsetSec(track, 0);
+            this._pendingStudioSeekSec = null;
+            if (totalDur > 0) this.updateTimelineUi(totalDur, totalDur);
+          }
         }
       });
     };

@@ -291,6 +291,23 @@ export function resolveReplayGain2(opts = {}) {
 }
 
 /**
+ * Determines whether Studio DSP / HTML5 playback for a track requires an FFmpeg live stream pipe
+ * instead of direct Chromium HTTP 206 byte-range seeking.
+ * @param {object|null} [track=null] - Track metadata object.
+ * @param {'direct'|'remux-copy'|'transcode-h264'} [videoStrategy='direct'] - Active video delivery strategy.
+ * @returns {boolean} True when FFmpeg piped transcoding/remuxing is required.
+ */
+export function requiresStudioFfmpegStream(track = null, videoStrategy = 'direct') {
+  if (!track) return false;
+  if (Number(track.sacdTrack) >= 1) return true;
+  if (track.isVideo) return videoStrategy !== 'direct';
+  const filePath = String(track.filePath || '');
+  if (/\.(?:w64|aiff?|alac|ape|wv|dsf|dff|wma|iso)$/i.test(filePath)) return true;
+  const codec = String(track.audioCodec || track.codec || '').toUpperCase();
+  return /^(?:ALAC|APE|WAVPACK|WMAV2|WMAPRO)$/.test(codec) || codec.includes('DSD');
+}
+
+/**
  * Serializes AudioEngine DSP state into the PurePath 64 native C++ wire format.
  * @param {object} [state={}] - Audio engine DSP state.
  * @returns {string} Compact wire string (`b0,...,b9|bass|bassDb|xf|xfPct|limiter`).
@@ -1094,26 +1111,39 @@ export class VantaAudioEngine {
 
       const needsClone = hadConnectedNodes || Boolean(this.deckAEl?.error) || Boolean(this.deckBEl?.error);
       if (needsClone) {
-        const cloneClean = (el) => {
-          if (!el || !el.parentNode) return el;
-          el.pause();
-          const clone = el.cloneNode(false);
-          clone.removeAttribute('src');
-          el.replaceWith(clone);
-          return clone;
-        };
-        this.deckAEl = cloneClean(this.deckAEl);
-        this.deckBEl = cloneClean(this.deckBEl);
-        this.videoEl = cloneClean(this.videoEl);
-        this.activeDeck = 'A';
-        if (typeof this.onElementsRecreated === 'function') {
-          this.onElementsRecreated({
-            deckAEl: this.deckAEl,
-            deckBEl: this.deckBEl,
-            videoEl: this.videoEl
-          });
-        }
+        this._recreateMediaElements(true);
       }
+    }
+  }
+
+  /**
+   * Clones deck/video elements cleanly without src or stale listener guard attributes,
+   * then notifies app orchestration to re-attach timeline/ended listeners.
+   * @param {boolean} [resetDeck=false] - Whether to reset activeDeck back to 'A'.
+   */
+  _recreateMediaElements(resetDeck = false) {
+    const cloneClean = (el) => {
+      if (!el || !el.parentNode) return el;
+      el.pause();
+      const clone = el.cloneNode(false);
+      clone.removeAttribute('src');
+      clone.removeAttribute('data-vanta-bound');
+      clone.removeAttribute('data-vanta-theater-bound');
+      el.replaceWith(clone);
+      return clone;
+    };
+    this.deckAEl = cloneClean(this.deckAEl);
+    this.deckBEl = cloneClean(this.deckBEl);
+    this.videoEl = cloneClean(this.videoEl);
+    if (resetDeck) {
+      this.activeDeck = 'A';
+    }
+    if (typeof this.onElementsRecreated === 'function') {
+      this.onElementsRecreated({
+        deckAEl: this.deckAEl,
+        deckBEl: this.deckBEl,
+        videoEl: this.videoEl
+      });
     }
   }
 
@@ -1133,24 +1163,7 @@ export class VantaAudioEngine {
       if (this.ctx) {
         await this.teardownEngine();
       } else {
-        const cloneClean = (el) => {
-          if (!el || !el.parentNode) return el;
-          el.pause();
-          const clone = el.cloneNode(false);
-          clone.removeAttribute('src');
-          el.replaceWith(clone);
-          return clone;
-        };
-        this.deckAEl = cloneClean(this.deckAEl);
-        this.deckBEl = cloneClean(this.deckBEl);
-        this.videoEl = cloneClean(this.videoEl);
-        if (typeof this.onElementsRecreated === 'function') {
-          this.onElementsRecreated({
-            deckAEl: this.deckAEl,
-            deckBEl: this.deckBEl,
-            videoEl: this.videoEl
-          });
-        }
+        this._recreateMediaElements(false);
       }
     }
     if (this.ctx && this.ctx.state !== 'running') {
