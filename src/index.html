@@ -1,0 +1,1096 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self' vanta-media: https://i.ytimg.com data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; media-src 'self' vanta-media: blob: data:; img-src 'self' vanta-media: https://i.ytimg.com data: blob:;"
+  />
+  <title>VANTA — Personal Audio &amp; Video OS</title>
+  <link rel="stylesheet" href="./styles/vanta.css" />
+</head>
+<body class="theme-ice">
+  <div class="app-shell" data-testid="vanta-app-shell">
+    <video id="stageFxVideo" muted loop playsinline preload="auto" class="hidden" aria-hidden="true"></video>
+    <canvas id="stageFxCanvas" class="stage-fx-canvas hidden" aria-hidden="true"></canvas>
+    <div id="stageEdgeLaserRing" class="stage-edge-laser-ring hidden" aria-hidden="true"></div>
+
+    <!-- ======================================================================
+         1. TOPBAR (Frameless Drag Region + Status + Theme & Window Controls)
+         ====================================================================== -->
+    <header class="topbar glass">
+      <div class="brand-group no-drag">
+        <div class="brand-mark">V</div>
+        <div>
+          <div class="brand-title">VANTA</div>
+          <button id="btnOpenVaultRoot" class="brand-vault-btn" title="Open C:\Vanta\VantaVault in Explorer">
+            <span>📂 C:\Vanta\VantaVault</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Status Pills, Engine Mode Switcher, Output DAC Selector, Theme & Window Controls -->
+      <div class="topbar-right no-drag">
+        <div class="segmented-group" data-testid="engine-mode-switcher" title="Switch between Shared Windows Audio Studio DSP and Native WASAPI Exclusive Bit-Perfect DAC">
+          <button class="seg-btn active" data-engine="dsp" title="Shared Windows Audio + 32-Bit Float EQ, Spatial & Crossfade (plays alongside YouTube & other apps)">🎛️ Studio DSP</button>
+          <button class="seg-btn" data-engine="wasapi" title="Bit-Perfect Direct DAC Access (exclusively locks audio device while playing; auto-releases on Pause)">⚡ WASAPI Exclusive</button>
+        </div>
+
+        <div id="audioOutputCombo" data-testid="audio-output-combo" class="vanta-combo no-drag" title="Select Hardware Audio Output / DAC">
+          <button type="button" class="vanta-combo-trigger status-pill" aria-haspopup="listbox" aria-expanded="false">
+            <span class="vanta-combo-label">🔊 Default Audio Device</span>
+            <span class="vanta-combo-caret">▾</span>
+          </button>
+          <div class="vanta-combo-menu hidden" role="listbox"></div>
+        </div>
+
+        <div id="deviceProfileCombo" data-testid="device-profile-combo" class="vanta-combo no-drag" title="Select Acoustic Output EQ Compensation Profile">
+          <button type="button" class="vanta-combo-trigger status-pill" aria-haspopup="listbox" aria-expanded="false">
+            <span class="vanta-combo-label">🎧 Bit-Perfect (Flat)</span>
+            <span class="vanta-combo-caret">▾</span>
+          </button>
+          <div class="vanta-combo-menu hidden" role="listbox"></div>
+        </div>
+
+        <button id="btnOpenLogs" data-testid="open-logs-btn" class="status-pill" title="Open C:\Vanta\VantaVault\logs\vanta.log">
+          📜 Logs
+        </button>
+
+        <div id="stageFxCombo" data-testid="stage-fx-combo" class="vanta-combo no-drag" title="Beat &amp; Stage Reactive Lighting FX (60 FPS Audio Sync)">
+          <button type="button" class="vanta-combo-trigger status-pill" aria-haspopup="listbox" aria-expanded="false">
+            <span class="fx-dot"></span>
+            <span class="vanta-combo-label">FX: Off</span>
+            <span class="vanta-combo-caret">▾</span>
+          </button>
+          <div id="stageFxMenu" class="vanta-combo-menu stage-fx-menu hidden" role="listbox"></div>
+        </div>
+
+        <button id="btnCinemaStage" data-testid="cinema-stage-btn" type="button" class="status-pill cinema-stage-btn" title="Cinema Mode: hide center playlist to showcase background video &amp; FX (Esc to return)">
+          🎭 Stage
+        </button>
+
+        <div class="segmented-group" data-testid="theme-switcher">
+          <button class="seg-btn" data-theme="obsidian">Obsidian</button>
+          <button class="seg-btn" data-theme="slate">Slate</button>
+          <button class="seg-btn active" data-theme="ice">Ice</button>
+        </div>
+
+        <div class="win-controls">
+          <button id="winMinBtn" class="win-btn" title="Minimize">─</button>
+          <button id="winMaxBtn" class="win-btn" title="Maximize / Restore">□</button>
+          <button id="winCloseBtn" class="win-btn close" title="Close VANTA">✕</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- ======================================================================
+         2. LEFT SIDEBAR (246px — 15 Custom Duotone Neon SVG Navigation Items)
+         ====================================================================== -->
+    <aside class="sidebar glass" data-testid="left-sidebar">
+      <div>
+        <!-- DISCOVER -->
+        <div class="nav-section-header">Discover</div>
+
+        <button class="nav-item active" data-nav="home">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="2">
+            <path d="M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1h-5.5v-6h-5v6H4a1 1 0 0 1-1-1v-9.5z" />
+          </svg>
+          <span>Home</span>
+        </button>
+
+        <button class="nav-item" data-nav="vibe">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2">
+            <circle cx="12" cy="12" r="2.5" />
+            <path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2" />
+          </svg>
+          <span>Vibe Radio</span>
+        </button>
+
+        <button class="nav-item" data-nav="dna">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#ff4d8d" stroke-width="2">
+            <path d="M4 4c6 0 10 16 16 16M20 4c-6 0-10 16-16 16M7 7h10M7 17h10" />
+          </svg>
+          <span>Song DNA</span>
+        </button>
+
+        <button class="nav-item" data-nav="capsule">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#ffd166" stroke-width="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 7v5l3.5 2" />
+          </svg>
+          <span>Time Capsule</span>
+        </button>
+
+        <button class="nav-item" data-nav="dj">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="2">
+            <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6" />
+          </svg>
+          <span>DJ Studio</span>
+        </button>
+
+        <button class="nav-item" data-nav="remix">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#ff4d8d" stroke-width="2">
+            <path d="M12 3l1.9 4.6L18.5 9l-4.6 1.9L12 15.5l-1.9-4.6L5.5 9l4.6-1.4L12 3z" />
+            <path d="M19 16l.9 2.1L22 19l-2.1.9L19 22l-.9-2.1L16 19l2.1-.9L19 16z" />
+          </svg>
+          <span>AI Remix</span>
+        </button>
+
+        <!-- LIBRARY -->
+        <div class="nav-section-header">Library</div>
+
+        <button class="nav-item" data-nav="tracks">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2">
+            <path d="M9 18V5l12-2v13" />
+            <circle cx="6" cy="18" r="3" />
+            <circle cx="18" cy="16" r="3" />
+          </svg>
+          <span>Tracks</span>
+          <span id="badgeTrackCount" class="nav-badge">0</span>
+        </button>
+
+        <button class="nav-item" data-nav="albums">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="2">
+            <circle cx="12" cy="12" r="9" />
+            <circle cx="12" cy="12" r="2.5" />
+          </svg>
+          <span>Albums</span>
+        </button>
+
+        <button class="nav-item" data-nav="artists">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#ff4d8d" stroke-width="2">
+            <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+            <path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4M8 22h8" />
+          </svg>
+          <span>Artists</span>
+        </button>
+
+        <button class="nav-item" data-nav="playlists">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2">
+            <path d="M4 6h16M4 12h10M4 18h10M18 14v6M15 17h6" />
+          </svg>
+          <span>Playlists</span>
+          <span id="badgePlaylistCount" class="nav-badge">0</span>
+        </button>
+
+        <button class="nav-item" data-nav="videos">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" stroke-width="2">
+            <rect x="2" y="4" width="20" height="16" rx="3" />
+            <path d="M10 9l5 3-5 3V9z" />
+          </svg>
+          <span>Video Clips</span>
+          <span id="badgeVideoCount" class="nav-badge">0</span>
+        </button>
+
+        <!-- SOURCES -->
+        <div class="nav-section-header">Sources</div>
+
+        <button id="btnNavComputerExplorer" class="nav-item" data-nav="explorer" data-testid="nav-computer-explorer">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="2">
+            <rect x="2" y="4" width="20" height="14" rx="2" />
+            <path d="M8 20h8M12 18v2" />
+          </svg>
+          <span>Computer Explorer</span>
+          <span class="nav-badge">PC</span>
+        </button>
+
+        <button id="btnExportWallet" class="nav-item" data-action="export-wallet">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2">
+            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+            <path d="M17 21v-8H7v8M7 3v5h8" />
+          </svg>
+          <span>Export Music Wallet</span>
+        </button>
+
+        <button class="nav-item" data-nav="doctor">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2">
+            <path d="M9 12l2 2 4-4" />
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+          </svg>
+          <span>Vault &amp; Doctor</span>
+          <span id="badgeDoctorCount" class="nav-badge">0</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- ======================================================================
+         3. CENTER MAIN STAGE (1fr — Hero Vibe + Universal Batch Importer + 4 Vibe Cards + Queue/DNA)
+         ====================================================================== -->
+    <main class="main-stage">
+      <button id="btnExitCinemaStage" type="button" class="btn btn-ghost cinema-exit-pill hidden" title="Return to Playlist &amp; Queue (Esc)">
+        ← Show Playlist (Esc)
+      </button>
+
+      <!-- 3.0 4K THEATER CINEMA STAGE (reparents #vantaVideoPlayer cleanly without recreating MediaElementSource) -->
+      <section id="theaterVideoStage" class="theater-stage hidden" aria-label="4K Video Theater Stage">
+        <canvas id="theaterAmbilightCanvas" class="theater-ambilight" aria-hidden="true"></canvas>
+        <div class="theater-top-osd">
+          <div class="theater-meta-group">
+            <span id="theaterTechBadge" class="theater-tech-badge">4K UHD • DIRECT GPU</span>
+            <span id="theaterVideoTitle" class="theater-video-title"></span>
+          </div>
+          <div class="theater-top-actions">
+            <button id="btnTheaterClose" type="button" class="btn btn-ghost theater-osd-btn" title="Minimize to Right Dock &amp; Show Queue (Esc)">
+              ↙ Queue
+            </button>
+          </div>
+        </div>
+
+        <div id="theaterVideoMount" class="theater-video-mount"></div>
+        <div id="theaterCenterOverlay" class="theater-center-overlay hidden" aria-hidden="true">▶ Play</div>
+
+        <div id="theaterOsdBar" class="theater-bottom-osd">
+          <div class="theater-seek-row">
+            <span id="theaterCurrentTime" class="theater-timecode">00:00</span>
+            <div id="theaterSeekTrack" class="theater-seek-track" role="slider" aria-label="Video Seek Bar" tabindex="0">
+              <div id="theaterSeekBuffer" class="theater-seek-buffer"></div>
+              <div id="theaterSeekFill" class="theater-seek-fill"></div>
+              <div id="theaterSeekThumb" class="theater-seek-thumb"></div>
+              <div id="theaterSeekHover" class="theater-seek-hover hidden">00:00</div>
+            </div>
+            <span id="theaterTotalTime" class="theater-timecode">00:00</span>
+          </div>
+
+          <div class="theater-controls-row">
+            <div class="theater-osd-left">
+              <button id="btnTheaterBack10" type="button" class="btn btn-ghost theater-osd-btn">⏪ -10s</button>
+              <button id="btnTheaterPlayPause" type="button" class="btn btn-ghost theater-osd-btn theater-play-btn">▶ Play</button>
+              <button id="btnTheaterFwd10" type="button" class="btn btn-ghost theater-osd-btn">⏩ +10s</button>
+              <div class="theater-vol-group">
+                <button id="btnTheaterMute" type="button" class="btn btn-ghost theater-osd-btn theater-icon-btn" title="Mute / Unmute Video (M)">🔊</button>
+                <input id="theaterVolumeSlider" type="range" min="0" max="100" value="100" class="theater-vol-slider" aria-label="Video Volume" />
+              </div>
+            </div>
+            <div class="theater-osd-right">
+              <label class="theater-select-wrap" title="Playback Speed">
+                <span>⚡</span>
+                <select id="theaterSpeedSelect" class="theater-osd-select" aria-label="Playback Speed">
+                  <option value="0.5">0.5x</option>
+                  <option value="0.75">0.75x</option>
+                  <option value="1" selected>1.0x</option>
+                  <option value="1.25">1.25x</option>
+                  <option value="1.5">1.5x</option>
+                  <option value="2">2.0x</option>
+                </select>
+              </label>
+              <button id="btnTheaterLoop" type="button" class="btn btn-ghost theater-osd-btn" title="Loop Video">
+                🔁 Loop
+              </button>
+              <label class="theater-select-wrap" title="Audio Language / Stream">
+                <span>🔊</span>
+                <select id="theaterAudioSelect" class="theater-osd-select" aria-label="Audio Stream">
+                  <option value="0">Audio #1</option>
+                </select>
+              </label>
+              <label class="theater-select-wrap" title="Subtitle Track (SRT / VTT)">
+                <span>CC</span>
+                <select id="theaterSubSelect" class="theater-osd-select" aria-label="Subtitle Track">
+                  <option value="off">Subtitles Off</option>
+                </select>
+              </label>
+              <button id="btnLoadSubtitleFile" type="button" class="btn btn-ghost theater-osd-btn" title="Load external .srt or .vtt subtitle file">
+                📁 .SRT
+              </button>
+              <button id="btnTheaterAmbilight" type="button" class="btn btn-ghost theater-osd-btn active" title="Toggle dynamic edge Ambilight glow">
+                ✦ Ambilight
+              </button>
+              <button id="btnTheaterPiP" type="button" class="btn btn-ghost theater-osd-btn" title="Picture-in-Picture Float">
+                ⧉ PiP
+              </button>
+              <button id="btnTheaterFullscreen" type="button" class="btn btn-primary theater-osd-btn" title="Toggle Native Fullscreen (F)">
+                ⛶ Fullscreen
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3A. COMPACT HERO HEADER (also hosts active Playlist artwork & quick Play/Shuffle) -->
+      <section id="heroShowcaseCard" class="hero-card hero-compact">
+        <div class="hero-orb"></div>
+        <div id="heroPlaylistArt" class="hero-playlist-art hidden"></div>
+        <div class="hero-content">
+          <div class="hero-tag-row">
+            <span id="heroModuleBadge" class="hero-pill">PERSONAL AUDIO &amp; VIDEO OS</span>
+            <span id="heroSubStatus">BPM, Camelot Key &amp; Energy Curve Synchronized</span>
+          </div>
+          <h1 id="heroHeadline">
+            Tonight's Vibe: <span class="grad-text">Night Walk &amp; Obsidian Synth</span>
+          </h1>
+          <p id="heroDescription">
+            VANTA harmonizes your YouTube Vault streams and Local 24-Bit FLAC / MP3 / MP4 masters with real-time Web Audio DSP.
+          </p>
+        </div>
+        <div id="heroPlaylistActions" class="hero-playlist-actions hidden">
+          <button id="btnHeroPlayAll" type="button" class="btn btn-primary hero-action-btn" title="Play this playlist from track 1">
+            ▶ Play All
+          </button>
+          <button id="btnHeroShufflePlay" type="button" class="btn btn-ghost hero-action-btn" title="Shuffle and play this playlist">
+            🔀 Shuffle
+          </button>
+        </div>
+      </section>
+
+      <!-- 3B. TACTILE RECESSED YOUTUBE MULTI-URL / ID BATCH IMPORTER BAR WITH INLINE PROGRESS INDICATOR -->
+      <section class="batch-bar" data-testid="universal-batch-bar">
+        <div class="batch-input-group">
+          <span class="batch-badge">▶ YouTube Batch</span>
+          <input
+            id="universalBatchInput"
+            data-testid="universal-batch-input"
+            type="text"
+            placeholder="Paste 1 or multiple YouTube URLs (youtube.com/watch?v=..., youtu.be/..., shorts) or 11-char Video IDs..."
+          />
+        </div>
+
+        <div class="segmented-group" id="formatSelectorGroup">
+          <button class="seg-btn active" data-format="MP3+ID3">MP3 + ID3</button>
+          <button class="seg-btn" data-format="MP4 Video">MP4 Video</button>
+          <button class="seg-btn" data-format="ALL">MP3 + MP4</button>
+        </div>
+
+        <div id="batchMiniStatus" class="batch-mini-status" title="YouTube Batch Download Progress">
+          <div class="mini-ring-wrap">
+            <svg viewBox="0 0 28 28">
+              <circle cx="14" cy="14" r="11" fill="none" stroke="rgba(148,163,184,0.22)" stroke-width="2.6" />
+              <circle
+                id="batchProgressCircle"
+                cx="14"
+                cy="14"
+                r="11"
+                fill="none"
+                stroke="#00e5ff"
+                stroke-width="2.6"
+                stroke-dasharray="69"
+                stroke-dashoffset="0"
+                stroke-linecap="round"
+              />
+            </svg>
+            <span id="batchProgressPct" class="mini-ring-pct">✓</span>
+          </div>
+          <span id="batchStatusText" class="batch-mini-label">Ready</span>
+        </div>
+
+        <button id="btnRunBatchDownload" data-testid="run-batch-download-btn" class="btn btn-primary">
+          ↓ Download &amp; Tag All
+        </button>
+      </section>
+
+      <!-- 3C. PRO SMART FOCUS FILTER BAR (Universal BPM, Camelot/Tonal Key, Energy, Stars, Tags & Smart Playlists) -->
+      <section class="smart-filter-bar" data-testid="smart-filter-bar">
+        <div class="filter-chip-group">
+          <label class="filter-label">BPM</label>
+          <input id="filterBpmMin" type="number" min="40" max="240" placeholder="Min" class="filter-num" title="Minimum BPM" />
+          <span style="color: var(--muted);">–</span>
+          <input id="filterBpmMax" type="number" min="40" max="240" placeholder="Max" class="filter-num" title="Maximum BPM" />
+        </div>
+
+        <div class="filter-chip-group">
+          <label class="filter-label">Key</label>
+          <select id="filterKeySelect" class="filter-select" title="Filter by Musical / Camelot Key">
+            <option value="ALL">All Keys</option>
+            <option value="HARMONIC">✨ Harmonic Match (±1)</option>
+            <option value="A min">8A · A min</option>
+            <option value="E min">9A · E min</option>
+            <option value="B min">10A · B min</option>
+            <option value="F# min">11A · F# min</option>
+            <option value="C# min">12A · C# min</option>
+            <option value="G# min">1A · G# min</option>
+            <option value="D# min">2A · D# min</option>
+            <option value="A# min">3A · A# min</option>
+            <option value="F min">4A · F min</option>
+            <option value="C min">5A · C min</option>
+            <option value="G min">6A · G min</option>
+            <option value="D min">7A · D min</option>
+          </select>
+        </div>
+
+        <div class="filter-chip-group">
+          <label class="filter-label">Energy</label>
+          <select id="filterEnergySelect" class="filter-select" title="Filter by Acoustic Energy">
+            <option value="ALL">All Energy</option>
+            <option value="low">Low (&lt;75%)</option>
+            <option value="mid">Mid (75–87%)</option>
+            <option value="high">Peak (88%+)</option>
+          </select>
+        </div>
+
+        <div class="filter-chip-group">
+          <label class="filter-label">Rating</label>
+          <select id="filterStarsSelect" class="filter-select" title="Filter by Exact Star Rating">
+            <option value="0">All</option>
+            <option value="1">★ (1)</option>
+            <option value="2">★★ (2)</option>
+            <option value="3">★★★ (3)</option>
+            <option value="4">★★★★ (4)</option>
+            <option value="5">★★★★★ (5)</option>
+          </select>
+        </div>
+
+        <div id="filterTagsCombo" data-testid="filter-tags-combo" class="vanta-combo filter-multi-combo filter-chip-group" title="Filter by Tags (Multi-Select)">
+          <label class="filter-label">Tag</label>
+          <button type="button" class="vanta-combo-trigger filter-combo-trigger" aria-haspopup="listbox" aria-expanded="false">
+            <span class="vanta-combo-label">All Tags</span>
+            <span class="vanta-combo-caret">▾</span>
+          </button>
+          <div class="vanta-combo-menu hidden" role="listbox"></div>
+        </div>
+
+        <div id="filterGroupsCombo" data-testid="filter-groups-combo" class="vanta-combo filter-multi-combo filter-chip-group" title="Filter by Groups (Multi-Select)">
+          <label class="filter-label">Group</label>
+          <button type="button" class="vanta-combo-trigger filter-combo-trigger" aria-haspopup="listbox" aria-expanded="false">
+            <span class="vanta-combo-label">All Groups</span>
+            <span class="vanta-combo-caret">▾</span>
+          </button>
+          <div class="vanta-combo-menu hidden" role="listbox"></div>
+        </div>
+
+        <button
+          id="btnFilterFavorites"
+          data-testid="filter-favorites-btn"
+          type="button"
+          class="filter-chip-group filter-heart-btn"
+          aria-pressed="false"
+          title="Filter Favorite Tracks Only"
+        >
+          <svg class="heart-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path>
+          </svg>
+        </button>
+
+        <div class="filter-actions">
+          <button id="btnSaveSmartPlaylist" class="btn btn-ghost filter-btn" title="Save current filter rules as a Smart Playlist">+ Smart List</button>
+          <button id="btnResetFilters" class="btn btn-ghost filter-btn" title="Clear all filters">Reset</button>
+        </div>
+      </section>
+
+      <!-- 3D. SPLIT WORKSPACE: LAZY COMPUTER EXPLORER (OPTIONAL) + FULL-WIDTH TRACK LIBRARY PANEL -->
+      <section id="centerSplitStage" class="center-full">
+        <aside id="computerExplorerPane" class="surface-panel explorer-pane hidden" data-testid="computer-explorer-pane">
+          <div class="explorer-header">
+            <div class="explorer-title-wrap">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--a1)" stroke-width="2.1">
+                <rect x="2" y="4" width="20" height="14" rx="2" />
+                <path d="M8 20h8M12 18v2" />
+              </svg>
+            </div>
+            <div class="explorer-header-actions">
+              <button
+                id="btnRefreshExplorer"
+                type="button"
+                class="btn btn-ghost explorer-hdr-btn"
+                title="Rescan drives and open folders from disk"
+              >
+                ⟳ Refresh
+              </button>
+              <button
+                id="btnExplorerHiddenMgr"
+                type="button"
+                class="btn btn-ghost explorer-hdr-btn hidden"
+                title="View and restore folders hidden from Computer Explorer"
+              >
+                Hidden (0)
+              </button>
+            </div>
+          </div>
+
+          <div id="explorerHiddenPopover" class="explorer-hidden-popover hidden">
+            <div class="explorer-hidden-hdr">
+              <span>Hidden Folders</span>
+              <div class="explorer-hidden-hdr-btns">
+                <button id="btnRestoreAllHiddenDirs" type="button" class="btn btn-ghost explorer-hdr-btn">
+                  Restore All
+                </button>
+                <button id="btnCloseHiddenPopover" type="button" class="explorer-close-btn" title="Close">×</button>
+              </div>
+            </div>
+            <div id="explorerHiddenList" class="explorer-hidden-list"></div>
+          </div>
+
+          <div id="computerTreeRoot" class="computer-tree-root" data-testid="computer-tree-root"></div>
+        </aside>
+
+        <div id="queuePanel" class="surface-panel queue-panel">
+          <div class="panel-header list-toolbar">
+            <div class="list-title-wrap">
+              <h3 id="queuePanelTitle">Library &amp; Vault Queue</h3>
+              <span id="listMatchCount" class="list-count-pill">0 tracks</span>
+            </div>
+
+            <!-- In-List Professional Search & Sort Controls -->
+            <div class="list-controls-wrap">
+              <div class="list-search-box">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                  <circle cx="11" cy="11" r="7"></circle>
+                  <path d="M20 20l-3.5-3.5"></path>
+                </svg>
+                <input
+                  id="listSearchInput"
+                  data-testid="list-search-input"
+                  type="text"
+                  placeholder="Search title, artist, #tag, bpm:120-130, key:8A, star:4+..."
+                />
+              </div>
+
+              <select id="listSortSelect" class="filter-select" title="Sort Tracks">
+                <option value="default">Sort: Default</option>
+                <option value="title-asc">Title A–Z</option>
+                <option value="artist-asc">Artist A–Z</option>
+                <option value="bpm-asc">BPM ↑</option>
+                <option value="bpm-desc">BPM ↓</option>
+                <option value="key-asc">Key (Camelot)</option>
+                <option value="genre-asc">Genre A–Z</option>
+                <option value="time-desc">Time ↓</option>
+                <option value="created-desc">Newest Created</option>
+                <option value="size-desc">Size ↓</option>
+                <option value="stars-desc">Rating ★</option>
+                <option value="energy-desc">Energy %</option>
+              </select>
+
+              <button id="btnRepairDoctorInline" class="btn btn-ghost" style="padding: 5px 10px; font-size: 11px;">
+                🩺 Quality Doctor: Healthy
+              </button>
+              <button
+                id="btnClearPlaylist"
+                data-testid="clear-playlist-btn"
+                type="button"
+                class="btn btn-ghost btn-danger-ghost"
+                style="padding: 5px 10px; font-size: 11px;"
+                title="Clear all tracks from playlist/queue (keeps files safe on disk)"
+                disabled
+              >
+                🗑️ Clear
+              </button>
+            </div>
+          </div>
+
+          <!-- Smart Playlists Rules Manager Bar (opens in Playlists workspace or when user has active rules) -->
+          <div id="smartPlaylistBar" class="smart-playlist-bar hidden" data-testid="smart-playlist-bar">
+            <div class="smart-bar-hdr">
+              <div class="smart-bar-title-wrap">
+                <span class="smart-bar-title">Smart Playlist Rules</span>
+                <span id="smartRulesSummaryBadge" class="list-count-pill">0 rules</span>
+              </div>
+              <div class="smart-bar-actions">
+                <button id="btnClearActiveRule" type="button" class="btn btn-ghost explorer-hdr-btn hidden">
+                  Clear Active Rule
+                </button>
+                <button id="btnNewSmartRule" type="button" class="btn btn-primary explorer-hdr-btn" data-testid="new-smart-rule-btn">
+                  + New Rule
+                </button>
+              </div>
+            </div>
+            <div id="smartPlaylistGrid" class="smart-playlist-grid" data-testid="smart-playlist-grid"></div>
+          </div>
+
+          <!-- Inline Tag & Group Editor Bar (opens when clicking +Tag on any track) -->
+          <div id="inlineTagEditor" class="inline-tag-editor hidden">
+            <span id="tagEditorTrackName" class="tag-editor-title">Editing Track</span>
+            <input id="tagInputField" type="text" placeholder="New tag..." class="tag-editor-input" />
+            <button id="btnConfirmAddTag" class="btn btn-primary" style="padding: 4px 9px; font-size: 11px;">+ Add</button>
+            <select id="existingTagSelect" class="filter-select tag-editor-select" title="Assign an existing Tag immediately">
+              <option value="">Existing Tag ▾</option>
+            </select>
+            <input id="groupInputField" type="text" placeholder="New group..." class="tag-editor-input" />
+            <button id="btnConfirmAddGroup" class="btn btn-ghost" style="padding: 4px 9px; font-size: 11px;">+ Add</button>
+            <select id="existingGroupSelect" class="filter-select tag-editor-select" title="Assign an existing Group immediately">
+              <option value="">Existing Group ▾</option>
+            </select>
+            <button id="btnCloseTagEditor" class="btn btn-ghost" style="padding: 4px 8px; font-size: 11px;">✕</button>
+          </div>
+
+          <!-- Rekordbox 7 Professional Columnar Library Table -->
+          <div id="rbTableViewport" class="rb-table-viewport">
+            <div id="rbTableHeader" class="rb-table-header" role="row"></div>
+            <div id="trackQueueList" data-testid="track-queue-list" class="track-list rb-table-body"></div>
+          </div>
+
+          <!-- Right-click Column Customizer Context Menu -->
+          <div id="rbColumnMenu" class="rb-col-menu hidden" role="menu"></div>
+
+          <!-- Dual-Panel Cascading + Live-Search Genre Picker Popover -->
+          <div id="rbGenrePopover" class="rb-genre-popover hidden" role="dialog" aria-label="Genre and Subgenre Picker"></div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- ======================================================================
+         4. RIGHT STUDIO INSPECTOR DOCK (334px — 4-Mode Stage + Live 8-Band EQ)
+         ====================================================================== -->
+    <aside class="right-dock glass" data-testid="right-studio-dock">
+
+      <!-- 4A. NOW PLAYING 4-MODE VISUAL DECK -->
+      <div class="now-playing-card">
+        <div class="segmented-group" id="stageModeSwitcher" style="width: 100%; justify-content: space-between;">
+          <button class="seg-btn active" data-stage="wave" style="flex: 1;">Wave</button>
+          <button class="seg-btn" data-stage="video" style="flex: 1;">🎬 Video</button>
+          <button class="seg-btn" data-stage="vinyl" style="flex: 1;">💿 Vinyl</button>
+          <button class="seg-btn" data-stage="lyrics" style="flex: 1;">🎤 Lyric</button>
+        </div>
+
+        <!-- Stage 1: Artwork + 60 FPS Rounded-Bar & Spline Wave Canvas -->
+        <div id="stageContainer-wave">
+          <div id="dockArtworkBox" class="art-showcase">🎧</div>
+          <h3 id="dockTrackTitle" style="font-size: 15px; font-weight: 900; margin-top: 6px;">No Track Loaded</h3>
+          <p id="dockTrackSubtitle" style="font-size: 11.8px; color: var(--muted); margin-top: 2px;">Select a folder or download from YouTube</p>
+          <div id="dockStreamTelemetry" class="stream-telemetry-pill">🎛️ Studio DSP · Shared Audio Ready</div>
+          <div class="stage-box" style="margin-top: 8px;">
+            <div id="vizModeSwitcher" class="viz-mode-bar" data-testid="viz-mode-switcher" title="Select Pro Audio Visualization Mode">
+              <button type="button" class="viz-pill active" data-viz="prism">Aurora</button>
+              <button type="button" class="viz-pill" data-viz="rta">RTA</button>
+              <button type="button" class="viz-pill" data-viz="vu">VU L/R</button>
+            </div>
+            <canvas id="vantaWaveCanvas" width="268" height="84" style="width: 100%; height: 84px; cursor: pointer;"></canvas>
+          </div>
+        </div>
+
+        <!-- Stage 2: Embedded HTML5 Video Clip Player (4K / MKV / MP4 + Theater + PiP) -->
+        <div id="stageContainer-video" class="hidden">
+          <div class="stage-box" style="position: relative; overflow: hidden;">
+            <div id="dockVideoMount" class="dock-video-mount">
+              <video
+                id="vantaVideoPlayer"
+                crossorigin="anonymous"
+                playsinline
+              ></video>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px;">
+              <span id="dockVideoStatusBadge" style="color: var(--a2); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">4K GPU + WebAudio EQ</span>
+              <div style="display: flex; gap: 4px; flex-shrink: 0;">
+                <button id="btnOpenTheater" type="button" class="btn btn-primary" style="padding: 3px 9px; font-size: 11px;">⛶ Theater</button>
+                <button id="btnTogglePiP" type="button" class="btn btn-ghost" style="padding: 3px 9px; font-size: 11px;">⧉ PiP</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Stage 3: Vinyl Soul Spinning Turntable -->
+        <div id="stageContainer-vinyl" class="hidden">
+          <div class="stage-box" style="padding: 14px;">
+            <div id="vinylPlatterDisc" class="vinyl-platter">
+              <div class="brand-mark" style="border-radius: 50%;">V</div>
+            </div>
+            <div style="font-weight: 800; font-size: 13px; margin-top: 6px;">Vinyl Soul Analog Engine</div>
+            <div style="font-size: 11px; color: var(--muted);">Harmonic Tube Warmth + Stylus Crackle</div>
+          </div>
+        </div>
+
+        <!-- Stage 4: Karaoke Synchronized Lyrics & Vocal Cancellation -->
+        <div id="stageContainer-lyrics" class="hidden">
+          <div class="stage-box lyrics-stage-box">
+            <div class="lyrics-header-row">
+              <span class="lyrics-title-label">Lyrics</span>
+              <button
+                type="button"
+                id="btnCopyLyrics"
+                data-testid="copy-lyrics-btn"
+                class="lyrics-copy-btn"
+                title="Copy lyrics to clipboard"
+                aria-label="Copy lyrics to clipboard"
+                disabled
+              >
+                <svg class="lyrics-copy-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+                <span class="lyrics-copy-label">Copy</span>
+              </button>
+            </div>
+            <div id="activeLyricLine" class="lyrics-scroll-body" data-testid="lyrics-scroll-body">
+              <div class="lyric-empty">No embedded lyrics found for this track.</div>
+            </div>
+            <button id="btnKaraokeStageToggle" class="btn btn-primary lyrics-karaoke-btn">
+              🎤 Toggle Lead Vocal Remover (Karaoke)
+            </button>
+          </div>
+        </div>
+
+        <!-- Quick DSP Chips inside Now Playing -->
+        <div class="chip-list" style="justify-content: center;">
+          <button class="chip on" data-dsp="lufs" title="Non-destructive EBU R128 ReplayGain (-14.0 LUFS)">EBU R128</button>
+          <button class="chip" data-dsp="spatial" title="3D Binaural & Mid-Side Spatializer (160Hz+ stereo stage widening + micro Haas depth)">Spatial 3D</button>
+          <button class="chip" data-dsp="crossfeed" title="Bauer/Meier Headphone Crossfeed (700Hz natural acoustic speaker stage)">Crossfeed</button>
+          <button class="chip" data-dsp="bassBoost" title="Dynamic 70Hz Sub-Bass Shelf & 120Hz Punch">Bass Boost</button>
+          <button class="chip" data-dsp="exciter" title="4.5kHz+ Harmonic Exciter / Crystalizer brilliance">Exciter</button>
+          <button class="chip" data-dsp="reverb" title="18ms Pre-Delay Hall Reverb">Reverb</button>
+          <button class="chip on" data-dsp="limiter" title="True-Peak Clip Protection Limiter (-1.5 dBFS)">Limiter</button>
+          <button class="chip" data-dsp="karaoke" title="Mid-Side Lead Vocal Cancellation">Karaoke</button>
+          <button class="chip" data-dsp="vinyl" title="Analog Tube Warmth & Vinyl Texture">Vinyl Soul</button>
+          <button class="chip" id="btnToggleDop" data-testid="dop-toggle-chip" title="Native DoP v1.1 (DSD over PCM) for DSD64/128/256 over WASAPI Exclusive DACs (auto-falls back to DXD PCM if DAC rejects DoP)">DoP v1.1</button>
+          <button class="chip dsp-rack-open-chip" id="btnOpenDspRack" data-testid="open-dsp-rack-btn" title="Open 10-Band EQ, Spatial 3D, Crossfeed, Pitch Shift & Fine DSP Rack">🎛️ DSP Rack</button>
+        </div>
+      </div>
+
+    </aside>
+
+    <!-- ======================================================================
+         5. PERSISTENT BOTTOM MASTER PLAYER BAR (92px — Pro 3-Zone Transport, Scrubber & Volume)
+         ====================================================================== -->
+    <footer class="playerbar glass" data-testid="bottom-player-bar">
+      <!-- Dual-Deck HTML5 audio elements connected to Web Audio DSP graph -->
+      <audio id="vantaAudioPlayer" crossorigin="anonymous"></audio>
+      <audio id="vantaAudioDeckB" crossorigin="anonymous"></audio>
+
+      <!-- Left Zone: Minimal Artwork Badge Only (zero text clutter) -->
+      <div class="mini-now">
+        <div id="footerMiniThumb" class="mini-thumb">🎧</div>
+      </div>
+      <div id="footerStatusToast" class="floating-toast hidden" role="status" aria-live="polite"></div>
+
+      <!-- Center Zone: Figma-Grade Transport Cluster + Precision Scrubber -->
+      <div class="player-center">
+        <div class="transport-cluster">
+          <button id="btnLastPlayedTrack" data-testid="last-played-btn" class="icon-btn compact" title="Back to Last Played Track (No history yet)" aria-label="Back to Last Played Track" disabled>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/>
+            </svg>
+          </button>
+          <button id="btnShuffle" class="icon-btn compact" title="Shuffle Queue" aria-label="Shuffle">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/>
+              <polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>
+            </svg>
+          </button>
+          <button id="btnPrevTrack" class="icon-btn compact" title="Previous Track" aria-label="Previous">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="4" y="5" width="2.4" height="14" rx="1.2"/>
+              <path d="M19.5 5.8a1 1 0 0 0-1.53-.85l-9.2 6.2a1 1 0 0 0 0 1.7l9.2 6.2a1 1 0 0 0 1.53-.85V5.8Z"/>
+            </svg>
+          </button>
+          <button id="btnSeekBack10" class="icon-btn seek-step" title="Skip Back 10 Seconds" aria-label="Back 10 seconds">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>
+            </svg>
+            <span>10s</span>
+          </button>
+          <button id="btnPlayPause" data-testid="master-play-btn" class="icon-btn play-main" title="Play / Pause (Space)" aria-label="Play or Pause">
+            <svg id="playPauseIconSvg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M7.5 5.14a1 1 0 0 1 1.52-.85l10.6 6.86a1 1 0 0 1 0 1.7l-10.6 6.86a1 1 0 0 1-1.52-.85V5.14Z"/>
+            </svg>
+          </button>
+          <button id="btnSeekForward10" class="icon-btn seek-step" title="Skip Forward 10 Seconds" aria-label="Forward 10 seconds">
+            <span>10s</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>
+            </svg>
+          </button>
+          <button id="btnNextTrack" class="icon-btn compact" title="Next Track" aria-label="Next">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="17.6" y="5" width="2.4" height="14" rx="1.2"/>
+              <path d="M4.5 5.8a1 1 0 0 1 1.53-.85l9.2 6.2a1 1 0 0 1 0 1.7l-9.2 6.2a1 1 0 0 1-1.53-.85V5.8Z"/>
+            </svg>
+          </button>
+          <button id="btnRepeatMode" class="icon-btn compact" title="Repeat Mode: Queue" aria-label="Repeat Mode">
+            <svg id="repeatIconSvg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+              <polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+            </svg>
+            <span id="repeatOneBadge" class="repeat-one-badge hidden">1</span>
+          </button>
+        </div>
+
+        <div class="scrubber-row">
+          <span id="timeElapsedLabel" class="time-stamp">00:00</span>
+          <div id="masterTimelineTrack" class="pro-timeline-track" data-testid="pro-timeline-track" title="Click or drag to seek">
+            <div class="timeline-rail"></div>
+            <div id="masterTimelineFill" class="timeline-fill" style="width: 0%;"></div>
+            <div id="masterTimelineThumb" class="timeline-thumb" style="left: clamp(6px, 0%, calc(100% - 6px));"></div>
+            <div id="timelineHoverTip" class="timeline-hover-tip hidden">00:00</div>
+          </div>
+          <span id="timeRemainingLabel" class="time-stamp">-00:00</span>
+        </div>
+      </div>
+
+      <!-- Right Zone: Crossfade, Speed, Bidirectional Windows Volume & Quick Export -->
+      <div class="player-right">
+        <select id="crossfadeSelect" class="crossfade-select" title="Select Gapless or Dual-Deck Crossfade overlap">
+          <option value="0">Gapless (0s)</option>
+          <option value="3">Fade 3s</option>
+          <option value="6">Fade 6s</option>
+          <option value="10">Fade 10s</option>
+        </select>
+
+        <button id="btnPlaybackSpeed" class="icon-btn speed-pill" title="Playback Speed / Slowed+Reverb Pitch">
+          1.00x
+        </button>
+
+        <div id="volumeControlGroup" class="volume-control" title="Master Volume (Synced with Windows System Volume)">
+          <button id="btnVolumeMute" data-testid="volume-mute-btn" class="vol-mute-btn" title="Mute / Unmute" aria-label="Mute or Unmute">
+            <svg id="volumeIconSvg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+            </svg>
+          </button>
+          <input
+            id="masterVolumeSlider"
+            data-testid="master-volume-slider"
+            class="vol-slider"
+            type="range"
+            min="0"
+            max="100"
+            value="100"
+          />
+          <span id="volumePercentLabel" class="vol-pct">100%</span>
+        </div>
+
+        <button id="btnQuickSaveTrack" class="btn btn-primary compact-save" title="Download & Embed ID3v2 Cover Art into C:\Vanta\VantaVault">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          <span>Save</span>
+        </button>
+      </div>
+    </footer>
+
+  </div>
+
+  <!-- Non-Destructive Clear Playlist Confirmation Modal -->
+  <div id="confirmClearModal" class="vanta-modal-backdrop hidden" data-testid="confirm-clear-modal" role="dialog" aria-modal="true" aria-labelledby="clearModalTitle">
+    <div class="vanta-modal-card">
+      <div class="vanta-modal-header">
+        <div class="vanta-modal-icon" aria-hidden="true">⚠️</div>
+        <h3 id="clearModalTitle" class="vanta-modal-title">Clear Entire Playlist?</h3>
+      </div>
+      <p id="clearModalMessage" class="vanta-modal-body">
+        All tracks will be removed from your VANTA playlist and queue.
+      </p>
+      <div class="vanta-modal-note">
+        Files on your disk will NOT be deleted — you can re-add folders anytime with "Computer Explorer".
+      </div>
+      <div class="vanta-modal-actions">
+        <button id="btnCancelClearModal" type="button" class="btn btn-ghost">Cancel</button>
+        <button id="btnConfirmClearModal" data-testid="confirm-clear-btn" type="button" class="btn btn-danger">Clear Playlist</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Smart Playlist Rule Editor Modal (Create / Edit dynamic BPM, Key, Energy, Rating, Tag, Group & Favorite rules) -->
+  <div id="smartRuleModal" class="vanta-modal-backdrop hidden" data-testid="smart-rule-modal" role="dialog" aria-modal="true" aria-labelledby="smartRuleModalTitle">
+    <div class="vanta-modal-card smart-rule-modal-card">
+      <div class="vanta-modal-header">
+        <div class="vanta-modal-icon" aria-hidden="true">🎛️</div>
+        <h3 id="smartRuleModalTitle" class="vanta-modal-title">New Smart Playlist Rule</h3>
+      </div>
+
+      <div class="smart-rule-form">
+        <div class="smart-rule-identity-row">
+          <div id="smartRuleCoverPreview" class="smart-rule-cover-preview"></div>
+          <div class="smart-rule-identity-fields">
+            <div class="smart-rule-field">
+              <label class="smart-rule-label" for="smartRuleNameInput">Playlist Name</label>
+              <input id="smartRuleNameInput" data-testid="smart-rule-name-input" type="text" class="smart-rule-input" placeholder="e.g. Night Drive 120–132, Warmup Set, Favorites 5★..." />
+            </div>
+            <div class="smart-rule-field">
+              <label class="smart-rule-label" for="smartRuleDescInput">Studio Note / Description (optional)</label>
+              <input id="smartRuleDescInput" type="text" maxlength="120" class="smart-rule-input" placeholder="e.g. Peak-hour melodic set with warm sub-bass" />
+            </div>
+          </div>
+        </div>
+
+        <div class="smart-cover-swatch-bar">
+          <span class="smart-rule-label">Cover Style:</span>
+          <div id="ruleCoverSwatches" class="cover-swatches-row"></div>
+          <button id="btnUploadRuleCover" type="button" class="btn btn-ghost explorer-hdr-btn" title="Choose a custom image from your PC (auto-optimized 256×256)">
+            📷 Upload Image…
+          </button>
+        </div>
+
+        <div class="smart-rule-field">
+          <label class="smart-rule-label" for="ruleBpmMin">BPM Min</label>
+          <input id="ruleBpmMin" type="number" min="40" max="240" class="smart-rule-input" placeholder="Any (e.g. 118)" />
+        </div>
+
+        <div class="smart-rule-field">
+          <label class="smart-rule-label" for="ruleBpmMax">BPM Max</label>
+          <input id="ruleBpmMax" type="number" min="40" max="240" class="smart-rule-input" placeholder="Any (e.g. 134)" />
+        </div>
+
+        <div class="smart-rule-field">
+          <label class="smart-rule-label" for="ruleKeySelect">Musical / Camelot Key</label>
+          <select id="ruleKeySelect" class="smart-rule-input">
+            <option value="ALL">All Keys</option>
+            <option value="HARMONIC">✨ Harmonic Match (±1)</option>
+            <option value="A min">8A · A min</option>
+            <option value="E min">9A · E min</option>
+            <option value="B min">10A · B min</option>
+            <option value="F# min">11A · F# min</option>
+            <option value="C# min">12A · C# min</option>
+            <option value="G# min">1A · G# min</option>
+            <option value="D# min">2A · D# min</option>
+            <option value="A# min">3A · A# min</option>
+            <option value="F min">4A · F min</option>
+            <option value="C min">5A · C min</option>
+            <option value="G min">6A · G min</option>
+            <option value="D min">7A · D min</option>
+          </select>
+        </div>
+
+        <div class="smart-rule-field">
+          <label class="smart-rule-label" for="ruleEnergySelect">Acoustic Energy</label>
+          <select id="ruleEnergySelect" class="smart-rule-input">
+            <option value="ALL">All Energy</option>
+            <option value="low">Low (&lt;75%)</option>
+            <option value="mid">Mid (75–87%)</option>
+            <option value="high">Peak (88%+)</option>
+          </select>
+        </div>
+
+        <div class="smart-rule-field">
+          <label class="smart-rule-label" for="ruleStarsSelect">Exact Rating</label>
+          <select id="ruleStarsSelect" class="smart-rule-input">
+            <option value="0">Any Rating</option>
+            <option value="1">★ (1)</option>
+            <option value="2">★★ (2)</option>
+            <option value="3">★★★ (3)</option>
+            <option value="4">★★★★ (4)</option>
+            <option value="5">★★★★★ (5)</option>
+          </select>
+        </div>
+
+        <div class="smart-rule-field">
+          <label class="smart-rule-label" for="ruleSortSelect">Sort Order</label>
+          <select id="ruleSortSelect" class="smart-rule-input">
+            <option value="default">Default Order</option>
+            <option value="title-asc">Title A–Z</option>
+            <option value="bpm-asc">BPM ↑</option>
+            <option value="bpm-desc">BPM ↓</option>
+            <option value="stars-desc">Rating ★</option>
+            <option value="energy-desc">Energy %</option>
+          </select>
+        </div>
+
+        <div class="smart-rule-field full-span">
+          <label class="smart-rule-label" for="ruleTagsInput">Tags (comma-separated, optional)</label>
+          <input id="ruleTagsInput" type="text" class="smart-rule-input" placeholder="e.g. nightdrive, warmup" />
+          <div id="ruleExistingTagsChips" class="smart-rule-suggest-chips"></div>
+        </div>
+
+        <div class="smart-rule-field full-span">
+          <label class="smart-rule-label" for="ruleGroupsInput">Groups (comma-separated, optional)</label>
+          <input id="ruleGroupsInput" type="text" class="smart-rule-input" placeholder="e.g. Car Mix, Set 1" />
+          <div id="ruleExistingGroupsChips" class="smart-rule-suggest-chips"></div>
+        </div>
+
+        <label class="smart-rule-check full-span">
+          <input id="ruleFavoriteOnly" type="checkbox" />
+          <span>Favorites Only (♥ hearted tracks)</span>
+        </label>
+      </div>
+
+      <div id="smartRulePreviewBanner" class="vanta-modal-note smart-rule-preview">
+        Matches 0 tracks right now
+      </div>
+      <div id="smartRuleValidationMsg" class="smart-rule-validation hidden"></div>
+
+      <div class="vanta-modal-actions">
+        <button id="btnCancelSmartRule" type="button" class="btn btn-ghost">Cancel</button>
+        <button id="btnSaveSmartRule" data-testid="save-smart-rule-btn" type="button" class="btn btn-primary">Save Rule</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Studio Pro Audio DSP Rack Modal (10-Band EQ, Spatial 3D, Crossfeed, Exciter, Limiter, Pitch) -->
+  <div id="dspRackModal" data-testid="dsp-rack-modal" class="vanta-modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="dspRackModalTitle">
+    <div class="vanta-modal-card dsp-rack-card">
+      <div class="vanta-modal-header dsp-rack-header">
+        <div class="dsp-rack-title-wrap">
+          <div class="vanta-modal-icon" style="background: rgba(56, 189, 248, 0.16); color: #38bdf8;">🎛️</div>
+          <div>
+            <h3 id="dspRackModalTitle" class="vanta-modal-title">Studio Pro DSP Rack (32-Bit Float)</h3>
+            <div class="dsp-rack-subtitle">Active on Studio DSP audio tracks &amp; Direct GPU videos · Zero-clipping limiter protected</div>
+          </div>
+        </div>
+        <div class="dsp-rack-header-actions">
+          <button id="btnResetBitPerfect" type="button" class="btn btn-ghost" style="padding: 5px 10px; font-size: 11px;">
+            Bit-Perfect Reset
+          </button>
+          <button id="btnCloseDspRack" type="button" class="btn btn-ghost" style="padding: 5px 9px; font-size: 12px;" aria-label="Close DSP Rack">
+            ✕
+          </button>
+        </div>
+      </div>
+
+      <!-- 10-Band Graphic EQ Section -->
+      <div class="dsp-rack-section">
+        <div class="dsp-section-hdr">
+          <span class="dsp-section-title">10-Band Parametric Equalizer (±12 dB)</span>
+          <div id="dspEqPresetRow" class="dsp-presets-row"></div>
+        </div>
+        <div class="dsp-eq-shell">
+          <div id="eqColumnsContainer" class="eq-columns-wrap dsp-eq-columns"></div>
+          <div id="eqFreqLabelsRow" class="dsp-eq-labels"></div>
+        </div>
+      </div>
+
+      <!-- Pro Spatial, Dynamics & Pitch Sliders -->
+      <div class="dsp-rack-section">
+        <div class="dsp-section-hdr">
+          <span class="dsp-section-title">Spatial Stage, Dynamics &amp; Key Pitch</span>
+          <div class="dsp-rack-toggles">
+            <button type="button" class="chip on" data-dsp="limiter" title="True-Peak Clip Protection Limiter (-1.5 dBFS)">True-Peak Limiter</button>
+            <button type="button" class="chip" data-dsp="nightMode" title="Night Listening Dynamic Compressor (lifts quiet vocals, tames loud peaks)">Night Mode</button>
+          </div>
+        </div>
+
+        <div class="dsp-sliders-grid">
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <button type="button" class="chip" data-dsp="spatial">Spatial 3D Width</button>
+              <span id="dspSpatialWidthVal" class="dsp-slider-val">135%</span>
+            </div>
+            <input id="dspSpatialWidth" type="range" min="0" max="150" step="5" value="135" class="dsp-range" />
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <button type="button" class="chip" data-dsp="crossfeed">Headphone Crossfeed</button>
+              <span id="dspCrossfeedLevelVal" class="dsp-slider-val">55%</span>
+            </div>
+            <input id="dspCrossfeedLevel" type="range" min="0" max="100" step="5" value="55" class="dsp-range" />
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <button type="button" class="chip" data-dsp="bassBoost">Sub-Bass Boost</button>
+              <span id="dspBassBoostDbVal" class="dsp-slider-val">+5.5 dB</span>
+            </div>
+            <input id="dspBassBoostDb" type="range" min="0" max="9" step="0.5" value="5.5" class="dsp-range" />
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <button type="button" class="chip" data-dsp="exciter">Harmonic Exciter</button>
+              <span id="dspExciterMixVal" class="dsp-slider-val">45%</span>
+            </div>
+            <input id="dspExciterMix" type="range" min="0" max="100" step="5" value="45" class="dsp-range" />
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <button type="button" class="chip" data-dsp="reverb">Hall Reverb Mix</button>
+              <span id="dspReverbMixVal" class="dsp-slider-val">22%</span>
+            </div>
+            <input id="dspReverbMix" type="range" min="0" max="45" step="1" value="22" class="dsp-range" />
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <span class="dsp-pitch-label">Key Shift (Pitch)</span>
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <span id="dspPitchSemitonesVal" class="dsp-slider-val">0 st</span>
+                <button id="btnResetPitch" type="button" class="chip" style="padding: 1px 7px; font-size: 10px;">0 st</button>
+              </div>
+            </div>
+            <input id="dspPitchSemitones" type="range" min="-6" max="6" step="1" value="0" class="dsp-range" />
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>

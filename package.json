@@ -1,0 +1,64 @@
+{
+  "name": "vanta-os",
+  "productName": "VANTA",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "VANTA — Personal Audio & Video Operating System (Suno, YouTube & Local Lossless Studio)",
+  "main": "electron/main.cjs",
+  "author": "VANTA Audio Engineering",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/vanta.test.mjs",
+    "build:dir": "electron-builder --dir",
+    "build:win": "electron-builder --win --x64"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.vanta.media.os",
+    "productName": "VANTA",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "bin",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

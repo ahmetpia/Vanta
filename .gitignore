@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build & packaging outputs
+dist/
+out/
+native/*.obj
+native/*.pdb
+native/*.lib
+native/*.exp
+
+# Runtime user vault, downloaded media & logs
+VantaVault/
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

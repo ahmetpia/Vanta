@@ -1,0 +1,23 @@
+# VANTA — Personal Audio & Video OS: In-Repository Living Roadmap
+
+- [x] **Phase 1: Project Foundation & Secure Electron Architecture (`C:\Vanta`)**
+  - [x] Initialize `C:\Vanta\package.json` with Electron, `ffmpeg-static`, `electron-builder` (NSIS `.exe` Setup + Portable `.exe`), and automated test scripts
+  - [x] Create `C:\Vanta\PLAN.md` mirror for in-repo milestone tracking and initialize `C:\Vanta\VantaVault\` (`/YouTube`, `/Local`, `/Exports`, `/logs`)
+  - [x] Implement custom desktop window, global Media Keys, custom `vanta-media://` streaming protocol, persistent diagnostic logging (`vanta.log`), and strict IPC security (`contextIsolation: true`, `sandbox: true`) in `electron/main.cjs` and `electron/preload.cjs`
+- [x] **Phase 2: Universal Acquisition, Binary ID3v2.4 & Storage Engine (Pillars D, E, F, G)**
+  - [x] ~~Suno Importer~~ *(Removed by user decision — Suno protected newer audio streams behind `403 / forbidden` & client-side stream ciphering)*
+  - [x] Build **Binary ID3v2.3/v2.4 Reader & Writer** (`electron/services/id3Service.cjs`)
+  - [x] Build **YouTube Audio/Video Batch Engine** (`electron/services/youtubeService.cjs`) supporting multi-URL/ID `320kbps MP3` + ID3v2 cover embedding and `1080p MP4` video extraction
+  - [x] Build **Local Library, Async Non-Blocking Folder Scanner, Quality Doctor & Portable Wallet Service** (`electron/services/libraryService.cjs`)
+- [x] **Phase 3: Studio Web Audio DSP Graph & Dual-Deck Crossfade Engine (Pillar C)**
+  - [x] Build **Web Audio DSP Graph** (`src/js/audioEngine.js`)
+- [x] **Phase 4: Music Information Retrieval (MIR), Song DNA & Vibe Radio AI (Pillars A, B, F, H)**
+  - [x] Build **MIR & Song DNA Analyzer** (`src/js/mirAnalyzer.js`)
+  - [x] Build **Vibe Radio, Semantic Search & Conversational Mood-to-Mix Engine** (`src/js/vibeRecommender.js`)
+- [x] **Phase 5: Finalized VANTA Master 3-Column UI & 4-Mode Stage (`src/`)**
+  - [x] Build `src/index.html` and `src/styles/vanta.css`
+  - [x] Build `src/js/visualizer.js` and `src/js/app.js`
+- [x] **Phase 6: Verification, Automated Tests & Windows Setup Packaging**
+  - [x] Run automated test suite (`tests/vanta.test.mjs`) — 6/6 tests passing
+  - [x] Verify live VANTA Desktop Studio (`npm start`)
+  - [x] Package Windows distributable (`npm run build:win`) — `VANTA Setup 1.0.0.exe` and `VANTA 1.0.0.exe`
