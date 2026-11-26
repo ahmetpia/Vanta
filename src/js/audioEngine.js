@@ -376,13 +376,13 @@ export function parseAutoEqTxt(rawText = '') {
       continue;
     }
 
-    const filterHdr = /^(ON|OFF)\s+([A-Za-z]+)(?:\s+(.*))?$/i.exec(hdrRest);
-    if (!filterHdr) {
+    const tokens = hdrRest.split(/\s+/);
+    const stateTok = (tokens[0] || '').toUpperCase();
+    const rawType = (tokens[1] || '').toUpperCase();
+    if (!['ON', 'OFF'].includes(stateTok) || !/^[A-Za-z]{2,12}$/.test(rawType)) {
       skippedLines++;
       continue;
     }
-    const stateTok = filterHdr[1].toUpperCase();
-    const rawType = filterHdr[2].toUpperCase();
     if (stateTok !== 'ON' || rawType === 'NONE') {
       continue;
     }
@@ -392,7 +392,7 @@ export function parseAutoEqTxt(rawText = '') {
       continue;
     }
 
-    const rest = filterHdr[3] || '';
+    const rest = tokens.slice(2).join(' ');
     const fcMatch = /\bFc\s+([-+]?\d+(?:\.\d+)?)\s*(?:Hz)?/i.exec(rest);
     if (!fcMatch) {
       skippedLines++;
