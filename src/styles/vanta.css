@@ -5612,7 +5612,6 @@ body.theme-ice .artist-card-art {
   fill: rgba(59, 130, 246, 0.12);
   stroke: var(--a1);
   stroke-width: 1.5;
-  rx: 3;
 }
 
 .flow-wire-svg {

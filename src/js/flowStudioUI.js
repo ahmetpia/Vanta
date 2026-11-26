@@ -798,6 +798,7 @@ export class FlowStudioController {
       y: Math.round(vpY),
       width: Math.max(12, Math.round(vpW)),
       height: Math.max(10, Math.round(vpH)),
+      rx: 3,
       class: 'flow-minimap-viewport'
     });
     svg.appendChild(vpRect);
