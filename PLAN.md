@@ -21,3 +21,12 @@
   - [x] Run automated test suite (`tests/vanta.test.mjs`) — 6/6 tests passing
   - [x] Verify live VANTA Desktop Studio (`npm start`)
   - [x] Package Windows distributable (`npm run build:win`) — `VANTA Setup 1.0.0.exe` and `VANTA 1.0.0.exe`
+- [x] **Phase 7: VANTA Playlist Flow Studio (Smarter Playlists DAG Automation V1)**
+  - [x] Build pure DAG scheduler, cycle/reference-cycle validator, and local/MIR node executor (`src/js/playlistFlowEngine.js`)
+  - [x] Build fullscreen Flow Studio visual node-graph modal (`src/js/flowStudioUI.js`, `src/index.html`, `src/styles/vanta.css`)
+  - [x] Integrate `kind: 'flow'` persistence & sanitization (`electron/services/libraryService.cjs`, `electron/main.cjs`) and Smart Playlist Ref interoperability (`src/js/app.js`)
+  - [x] Add automated DAG/node/persistence tests (`tests/vanta.test.mjs`) and rebuild Windows package (`npm run build:win`)
+- [x] **Phase 8: VANTA Playlist Flow Studio V2 (Extended Nodes & Secure `.m3u8` Export)**
+  - [x] Add V2 Flow nodes (`source:recently_added`, `filter:year`, `filter:exclude_played`, `filter:format_tier`, `sorter:format_priority`) to `FLOW_NODE_REGISTRY` and backend `ALLOWED_FLOW_NODE_TYPES`
+  - [x] Implement secure UTF-8 `.m3u8` export (`PLAYLIST_EXTENSIONS`, `buildM3u8Content`, `vanta:export-flow-m3u8` IPC, `preload.cjs`, Flow Studio & Hero actions)
+  - [x] Add V2 node & `.m3u8` security test coverage (`tests/vanta.test.mjs`) and verify packaged Windows build (`npm run build:win`)

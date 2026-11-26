@@ -331,6 +331,9 @@
           <button id="btnHeroShufflePlay" type="button" class="btn btn-ghost hero-action-btn" title="Shuffle and play this playlist">
             🔀 Shuffle
           </button>
+          <button id="btnHeroExportM3u8" type="button" class="btn btn-ghost hero-action-btn" title="Export active playlist to .m3u8">
+            ⬇ .m3u8
+          </button>
         </div>
       </section>
 
@@ -581,6 +584,9 @@
               <div class="smart-bar-actions">
                 <button id="btnClearActiveRule" type="button" class="btn btn-ghost explorer-hdr-btn hidden">
                   Clear Active Rule
+                </button>
+                <button id="btnNewFlowPlaylist" type="button" class="btn btn-ghost explorer-hdr-btn" data-testid="new-flow-btn" title="Build multi-stage node-graph playlists (Smarter Playlists Studio)">
+                  ⚡ Flow Studio
                 </button>
                 <button id="btnNewSmartRule" type="button" class="btn btn-primary explorer-hdr-btn" data-testid="new-smart-rule-btn">
                   + New Rule
@@ -1443,6 +1449,106 @@
         </div>
         <div id="abxVerdictSummary" class="abx-verdict-text"></div>
         <div id="abxTrialLogList" class="abx-trial-log"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- VANTA Playlist Flow Studio Fullscreen Modal (Node-Graph Playlist Automation) -->
+  <div id="flowStudioModal" data-testid="flow-studio-modal" class="vanta-modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="flowStudioTitle">
+    <div class="vanta-modal-card flow-studio-modal-card">
+      <!-- Top Studio Header -->
+      <div class="flow-studio-topbar">
+        <div class="flow-studio-brand">
+          <div id="flowCoverPreview" class="smart-rule-cover-preview"></div>
+          <div class="flow-studio-identity">
+            <div class="flow-studio-title-row">
+              <h3 id="flowStudioTitle" class="vanta-modal-title">VANTA Playlist Flow Studio</h3>
+              <span id="flowDagStatusBadge" class="flow-dag-badge ok">DAG Valid</span>
+              <span id="flowScheduleSummary" class="flow-schedule-summary"></span>
+            </div>
+            <div class="flow-studio-inputs-row">
+              <input id="flowStudioNameInput" data-testid="flow-studio-name-input" type="text" class="smart-rule-input flow-name-input" placeholder="Flow Playlist Name (e.g. Night Drive Peak-Hour Mix)" />
+              <input id="flowStudioDescInput" type="text" maxlength="140" class="smart-rule-input flow-desc-input" placeholder="Optional studio note / description" />
+            </div>
+          </div>
+        </div>
+
+        <div class="flow-studio-top-actions">
+          <div id="flowCoverSwatches" class="cover-swatches-row"></div>
+          <button id="btnUploadFlowCover" type="button" class="btn btn-ghost explorer-hdr-btn" title="Choose a custom cover image">📷 Cover</button>
+          <button id="btnFlowAutoLayout" type="button" class="btn btn-ghost explorer-hdr-btn" title="Align nodes left-to-right by DAG topological depth">Auto-Layout</button>
+          <button id="btnFlowRunBatch" type="button" class="btn btn-primary explorer-hdr-btn" title="Simulate topological batch execution">▶ Run Batch</button>
+          <button id="btnCloseFlowStudio" type="button" class="btn btn-ghost btn-dsp-close" aria-label="Close Flow Studio">✕</button>
+        </div>
+      </div>
+
+      <!-- Starter Templates Strip -->
+      <div class="flow-templates-strip">
+        <span class="flow-templates-label">Templates:</span>
+        <div id="flowTemplatesList" class="flow-templates-list"></div>
+        <span id="flowWireBanner" class="flow-wire-banner hidden">Wiring active — click target input port ● (Esc or canvas to cancel)</span>
+      </div>
+
+      <!-- 3-Column Studio Body -->
+      <div class="flow-studio-body">
+        <!-- Left: Node Palette -->
+        <aside class="flow-palette-pane">
+          <div class="flow-pane-hdr">
+            <span>Node Palette</span>
+          </div>
+          <input id="flowPaletteSearch" type="search" class="smart-rule-input flow-palette-search" placeholder="Filter nodes..." />
+          <div id="flowPaletteList" class="flow-palette-list"></div>
+        </aside>
+
+        <!-- Center: Interactive DAG Canvas -->
+        <section id="flowCanvasViewport" class="flow-canvas-viewport" data-testid="flow-canvas-viewport">
+          <div id="flowCanvasWorld" class="flow-canvas-world">
+            <div id="flowCanvasStage" class="flow-canvas-stage">
+              <svg id="flowWireSvg" class="flow-wire-svg"></svg>
+              <div id="flowNodesLayer" class="flow-nodes-layer"></div>
+            </div>
+          </div>
+          <div class="flow-canvas-hud" data-testid="flow-canvas-hud">
+            <button id="btnFlowZoomOut" type="button" class="flow-hud-btn" title="Zoom Out (-)">−</button>
+            <span id="flowZoomLabel" class="flow-hud-zoom">100%</span>
+            <button id="btnFlowZoomIn" type="button" class="flow-hud-btn" title="Zoom In (+)">+</button>
+            <button id="btnFlowZoomFit" type="button" class="flow-hud-btn flow-hud-fit" title="Fit all nodes into view">Fit</button>
+          </div>
+        </section>
+
+        <!-- Right: Node Inspector & Live Stream Tap -->
+        <aside class="flow-right-pane">
+          <div class="flow-inspector-card">
+            <div class="flow-pane-hdr">
+              <span>Node Inspector</span>
+              <span id="flowInspectorCatPill" class="flow-inspector-cat-pill">None</span>
+            </div>
+            <div id="flowInspectorBody" class="flow-inspector-body"></div>
+          </div>
+
+          <div class="flow-tap-card">
+            <div class="flow-pane-hdr">
+              <span>Live Stream Tap</span>
+              <div class="segmented-group flow-tap-toggle">
+                <button id="btnFlowTapOutput" type="button" class="seg-btn active">Output</button>
+                <button id="btnFlowTapSelected" type="button" class="seg-btn">Selected</button>
+              </div>
+            </div>
+            <div id="flowTapSummary" class="flow-tap-summary">0 tracks · 0:00</div>
+            <div id="flowTapList" class="flow-tap-list"></div>
+          </div>
+        </aside>
+      </div>
+
+      <!-- Studio Footer -->
+      <div class="flow-studio-footer">
+        <div id="flowValidationMsg" class="smart-rule-validation hidden"></div>
+        <div class="flow-footer-actions">
+          <button id="btnCancelFlowStudio" type="button" class="btn btn-ghost">Cancel</button>
+          <button id="btnFlowExportM3u8" data-testid="export-flow-m3u8-btn" type="button" class="btn btn-ghost" title="Export Flow output tracks as UTF-8 .m3u8 playlist">⬇ Export .m3u8</button>
+          <button id="btnFlowPlayOutput" type="button" class="btn btn-ghost">▶ Play Output</button>
+          <button id="btnSaveFlowStudio" data-testid="save-flow-studio-btn" type="button" class="btn btn-primary">Save Flow</button>
+        </div>
       </div>
     </div>
   </div>

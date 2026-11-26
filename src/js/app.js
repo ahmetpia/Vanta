@@ -38,6 +38,8 @@ import {
   parseStructuredLyrics
 } from './vibeRecommender.js';
 import { CAMELOT_KEY_MAP } from './mirAnalyzer.js';
+import { executeFlowGraph } from './playlistFlowEngine.js';
+import { FlowStudioController } from './flowStudioUI.js';
 
 const REKORDBOX_COLUMNS = [
   { id: 'num', label: '#', width: 32, minWidth: 28, locked: true, defaultVisible: true, sortAsc: '', sortDesc: '' },
@@ -168,6 +170,22 @@ class VantaStudioApp {
     this.abxSession = null;
     this.activeTrackProbe = null;
     this.activeTrackR128 = null;
+    this.flowStudio = new FlowStudioController({
+      getCatalog: () => this.catalog,
+      getSmartPlaylists: () => this.smartPlaylists,
+      getAnchorTrack: () => this.currentLoadedTrack || this.displayedTracks[this.activeTrackIndex] || this.catalog[0] || null,
+      getCurrentQueue: () => this.displayedTracks,
+      getBanditRewards: () => this.banditRewards,
+      getPlaybackHistory: () => this.playbackHistory,
+      buildCoverElement: (rule, tracks, size) => this.buildPlaylistCoverElement(rule, tracks, size),
+      renderCoverSwatches: (host, draftVisual, onSelect) => this._renderCoverSwatchesInto(host, draftVisual, onSelect),
+      pickCoverImage: (id) => (window.vantaAPI?.pickPlaylistCover ? window.vantaAPI.pickPlaylistCover(id) : null),
+      isDuplicateName: (name, ignoreId) => this._isDuplicateSmartPlaylistName(name, ignoreId),
+      onSaveFlow: (flowObj, isEdit) => this.saveSmartPlaylistObject(flowObj, isEdit, 'flowValidationMsg'),
+      onPlayTracks: (tracks, title) => this.playAdHocFlowPreview(tracks, title),
+      onExportM3u8: (tracks, name) => this.exportPlaylistM3u8(tracks, name),
+      onToast: (msg) => this.setToast(msg)
+    });
     this.activeTrackTags = null;
     this.lastReplayGainInfo = null;
     this.sacdVirtualTracks = [];
@@ -621,6 +639,10 @@ class VantaStudioApp {
       return this.catalog.filter((t) => t.isVideo);
     }
     if (navId === 'playlists' && this.activeSmartPlaylistId) {
+      const activePl = this.smartPlaylists.find((p) => p.id === this.activeSmartPlaylistId);
+      if (activePl?.kind === 'flow') {
+        return this.evaluateSmartPlaylistTracks(activePl);
+      }
       return [...this.catalog];
     }
     const audioPool = this.catalog.filter((t) => !t.isVideo || isMusicVideoTagged(t));
@@ -4546,11 +4568,7 @@ class VantaStudioApp {
         if (this.activeSmartPlaylistId) {
           const activeRule = this.smartPlaylists.find((p) => p.id === this.activeSmartPlaylistId);
           if (activeRule) {
-            this.displayedTracks = applyProSmartFilter(
-              this.catalog,
-              this.normalizeRuleFilters(activeRule.filters),
-              audioPool[0] || this.catalog[0] || null
-            );
+            this.displayedTracks = this.evaluateSmartPlaylistTracks(activeRule);
           } else {
             this.activeSmartPlaylistId = null;
             this.displayedTracks = [...audioPool];
@@ -4706,8 +4724,9 @@ class VantaStudioApp {
     const anchor = this.catalog[0] || null;
     const frag = document.createDocumentFragment();
     for (const rule of rules) {
-      const normalizedFilters = this.normalizeRuleFilters(rule.filters);
-      const matchingTracks = applyProSmartFilter(this.catalog, normalizedFilters, anchor);
+      const isFlow = rule.kind === 'flow';
+      const normalizedFilters = isFlow ? {} : this.normalizeRuleFilters(rule.filters);
+      const matchingTracks = this.evaluateSmartPlaylistTracks(rule, anchor);
       const matchCount = matchingTracks.length;
       const isActive = this.activeSmartPlaylistId === rule.id;
 
@@ -4727,16 +4746,26 @@ class VantaStudioApp {
       nameEl.className = 'smart-rule-name';
       nameEl.textContent = rule.name;
 
+      top.appendChild(nameEl);
+      if (isFlow) {
+        const kindPill = document.createElement('span');
+        kindPill.className = 'smart-rule-kind-pill';
+        kindPill.textContent = 'FLOW';
+        top.appendChild(kindPill);
+      }
+
       const countPill = document.createElement('span');
       countPill.className = 'smart-rule-count';
       countPill.textContent = `${matchCount} track${matchCount === 1 ? '' : 's'}`;
-
-      top.appendChild(nameEl);
       top.appendChild(countPill);
 
       const summaryEl = document.createElement('span');
       summaryEl.className = 'smart-rule-summary';
-      const ruleSpec = this.formatRuleSummary(normalizedFilters) || 'All tracks';
+      const flowNodeLen = Object.keys(rule.graph?.nodes || {}).length;
+      const flowEdgeLen = Array.isArray(rule.graph?.edges) ? rule.graph.edges.length : 0;
+      const ruleSpec = isFlow
+        ? `${flowNodeLen} nodes · ${flowEdgeLen} wires`
+        : (this.formatRuleSummary(normalizedFilters) || 'All tracks');
       summaryEl.textContent = rule.description ? `${rule.description} · ${ruleSpec}` : ruleSpec;
       summaryEl.title = summaryEl.textContent;
 
@@ -4760,10 +4789,11 @@ class VantaStudioApp {
       editBtn.type = 'button';
       editBtn.className = 'smart-rule-icon-btn';
       editBtn.textContent = '✎';
-      editBtn.title = `Edit "${rule.name}"`;
+      editBtn.title = isFlow ? `Open "${rule.name}" in Flow Studio` : `Edit "${rule.name}"`;
       editBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        this.openSmartRuleModal(rule);
+        if (isFlow) this.flowStudio.open(rule);
+        else this.openSmartRuleModal(rule);
       });
 
       const delBtn = document.createElement('button');
@@ -5691,6 +5721,63 @@ class VantaStudioApp {
   }
 
   /**
+   * Evaluates either a flat Smart Rule (`kind === 'rule'`) or a DAG Flow (`kind === 'flow'`).
+   * @param {object} playlist - Saved Smart Playlist or Flow descriptor.
+   * @param {object|null} [anchorOverride=null] - Optional anchor track for harmonic/vibe references.
+   * @returns {object[]} Matching/ordered track array.
+   */
+  evaluateSmartPlaylistTracks(playlist, anchorOverride = null) {
+    if (!playlist) return [];
+    const anchor = anchorOverride || this.currentLoadedTrack || this.catalog[0] || null;
+    if (playlist.kind === 'flow') {
+      const res = executeFlowGraph(playlist, {
+        catalog: this.catalog,
+        anchorTrack: anchor,
+        banditRewards: this.banditRewards,
+        playbackHistory: this.playbackHistory,
+        currentQueue: this.displayedTracks,
+        smartPlaylists: this.smartPlaylists
+      });
+      return Array.isArray(res.outputTracks) ? res.outputTracks : [];
+    }
+    return applyProSmartFilter(this.catalog, this.normalizeRuleFilters(playlist.filters), anchor);
+  }
+
+  /**
+   * Exports a Flow or Smart Playlist track array to a UTF-8 `.m3u8` file via secure Main Process dialog.
+   * @param {object[]} [tracks=[]] - Tracks to export.
+   * @param {string} [playlistName='VANTA_Flow'] - Suggested playlist title.
+   */
+  async exportPlaylistM3u8(tracks = [], playlistName = 'VANTA_Flow') {
+    if (!window.vantaAPI?.exportFlowM3u8) {
+      this.setToast('M3U8 export requires the VANTA desktop runtime');
+      return;
+    }
+    if (!Array.isArray(tracks) || !tracks.length) {
+      this.setToast('No tracks available to export');
+      return;
+    }
+    const slimTracks = tracks.map((t) => ({
+      filePath: t.filePath || '',
+      title: t.title || '',
+      artist: t.artist || '',
+      fileName: t.fileName || '',
+      durationSec: Number(t.durationSec) || 0
+    }));
+    const res = await window.vantaAPI.exportFlowM3u8({
+      playlistName,
+      tracks: slimTracks
+    });
+    if (res?.canceled) return;
+    if (!res?.ok) {
+      this.setToast(`Export failed: ${res?.error || 'Could not save .m3u8'}`);
+      return;
+    }
+    const fileLabel = String(res.filePath || '').split(/[\\/]/).pop() || 'playlist.m3u8';
+    this.setToast(`Exported ${res.exportedCount} track${res.exportedCount === 1 ? '' : 's'} to ${fileLabel}`);
+  }
+
+  /**
    * Synchronizes the top Hero banner artwork, title, description, and Play/Shuffle controls
    * whenever a Smart Playlist rule is active in the Playlists workspace.
    */
@@ -5719,21 +5806,18 @@ class VantaStudioApp {
         grad.textContent = `${this.smartPlaylists.length} Custom Rule${this.smartPlaylists.length === 1 ? '' : 's'}`;
         headlineEl.appendChild(grad);
         const names = (this.smartPlaylists || []).map((p) => p.name).join(' · ');
-        descEl.textContent = names || 'No rules defined yet. Click "+ New Rule" below or configure filters above and click "+ Smart List".';
+        descEl.textContent = names || 'No rules defined yet. Click "+ New Rule" or "⚡ Flow Studio" below.';
       }
       return;
     }
 
-    const matchingTracks = applyProSmartFilter(
-      this.catalog,
-      this.normalizeRuleFilters(activeRule.filters),
-      this.catalog[0] || null
-    );
+    const matchingTracks = this.evaluateSmartPlaylistTracks(activeRule);
     artHost.replaceChildren(this.buildPlaylistCoverElement(activeRule, matchingTracks, 'lg'));
     artHost.classList.remove('hidden');
     actionsHost.classList.remove('hidden');
 
-    if (badgeEl) badgeEl.textContent = `SMART PLAYLIST • ${matchingTracks.length} TRACKS`;
+    const isFlow = activeRule.kind === 'flow';
+    if (badgeEl) badgeEl.textContent = `${isFlow ? 'FLOW PLAYLIST' : 'SMART PLAYLIST'} • ${matchingTracks.length} TRACKS`;
     headlineEl.replaceChildren();
     headlineEl.append('Playlist: ');
     const gradName = document.createElement('span');
@@ -5741,15 +5825,17 @@ class VantaStudioApp {
     gradName.textContent = activeRule.name;
     headlineEl.appendChild(gradName);
 
-    const ruleSummary = this.formatRuleSummary(activeRule.filters);
+    const ruleSummary = isFlow
+      ? `${Object.keys(activeRule.graph?.nodes || {}).length} nodes · ${activeRule.graph?.edges?.length || 0} wires`
+      : this.formatRuleSummary(activeRule.filters);
     descEl.textContent = activeRule.description
       ? `${activeRule.description}${ruleSummary ? ` · ${ruleSummary}` : ''}`
       : (ruleSummary || `${matchingTracks.length} matching tracks`);
   }
 
   /**
-   * Applies a Smart Playlist rule and immediately starts playing (sequential or shuffled).
-   * @param {object} rule - Target Smart Playlist rule.
+   * Applies a Smart Playlist rule or Flow Playlist and immediately starts playing.
+   * @param {object} rule - Target Smart Playlist rule or flow.
    * @param {boolean} [shuffle=false] - Whether to randomize starting track and enable shuffle.
    */
   playSmartPlaylistRule(rule, shuffle = false) {
@@ -5774,21 +5860,56 @@ class VantaStudioApp {
   }
 
   /**
-   * Loads a saved Smart Playlist rule into the Smart Focus filter bar and updates the queue.
-   * @param {object} rule - Smart playlist rule object.
+   * Loads an ad-hoc tracklist previewed inside Flow Studio into the active queue and starts playback.
+   * @param {object[]} tracks - Flow output tracks.
+   * @param {string} [title='Flow Preview'] - Label for toast notification.
+   */
+  playAdHocFlowPreview(tracks = [], title = 'Flow Preview') {
+    if (!Array.isArray(tracks) || !tracks.length) {
+      this.setToast(`"${title}" produced 0 tracks`);
+      return;
+    }
+    this.displayedTracks = [...tracks];
+    this.activeTrackIndex = 0;
+    const matchBadge = document.getElementById('listMatchCount');
+    if (matchBadge) {
+      matchBadge.textContent = `${this.displayedTracks.length} / ${this.catalog.length} tracks`;
+    }
+    this.renderQueue();
+    this.selectTrack(0, true);
+    this.setToast(`Playing Flow output: "${title}" (${tracks.length} tracks)`);
+  }
+
+  /**
+   * Loads a saved Smart Playlist rule or Flow Playlist into the queue and updates active showcase.
+   * @param {object} rule - Smart playlist rule or flow object.
    */
   applySmartPlaylistRule(rule) {
     if (!rule) return;
-    const f = this.normalizeRuleFilters(rule.filters);
     this.activeSmartPlaylistId = rule.id;
-    this.filterState = { ...f };
+    if (rule.kind === 'flow') {
+      this.filterState = {
+        query: '',
+        minBpm: '',
+        maxBpm: '',
+        key: 'ALL',
+        energyBand: 'ALL',
+        exactStars: 0,
+        tags: [],
+        groups: [],
+        favoriteOnly: false,
+        sortBy: 'default'
+      };
+    } else {
+      this.filterState = { ...this.normalizeRuleFilters(rule.filters) };
+    }
 
     this._syncFilterBarDomFromState();
     this.renderTagFilterOptions();
     this.applyFiltersAndRender(true);
     this.renderSmartPlaylistBar();
     this.syncHeroPlaylistShowcase();
-    this.setToast(`Applied Smart Playlist: "${rule.name}" (${this.displayedTracks.length} matches)`);
+    this.setToast(`Applied ${rule.kind === 'flow' ? 'Flow' : 'Smart'} Playlist: "${rule.name}" (${this.displayedTracks.length} matches)`);
   }
 
   /**
@@ -5894,38 +6015,42 @@ class VantaStudioApp {
     document.getElementById('smartRuleNameInput')?.focus();
   }
 
-  _renderCoverSwatches() {
-    const host = document.getElementById('ruleCoverSwatches');
+  _renderCoverSwatchesInto(host, draftVisual, onSelect) {
     if (!host) return;
     host.replaceChildren();
 
     const autoBtn = document.createElement('button');
     autoBtn.type = 'button';
-    autoBtn.className = `cover-swatch-btn auto-swatch${this.draftRuleVisual.mode === 'auto' ? ' active' : ''}`;
+    autoBtn.className = `cover-swatch-btn auto-swatch${draftVisual.mode === 'auto' ? ' active' : ''}`;
     autoBtn.textContent = 'Auto 2×2';
     autoBtn.title = 'Automatic 2×2 collage from matching track covers';
     autoBtn.addEventListener('click', () => {
-      this.draftRuleVisual = { ...this.draftRuleVisual, mode: 'auto', imagePath: '' };
-      this._renderCoverSwatches();
-      this._updateSmartRulePreview();
+      onSelect({ ...draftVisual, mode: 'auto', imagePath: '' });
     });
     host.appendChild(autoBtn);
 
     for (const preset of PLAYLIST_VISUAL_PRESETS) {
       const btn = document.createElement('button');
       btn.type = 'button';
-      const isSelected = this.draftRuleVisual.mode === 'preset' && this.draftRuleVisual.presetKey === preset.key;
+      const isSelected = draftVisual.mode === 'preset' && draftVisual.presetKey === preset.key;
       btn.className = `cover-swatch-btn${isSelected ? ' active' : ''}`;
       btn.style.background = preset.grad;
       btn.textContent = preset.icon;
       btn.title = preset.label;
       btn.addEventListener('click', () => {
-        this.draftRuleVisual = { mode: 'preset', presetKey: preset.key, imagePath: '' };
-        this._renderCoverSwatches();
-        this._updateSmartRulePreview();
+        onSelect({ mode: 'preset', presetKey: preset.key, imagePath: '' });
       });
       host.appendChild(btn);
     }
+  }
+
+  _renderCoverSwatches() {
+    const host = document.getElementById('ruleCoverSwatches');
+    this._renderCoverSwatchesInto(host, this.draftRuleVisual, (nextVisual) => {
+      this.draftRuleVisual = nextVisual;
+      this._renderCoverSwatches();
+      this._updateSmartRulePreview();
+    });
   }
 
   _renderRuleModalSuggestChips(containerId, inputId, values, prefix) {
@@ -6023,6 +6148,45 @@ class VantaStudioApp {
   }
 
   /**
+   * Shared persistence helper for both rule-based Smart Playlists and DAG Flow Playlists.
+   * @param {object} playlistObj - Normalized playlist object (`kind: 'rule' | 'flow'`).
+   * @param {boolean} isEdit - Whether updating an existing playlist.
+   * @param {string} [validationElId='smartRuleValidationMsg'] - Validation error element ID.
+   * @returns {Promise<boolean>} True on save success.
+   */
+  async saveSmartPlaylistObject(playlistObj, isEdit, validationElId = 'smartRuleValidationMsg') {
+    if (window.vantaAPI?.saveSmartPlaylist) {
+      const res = await window.vantaAPI.saveSmartPlaylist(playlistObj);
+      if (!res?.ok) {
+        const valEl = document.getElementById(validationElId);
+        if (valEl) {
+          valEl.textContent = res?.error || 'Could not save playlist.';
+          valEl.classList.remove('hidden');
+        }
+        return false;
+      }
+      if (Array.isArray(res.smartPlaylists)) {
+        this.smartPlaylists = res.smartPlaylists;
+      }
+    } else {
+      const idx = this.smartPlaylists.findIndex((p) => p.id === playlistObj.id);
+      if (idx >= 0) this.smartPlaylists[idx] = playlistObj;
+      else this.smartPlaylists.push(playlistObj);
+    }
+
+    this.updateSidebarBadges();
+    this.renderSmartPlaylistBar();
+    if (isEdit && this.activeSmartPlaylistId === playlistObj.id) {
+      this.applySmartPlaylistRule(playlistObj);
+    } else {
+      this.syncHeroPlaylistShowcase();
+    }
+    const label = playlistObj.kind === 'flow' ? 'Flow Playlist' : 'Smart Playlist';
+    this.setToast(`${isEdit ? 'Updated' : 'Saved'} ${label}: "${playlistObj.name}"`);
+    return true;
+  }
+
+  /**
    * Saves a created or edited Smart Playlist rule persistently and updates UI state.
    */
   async saveSmartRuleFromModal() {
@@ -6044,6 +6208,7 @@ class VantaStudioApp {
     const isEdit = Boolean(this.editingSmartRuleId);
     const playlistObj = {
       id: this.editingSmartRuleId || `sp-${Date.now()}`,
+      kind: 'rule',
       name: draft.name,
       description: draft.description,
       visual: draft.visual,
@@ -6051,36 +6216,11 @@ class VantaStudioApp {
     };
 
     try {
-      if (window.vantaAPI?.saveSmartPlaylist) {
-        const res = await window.vantaAPI.saveSmartPlaylist(playlistObj);
-        if (!res?.ok) {
-          const valEl = document.getElementById('smartRuleValidationMsg');
-          if (valEl) {
-            valEl.textContent = res?.error || 'Could not save Smart Playlist.';
-            valEl.classList.remove('hidden');
-          }
-          return;
-        }
-        if (Array.isArray(res.smartPlaylists)) {
-          this.smartPlaylists = res.smartPlaylists;
-        }
-      } else {
-        const idx = this.smartPlaylists.findIndex((p) => p.id === playlistObj.id);
-        if (idx >= 0) this.smartPlaylists[idx] = playlistObj;
-        else this.smartPlaylists.push(playlistObj);
+      const ok = await this.saveSmartPlaylistObject(playlistObj, isEdit, 'smartRuleValidationMsg');
+      if (ok) {
+        document.getElementById('smartRuleModal')?.classList.add('hidden');
+        this.editingSmartRuleId = null;
       }
-
-      document.getElementById('smartRuleModal')?.classList.add('hidden');
-      this.editingSmartRuleId = null;
-
-      this.updateSidebarBadges();
-      this.renderSmartPlaylistBar();
-      if (isEdit && this.activeSmartPlaylistId === playlistObj.id) {
-        this.applySmartPlaylistRule(playlistObj);
-      } else {
-        this.syncHeroPlaylistShowcase();
-      }
-      this.setToast(`${isEdit ? 'Updated' : 'Saved'} Smart Playlist: "${playlistObj.name}"`);
     } finally {
       this._isSavingSmartRule = false;
     }
@@ -7708,6 +7848,10 @@ class VantaStudioApp {
       this.openSmartRuleModal(null);
     });
 
+    document.getElementById('btnNewFlowPlaylist')?.addEventListener('click', () => {
+      this.flowStudio.open(null);
+    });
+
     document.getElementById('btnClearActiveRule')?.addEventListener('click', () => {
       this.clearActiveSmartRule();
     });
@@ -7822,6 +7966,13 @@ class VantaStudioApp {
     document.getElementById('btnHeroShufflePlay')?.addEventListener('click', () => {
       const activeRule = this.smartPlaylists.find((p) => p.id === this.activeSmartPlaylistId);
       if (activeRule) this.playSmartPlaylistRule(activeRule, true);
+    });
+
+    document.getElementById('btnHeroExportM3u8')?.addEventListener('click', async () => {
+      const activeRule = this.smartPlaylists.find((p) => p.id === this.activeSmartPlaylistId);
+      if (!activeRule) return;
+      const tracks = this.evaluateSmartPlaylistTracks(activeRule);
+      await this.exportPlaylistM3u8(tracks, activeRule.name);
     });
 
     document.getElementById('btnUploadRuleCover')?.addEventListener('click', async () => {

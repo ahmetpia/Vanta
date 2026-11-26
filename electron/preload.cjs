@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('vantaAPI', {
   updateTrackMeta: (payload) => ipcRenderer.invoke('vanta:update-track-meta', payload),
   saveSmartPlaylist: (playlist) => ipcRenderer.invoke('vanta:save-smart-playlist', playlist),
   deleteSmartPlaylist: (id) => ipcRenderer.invoke('vanta:delete-smart-playlist', { id }),
+  exportFlowM3u8: (payload) => ipcRenderer.invoke('vanta:export-flow-m3u8', payload),
   pickPlaylistCover: (playlistId) => ipcRenderer.invoke('vanta:pick-playlist-cover', { playlistId }),
   getFxVideo: () => ipcRenderer.invoke('vanta:get-fx-video'),
   pickFxVideo: () => ipcRenderer.invoke('vanta:pick-fx-video'),

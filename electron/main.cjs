@@ -25,6 +25,7 @@ const {
   SACD_ISO_EXTENSIONS,
   PEQ_TXT_EXTENSIONS,
   CONVOLVER_IR_EXTENSIONS,
+  PLAYLIST_EXTENSIONS,
   hasSafePathSyntax,
   canonicalizePath,
   resolveSafeVaultSubfolder,
@@ -80,6 +81,8 @@ const {
   repairQualityIssues,
   exportPortableWallet,
   filterHiddenCatalogTracks,
+  sanitizeFlowGraph,
+  buildM3u8Content,
   loadLibraryStore,
   saveLibraryStore
 } = require('./services/libraryService.cjs');
@@ -939,10 +942,20 @@ function registerIpcHandlers() {
       };
     }
 
+    const kind = playlist?.kind === 'flow' ? 'flow' : 'rule';
+    let flowGraph = null;
+    if (kind === 'flow') {
+      flowGraph = sanitizeFlowGraph(playlist.graph);
+      if (!Object.keys(flowGraph.nodes).length) {
+        return { ok: false, error: 'Flow graph must contain at least one valid node.' };
+      }
+    }
+
     const requestedImg = String(playlist.visual?.imagePath || '').trim();
     const safeCoverImg = requestedImg ? (resolveAuthorizedFile(requestedImg, IMAGE_EXTENSIONS) || '') : '';
     const normalized = {
       id: normalizedId,
+      kind,
       name: cleanName,
       description: String(playlist.description || '').trim().slice(0, 140),
       visual: playlist.visual && typeof playlist.visual === 'object'
@@ -952,7 +965,9 @@ function registerIpcHandlers() {
             imagePath: safeCoverImg
           }
         : { mode: 'auto', presetKey: 'synth', imagePath: '' },
-      filters: playlist.filters && typeof playlist.filters === 'object' ? playlist.filters : {}
+      ...(kind === 'flow'
+        ? { graph: flowGraph }
+        : { filters: playlist.filters && typeof playlist.filters === 'object' ? playlist.filters : {} })
     };
     const existingIdx = libraryStore.smartPlaylists.findIndex((p) => p.id === normalized.id);
     if (existingIdx >= 0) {
@@ -965,7 +980,7 @@ function registerIpcHandlers() {
       libraryStore.smartPlaylists.push(normalized);
     }
     saveLibraryStore(libraryStore, STORE_PATH);
-    logger.info('LibraryStore', `Saved smart playlist "${normalized.name}"`);
+    logger.info('LibraryStore', `Saved ${kind === 'flow' ? 'flow' : 'smart'} playlist "${normalized.name}"`);
     return { ok: true, smartPlaylists: libraryStore.smartPlaylists };
   });
 
@@ -1040,6 +1055,63 @@ function registerIpcHandlers() {
       logger.info('LibraryStore', `Deleted smart playlist "${targetId}"`);
     }
     return { ok: true, smartPlaylists: libraryStore.smartPlaylists };
+  });
+
+  registerSecureIpcHandler('vanta:export-flow-m3u8', async (_event, payload = {}) => {
+    if (!mainWindow) return { canceled: true, ok: false };
+    const rawTracks = Array.isArray(payload?.tracks) ? payload.tracks : [];
+    const authorizedTracks = [];
+    for (const item of rawTracks) {
+      const safeMedia = resolveAuthorizedFile(item?.filePath, ALL_MEDIA_EXTENSIONS);
+      if (safeMedia) {
+        authorizedTracks.push({
+          filePath: safeMedia,
+          title: item?.title,
+          artist: item?.artist,
+          fileName: item?.fileName,
+          durationSec: item?.durationSec
+        });
+      }
+    }
+    if (!authorizedTracks.length) {
+      return { canceled: false, ok: false, error: 'No authorized local tracks available to export.' };
+    }
+
+    const rawName = String(payload?.playlistName || 'VANTA_Flow').trim();
+    const safeSlug = rawName.replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'VANTA_Flow';
+    const exportsDir = path.join(VAULT_ROOT, 'Exports');
+    fs.mkdirSync(exportsDir, { recursive: true });
+
+    const saveRes = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export VANTA Playlist (.m3u8)',
+      defaultPath: path.join(exportsDir, `${safeSlug}.m3u8`),
+      filters: [
+        { name: 'Extended M3U8 Playlist', extensions: ['m3u8'] },
+        { name: 'M3U Playlist', extensions: ['m3u'] }
+      ]
+    });
+    if (saveRes.canceled || !saveRes.filePath) {
+      return { canceled: true, ok: false };
+    }
+
+    const safeOutPath = validateSafeFilePath(saveRes.filePath, {
+      allowedExtensions: PLAYLIST_EXTENSIONS,
+      mustExist: false
+    });
+    if (!safeOutPath) {
+      logger.warn('FlowExporter', 'Rejected unsafe playlist export path', { targetPath: saveRes.filePath });
+      return { canceled: false, ok: false, error: 'Export path rejected by VANTA security policy.' };
+    }
+
+    try {
+      const { content, exportedCount } = buildM3u8Content(authorizedTracks, { playlistName: rawName });
+      fs.writeFileSync(safeOutPath, content, 'utf8');
+      logger.info('FlowExporter', `Exported ${exportedCount} tracks to ${safeOutPath}`);
+      return { canceled: false, ok: true, filePath: safeOutPath, exportedCount };
+    } catch (err) {
+      logger.error('FlowExporter', 'Failed writing M3U8 playlist file', { error: err.message });
+      return { canceled: false, ok: false, error: err.message || 'Could not write playlist file.' };
+    }
   });
 
   registerSecureIpcHandler('vanta:get-fx-video', () => {

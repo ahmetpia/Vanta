@@ -857,6 +857,158 @@ function exportPortableWallet(walletPayload = {}, exportDir = 'C:\\Vanta\\VantaV
   };
 }
 
+const ALLOWED_FLOW_NODE_TYPES = new Set([
+  'source:all',
+  'source:smart_playlist',
+  'source:folder',
+  'source:album',
+  'source:artist',
+  'source:vibe_radio',
+  'source:favorites',
+  'source:lossless',
+  'source:current_queue',
+  'source:recently_added',
+  'filter:bpm',
+  'filter:harmonic',
+  'filter:energy',
+  'filter:genre',
+  'filter:tags_groups',
+  'filter:dedup_track',
+  'filter:dedup_artist',
+  'filter:take',
+  'filter:year',
+  'filter:exclude_played',
+  'filter:format_tier',
+  'combiner:concat',
+  'combiner:zip',
+  'combiner:union',
+  'combiner:intersect',
+  'combiner:subtract',
+  'sorter:field',
+  'sorter:harmonic_journey',
+  'sorter:artist_spaced_shuffle',
+  'sorter:reverse',
+  'sorter:format_priority',
+  'conditional:if_min_count',
+  'conditional:if_empty',
+  'conditional:time_of_day',
+  'output:playlist'
+]);
+
+const MAX_FLOW_NODES = 120;
+const MAX_FLOW_EDGES = 400;
+
+/**
+ * Sanitizes an untrusted Flow node parameter map to bounded JSON primitives.
+ * @param {object} rawParams - Raw parameter dictionary.
+ * @returns {object} Safe parameter map.
+ */
+function sanitizeFlowParams(rawParams) {
+  if (!rawParams || typeof rawParams !== 'object' || Array.isArray(rawParams)) return {};
+  const clean = {};
+  let count = 0;
+  for (const [k, v] of Object.entries(rawParams)) {
+    if (count >= 32) break;
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+    const key = String(k || '').trim().slice(0, 48);
+    if (!key) continue;
+    if (typeof v === 'string') {
+      clean[key] = v.slice(0, 512);
+    } else if (typeof v === 'number' && Number.isFinite(v)) {
+      clean[key] = v;
+    } else if (typeof v === 'boolean') {
+      clean[key] = v;
+    }
+    count++;
+  }
+  return clean;
+}
+
+/**
+ * Validates and canonicalizes a Smarter Playlists DAG graph object (`{ nodes, edges }`).
+ * Drops unknown node types, out-of-bounds coordinates, dangling edges, and self-loops.
+ * @param {object} rawGraph - Untrusted graph payload from IPC or disk store.
+ * @returns {{ nodes: object, edges: Array }} Sanitized DAG structure.
+ */
+function sanitizeFlowGraph(rawGraph) {
+  const nodes = {};
+  const rawNodes = rawGraph?.nodes && typeof rawGraph.nodes === 'object' && !Array.isArray(rawGraph.nodes)
+    ? rawGraph.nodes
+    : {};
+
+  let nodeCount = 0;
+  for (const [rawId, node] of Object.entries(rawNodes)) {
+    if (nodeCount >= MAX_FLOW_NODES) break;
+    const id = String(rawId || node?.id || '').trim().slice(0, 64);
+    if (!id || !/^[a-zA-Z0-9_-]+$/.test(id)) continue;
+    const type = String(node?.type || '').trim();
+    if (!ALLOWED_FLOW_NODE_TYPES.has(type)) continue;
+    const xNum = Number(node?.x);
+    const yNum = Number(node?.y);
+    nodes[id] = {
+      id,
+      type,
+      x: Number.isFinite(xNum) ? Math.max(0, Math.min(10000, Math.round(xNum))) : 28,
+      y: Number.isFinite(yNum) ? Math.max(0, Math.min(10000, Math.round(yNum))) : 48,
+      params: sanitizeFlowParams(node?.params)
+    };
+    nodeCount++;
+  }
+
+  const edges = [];
+  const seenEdges = new Set();
+  const rawEdges = Array.isArray(rawGraph?.edges) ? rawGraph.edges : [];
+  for (const edge of rawEdges) {
+    if (edges.length >= MAX_FLOW_EDGES) break;
+    if (!Array.isArray(edge) || edge.length < 2) continue;
+    const src = String(edge[0] || '').trim();
+    const dst = String(edge[1] || '').trim();
+    if (!Object.hasOwn(nodes, src) || !Object.hasOwn(nodes, dst) || src === dst) continue;
+    const hasSlot = edge.length >= 3 && (edge[2] === 0 || edge[2] === 1);
+    const slotKey = hasSlot ? `:${edge[2]}` : '';
+    const edgeKey = `${src}->${dst}${slotKey}`;
+    if (seenEdges.has(edgeKey)) continue;
+    seenEdges.add(edgeKey);
+    edges.push(hasSlot ? [src, dst, edge[2]] : [src, dst]);
+  }
+
+  return { nodes, edges };
+}
+
+/**
+ * Generates an extended UTF-8 `.m3u8` playlist file string from a list of tracks,
+ * stripping control/newline characters to prevent playlist line injection.
+ * @param {object[]} [tracks=[]] - Authorized media track objects.
+ * @param {object} [options={}] - Optional `{ playlistName }`.
+ * @returns {{ content: string, exportedCount: number }} Extended M3U8 text and exported track count.
+ */
+function buildM3u8Content(tracks = [], options = {}) {
+  const sanitizeLine = (val) => String(val || '').replace(/[\r\n\0]+/g, ' ').trim();
+  const lines = ['#EXTM3U'];
+  const cleanPlaylistName = sanitizeLine(options?.playlistName);
+  if (cleanPlaylistName) {
+    lines.push(`#PLAYLIST:${cleanPlaylistName}`);
+  }
+
+  let exportedCount = 0;
+  for (const track of Array.isArray(tracks) ? tracks : []) {
+    const rawPath = String(track?.filePath || '').trim();
+    if (!rawPath || /[\r\n\0]/.test(rawPath)) continue;
+    const durationSec = Number(track?.durationSec);
+    const durInt = Number.isFinite(durationSec) && durationSec > 0 ? Math.round(durationSec) : -1;
+    const artist = sanitizeLine(track?.artist) || 'Unknown Artist';
+    const title = sanitizeLine(track?.title || track?.fileName) || 'Untitled';
+    lines.push(`#EXTINF:${durInt},${artist} - ${title}`);
+    lines.push(rawPath);
+    exportedCount++;
+  }
+
+  return {
+    content: `${lines.join('\n')}\n`,
+    exportedCount
+  };
+}
+
 /**
  * Loads the persistent VANTA library store (ratings, custom tags, groups, smart playlists, watched folders).
  * @param {string} [storePath='C:\\Vanta\\VantaVault\\vanta-library.json'] - Path to JSON store.
@@ -897,14 +1049,21 @@ function loadLibraryStore(storePath = 'C:\\Vanta\\VantaVault\\vanta-library.json
           const key = cleanName.toLowerCase();
           if (seenNames.has(key)) continue;
           seenNames.add(key);
-          unique.push({
+          const kind = sp?.kind === 'flow' ? 'flow' : 'rule';
+          const baseEntry = {
             ...sp,
+            kind,
             name: cleanName,
             description: String(sp.description || '').trim(),
             visual: sp.visual && typeof sp.visual === 'object'
               ? sp.visual
               : { mode: 'auto', presetKey: 'synth', imagePath: '' }
-          });
+          };
+          if (kind === 'flow') {
+            baseEntry.graph = sanitizeFlowGraph(sp.graph);
+            delete baseEntry.filters;
+          }
+          unique.push(baseEntry);
         }
         return unique;
       })()
@@ -1016,6 +1175,8 @@ module.exports = {
   repairQualityIssues,
   exportPortableWallet,
   filterHiddenCatalogTracks,
+  sanitizeFlowGraph,
+  buildM3u8Content,
   loadLibraryStore,
   saveLibraryStore
 };

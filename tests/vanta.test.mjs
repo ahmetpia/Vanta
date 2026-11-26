@@ -50,6 +50,14 @@ import {
   computeStageSpectralMetrics,
   resolveStagePalette
 } from '../src/js/stageLights.js';
+import {
+  FLOW_NODE_REGISTRY,
+  FLOW_PRESET_TEMPLATES,
+  buildFlowSchedule,
+  validateFlowGraph,
+  hasPlaylistReferenceCycle,
+  executeFlowGraph
+} from '../src/js/playlistFlowEngine.js';
 
 const require = createRequire(import.meta.url);
 const {
@@ -89,6 +97,8 @@ const {
   repairQualityIssues,
   exportPortableWallet,
   filterHiddenCatalogTracks,
+  sanitizeFlowGraph,
+  buildM3u8Content,
   loadLibraryStore,
   saveLibraryStore
 } = require('../electron/services/libraryService.cjs');
@@ -121,7 +131,8 @@ const {
   isPathAuthorizedInScope,
   resolveFromTrustedRoots,
   SUBTITLE_EXTENSIONS,
-  SACD_ISO_EXTENSIONS
+  SACD_ISO_EXTENSIONS,
+  PLAYLIST_EXTENSIONS
 } = require('../electron/services/pathSecurityService.cjs');
 
 describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
@@ -2361,5 +2372,362 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
     assert.equal(recreatedPayload.videoEl.getAttribute('data-vanta-bound'), undefined);
     assert.equal(recreatedPayload.videoEl.getAttribute('data-vanta-theater-bound'), undefined);
     assert.equal(recreatedPayload.deckAEl.src, '');
+  });
+
+  it('25. Playlist Flow Engine: DAG Scheduler, Cycle Guards, All Node Types & Persistent Flow Store', () => {
+    // 1. Topological scheduling (diamond graph + cycle rejection)
+    const diamond = buildFlowSchedule(
+      { a: {}, b: {}, c: {}, d: {} },
+      [['a', 'b'], ['a', 'c'], ['b', 'd'], ['c', 'd']]
+    );
+    assert.equal(diamond.ok, true);
+    assert.equal(diamond.hasCycle, false);
+    assert.deepEqual(diamond.schedule[0], ['a']);
+    assert.deepEqual(diamond.schedule[1].sort(), ['b', 'c']);
+    assert.deepEqual(diamond.schedule[2], ['d']);
+
+    const cyclic = buildFlowSchedule(
+      { a: {}, b: {}, c: {} },
+      [['a', 'b'], ['b', 'c'], ['c', 'a']]
+    );
+    assert.equal(cyclic.ok, false);
+    assert.equal(cyclic.hasCycle, true);
+    assert.match(cyclic.error, /Cycle detected/);
+
+    // 2. Smart Playlist cross-reference cycle detection
+    const allFlows = [
+      {
+        id: 'flow-a',
+        kind: 'flow',
+        name: 'Flow A',
+        graph: {
+          nodes: { n1: { id: 'n1', type: 'source:smart_playlist', params: { playlistId: 'flow-b' } } },
+          edges: []
+        }
+      },
+      {
+        id: 'flow-b',
+        kind: 'flow',
+        name: 'Flow B',
+        graph: {
+          nodes: { n1: { id: 'n1', type: 'source:smart_playlist', params: { playlistId: 'flow-a' } } },
+          edges: []
+        }
+      }
+    ];
+    assert.equal(hasPlaylistReferenceCycle('flow-a', 'flow-b', allFlows), true);
+    const validation = validateFlowGraph(allFlows[0], { smartPlaylists: allFlows });
+    assert.equal(validation.valid, false);
+    assert.match(validation.errors[0], /Circular Smart Playlist reference/);
+
+    // 3. Multi-source catalog for node tests
+    const catalog = [
+      { id: 't1', audioHash: 'h1', filePath: 'C:\\Music\\Pop\\Track1.flac', title: 'Midnight Grid', artist: 'Artist A', album: 'Night', genre: 'Deep House', bpm: 124, key: 'A min', energy: 86, stars: 5, favorite: true, ext: 'FLAC', durationSec: 240, tags: ['nightdrive'], groups: ['Set 1'] },
+      { id: 't2', audioHash: 'h2', filePath: 'C:\\Music\\Pop\\Track2.flac', title: 'Neon Pulse', artist: 'Artist B', album: 'Night', genre: 'Melodic Techno', bpm: 128, key: 'E min', energy: 92, stars: 5, favorite: true, ext: 'FLAC', durationSec: 260, tags: ['peak'], groups: ['Set 1'] },
+      { id: 't3', audioHash: 'h3', filePath: 'C:\\Music\\Pop2\\Other.mp3', title: 'Pop2 Trap', artist: 'Artist A', album: 'Other', genre: 'Synth-Pop', bpm: 120, key: 'D min', energy: 78, stars: 4, favorite: false, ext: 'MP3', durationSec: 200, tags: ['warmup'], groups: ['Car'] },
+      { id: 't4', audioHash: 'h4', filePath: 'C:\\Music\\Ambient\\Rain.wav', title: 'Rain Focus', artist: 'Artist C', album: 'Calm', genre: 'Ambient', bpm: 88, key: 'G min', energy: 55, stars: 4, favorite: true, ext: 'WAV', durationSec: 300, tags: ['focus'], groups: [] },
+      { id: 't5', audioHash: 'h5', filePath: 'C:\\Music\\Videos\\Live.mp4', title: 'Live Clip', artist: 'Artist D', album: '', genre: 'Electronic', bpm: 130, key: 'A min', energy: 90, stars: 3, favorite: false, ext: 'MP4', durationSec: 180, isVideo: true, tags: ['MusicVideo'], groups: [] }
+    ];
+
+    const savedRule = {
+      id: 'rule-fav',
+      kind: 'rule',
+      name: 'Favs',
+      filters: { favoriteOnly: true, minBpm: '120', maxBpm: '132' }
+    };
+
+    const ctx = {
+      catalog,
+      anchorTrack: catalog[0],
+      currentQueue: [catalog[3]],
+      smartPlaylists: [savedRule],
+      rng: () => 0.25,
+      nowDate: new Date(2026, 10, 26, 22, 0, 0)
+    };
+
+    // Folder boundary guard: C:\Music\Pop must NOT match C:\Music\Pop2
+    const folderExec = executeFlowGraph({
+      id: 'f-folder',
+      graph: {
+        nodes: { s1: { id: 's1', type: 'source:folder', x: 0, y: 0, params: { folderPath: 'C:\\Music\\Pop', includeSubfolders: true } } },
+        edges: []
+      }
+    }, ctx);
+    assert.deepEqual(folderExec.outputTracks.map((t) => t.id), ['t1', 't2']);
+
+    // Genre taxonomy match ('Electronic' matches Deep House, Melodic Techno, Ambient, Electronic)
+    const genreExec = executeFlowGraph({
+      id: 'f-genre',
+      graph: {
+        nodes: {
+          s1: { id: 's1', type: 'source:all', x: 0, y: 0, params: { pool: 'audio' } },
+          g1: { id: 'g1', type: 'filter:genre', x: 100, y: 0, params: { genre: 'Electronic' } }
+        },
+        edges: [['s1', 'g1']]
+      }
+    }, ctx);
+    assert.ok(genreExec.outputTracks.some((t) => t.id === 't1'));
+    assert.equal(genreExec.outputTracks.some((t) => t.id === 't3'), false);
+
+    // Explicit slot routing on 2-input Subtract (B wired before A in edges array!)
+    const subtractExec = executeFlowGraph({
+      id: 'f-sub',
+      graph: {
+        nodes: {
+          a: { id: 'a', type: 'source:lossless', x: 0, y: 0, params: { format: 'ALL_LOSSLESS' } },
+          b: { id: 'b', type: 'source:smart_playlist', x: 0, y: 100, params: { playlistId: 'rule-fav' } },
+          sub: { id: 'sub', type: 'combiner:subtract', x: 200, y: 50, params: {} },
+          out: { id: 'out', type: 'output:playlist', x: 400, y: 50, params: {} }
+        },
+        edges: [
+          ['b', 'sub', 1], // slot B wired first!
+          ['a', 'sub', 0], // slot A wired second!
+          ['sub', 'out']
+        ]
+      }
+    }, ctx);
+    assert.deepEqual(subtractExec.outputTracks.map((t) => t.id), ['t4']);
+
+    // Weighted Zip + Dedup Artist + Harmonic Journey + Take Minutes + Time of Day
+    const pipelineExec = executeFlowGraph({
+      id: 'f-pipe',
+      graph: {
+        nodes: {
+          srcA: { id: 'srcA', type: 'source:all', x: 0, y: 0, params: { pool: 'audio' } },
+          srcB: { id: 'srcB', type: 'source:current_queue', x: 0, y: 100, params: {} },
+          tod: { id: 'tod', type: 'conditional:time_of_day', x: 200, y: 50, params: { dayStartHour: 6, nightStartHour: 19 } },
+          dedup: { id: 'dedup', type: 'filter:dedup_artist', x: 400, y: 50, params: { maxPerArtist: 1 } },
+          sort: { id: 'sort', type: 'sorter:harmonic_journey', x: 600, y: 50, params: { curve: 'energy-up' } },
+          out: { id: 'out', type: 'output:playlist', x: 800, y: 50, params: { dedupOutput: true } }
+        },
+        edges: [
+          ['srcA', 'tod', 0],
+          ['srcB', 'tod', 1], // At 22:00, Time of Day picks Night branch (slot 1 = currentQueue)
+          ['tod', 'dedup'],
+          ['dedup', 'sort'],
+          ['sort', 'out']
+        ]
+      }
+    }, ctx);
+    assert.deepEqual(pipelineExec.outputTracks.map((t) => t.id), ['t4']);
+
+    // Every preset template executes without errors
+    assert.ok(Object.keys(FLOW_NODE_REGISTRY).length >= 25);
+    for (const tpl of FLOW_PRESET_TEMPLATES) {
+      const res = executeFlowGraph({ id: tpl.key, kind: 'flow', graph: tpl.graph }, ctx);
+      assert.equal(res.ok, true, `Preset ${tpl.key} should execute cleanly`);
+      assert.equal(res.hasCycle, false);
+    }
+
+    // Exercise remaining V1 nodes (Zip, Union, Intersect, Harmonic, Tags, Take minutes/random, Artist-spaced shuffle, If Empty)
+    const zipUnionExec = executeFlowGraph({
+      id: 'f-comb',
+      graph: {
+        nodes: {
+          sAlb: { id: 'sAlb', type: 'source:album', x: 0, y: 0, params: { albumTitle: 'Night' } },
+          sArt: { id: 'sArt', type: 'source:artist', x: 0, y: 80, params: { artistName: 'Artist A', matchMode: 'exact' } },
+          sVibe: { id: 'sVibe', type: 'source:vibe_radio', x: 0, y: 160, params: { anchorMode: 'playing', count: 3, includeSeed: true } },
+          zip: { id: 'zip', type: 'combiner:zip', x: 180, y: 40, params: { ratioA: 1, ratioB: 1, deduplicate: true } },
+          inter: { id: 'inter', type: 'combiner:intersect', x: 180, y: 160, params: {} },
+          uni: { id: 'uni', type: 'combiner:union', x: 360, y: 90, params: {} },
+          harm: { id: 'harm', type: 'filter:harmonic', x: 520, y: 90, params: { anchorMode: 'fixed', targetKey: 'A min', maxDistance: 1 } },
+          tags: { id: 'tags', type: 'filter:tags_groups', x: 680, y: 90, params: { tagsCsv: 'nightdrive,peak', matchAll: false, minStars: 4, favoriteOnly: true, format: 'FLAC' } },
+          spaced: { id: 'spaced', type: 'sorter:artist_spaced_shuffle', x: 840, y: 90, params: {} },
+          takeMin: { id: 'takeMin', type: 'filter:take', x: 1000, y: 90, params: { mode: 'minutes', limit: 5, from: 'start' } },
+          emptyCheck: { id: 'emptyCheck', type: 'conditional:if_empty', x: 1160, y: 90, params: {} },
+          out: { id: 'out', type: 'output:playlist', x: 1320, y: 90, params: { dedupOutput: true } }
+        },
+        edges: [
+          ['sAlb', 'zip', 0],
+          ['sArt', 'zip', 1],
+          ['sAlb', 'inter', 0],
+          ['sVibe', 'inter', 1],
+          ['zip', 'uni', 0],
+          ['inter', 'uni', 1],
+          ['uni', 'harm'],
+          ['harm', 'tags'],
+          ['tags', 'spaced'],
+          ['spaced', 'takeMin'],
+          ['takeMin', 'emptyCheck', 0],
+          ['sVibe', 'emptyCheck', 1],
+          ['emptyCheck', 'out']
+        ]
+      }
+    }, ctx);
+    assert.equal(zipUnionExec.ok, true);
+    assert.ok(zipUnionExec.outputTracks.length >= 1);
+    assert.ok(zipUnionExec.outputTracks.every((t) => t.ext === 'FLAC' && t.favorite));
+
+    // Verify if_empty fallback & dedup_track
+    const fallbackExec = executeFlowGraph({
+      id: 'f-empty-fb',
+      graph: {
+        nodes: {
+          sAll: { id: 'sAll', type: 'source:all', x: 0, y: 0, params: { pool: 'audio' } },
+          fBpm: { id: 'fBpm', type: 'filter:bpm', x: 160, y: 0, params: { minBpm: 210, maxBpm: 230 } },
+          sFav: { id: 'sFav', type: 'source:favorites', x: 0, y: 100, params: { favoritesOnly: true, minStars: 5 } },
+          fb: { id: 'fb', type: 'conditional:if_empty', x: 320, y: 50, params: {} },
+          dedupT: { id: 'dedupT', type: 'filter:dedup_track', x: 480, y: 50, params: {} },
+          rev: { id: 'rev', type: 'sorter:reverse', x: 640, y: 50, params: {} }
+        },
+        edges: [
+          ['sAll', 'fBpm'],
+          ['fBpm', 'fb', 0],
+          ['sFav', 'fb', 1],
+          ['fb', 'dedupT'],
+          ['dedupT', 'rev']
+        ]
+      }
+    }, ctx);
+    assert.deepEqual(fallbackExec.outputTracks.map((t) => t.id), ['t2', 't1']);
+
+    // 4. Backend sanitizeFlowGraph & loadLibraryStore round-trip security
+    const sanitized = sanitizeFlowGraph({
+      nodes: {
+        valid1: { id: 'valid1', type: 'source:all', x: 42.6, y: -15, params: { pool: 'audio', __proto__: { hacked: true }, num: 5 } },
+        badType: { id: 'badType', type: 'exec:shell', x: 10, y: 10, params: {} },
+        'bad id!': { id: 'bad id!', type: 'source:all', x: 10, y: 10, params: {} }
+      },
+      edges: [
+        ['valid1', 'valid1'], // self-loop blocked
+        ['valid1', 'badType'], // dangling blocked
+        ['valid1', 'valid1', 0]
+      ]
+    });
+    assert.deepEqual(Object.keys(sanitized.nodes), ['valid1']);
+    assert.equal(sanitized.nodes.valid1.x, 43);
+    assert.equal(sanitized.nodes.valid1.y, 0);
+    assert.equal(Object.hasOwn(sanitized.nodes.valid1.params, '__proto__'), false);
+    assert.equal(sanitized.edges.length, 0);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-flow-store-'));
+    const storeFile = path.join(tmpDir, 'vanta-library.json');
+    saveLibraryStore({
+      watchedFolders: [],
+      annotations: {},
+      smartPlaylists: [
+        savedRule,
+        {
+          id: 'flow-persisted',
+          kind: 'flow',
+          name: 'Saved Flow',
+          description: 'Night graph',
+          visual: { mode: 'auto', presetKey: 'synth', imagePath: '' },
+          graph: {
+            nodes: { n1: { id: 'n1', type: 'source:all', x: 20, y: 30, params: { pool: 'audio' } } },
+            edges: []
+          }
+        }
+      ]
+    }, storeFile);
+    const loaded = loadLibraryStore(storeFile);
+    assert.equal(loaded.smartPlaylists.length, 2);
+    assert.equal(loaded.smartPlaylists[0].kind, 'rule');
+    assert.equal(loaded.smartPlaylists[1].kind, 'flow');
+    assert.equal(loaded.smartPlaylists[1].graph.nodes.n1.type, 'source:all');
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('26. Playlist Flow Studio V2: Extended Nodes (Year, Played/Skipped, Format Tier/Priority, Recently Added) & Secure M3U8 Export', () => {
+    const nowDate = new Date('2026-11-26T20:00:00Z');
+    const v2Catalog = [
+      { id: 'v1', filePath: 'C:\\Music\\OldMp3.mp3', title: 'Retro Synth', artist: 'Artist X', ext: 'MP3', bitDepth: 16, year: '1998', createdAt: '2026-11-25T10:00:00Z', durationSec: 210 },
+      { id: 'v2', filePath: 'C:\\Music\\RecentFlac.flac', title: 'Modern Lossless', artist: 'Artist Y', ext: 'FLAC', bitDepth: 16, year: '2024', createdAt: '2026-11-20T10:00:00Z', durationSec: 245 },
+      { id: 'v3', filePath: 'C:\\Music\\HiRes24.flac', title: 'Studio Master 24', artist: 'Artist Z', ext: 'FLAC', bitDepth: 24, year: '2025', createdAt: '2026-11-24T10:00:00Z', durationSec: 300 },
+      { id: 'v4', filePath: 'C:\\Music\\PlayedTrack.wav', title: 'Just Played', artist: 'Artist W', ext: 'WAV', bitDepth: 24, year: '2023', createdAt: '2026-01-01T10:00:00Z', durationSec: 190 },
+      { id: 'v5', filePath: 'C:\\Music\\SkippedTrack.dsf', title: 'Skipped DSD', artist: 'Artist Q', ext: 'DSF', bitDepth: 1, year: '', createdAt: '2026-11-22T10:00:00Z', durationSec: 260 }
+    ];
+
+    const v2Ctx = {
+      catalog: v2Catalog,
+      nowDate,
+      playbackHistory: [{ key: 'C:\\Music\\PlayedTrack.wav', title: 'Just Played' }],
+      banditRewards: { v5: -0.5, v3: 0.5 }
+    };
+
+    // 1. Recently Added (30 days) sorted descending -> excludes v4 (Jan 2026)
+    const recentExec = executeFlowGraph({
+      id: 'v2-recent',
+      graph: {
+        nodes: {
+          s1: { id: 's1', type: 'source:recently_added', x: 0, y: 0, params: { withinDays: 30, limit: 10 } }
+        },
+        edges: []
+      }
+    }, v2Ctx);
+    assert.deepEqual(recentExec.outputTracks.map((t) => t.id), ['v1', 'v3', 'v5', 'v2']);
+
+    // 2. Release Year + Exclude Played/Skipped + Format Priority
+    const pipeExec = executeFlowGraph({
+      id: 'v2-pipe',
+      graph: {
+        nodes: {
+          sAll: { id: 'sAll', type: 'source:all', x: 0, y: 0, params: { pool: 'audio' } },
+          yr: { id: 'yr', type: 'filter:year', x: 160, y: 0, params: { minYear: 2020, maxYear: 2026, includeUnknown: true } },
+          ex: { id: 'ex', type: 'filter:exclude_played', x: 320, y: 0, params: { mode: 'both', recentWindow: 20 } },
+          prio: { id: 'prio', type: 'sorter:format_priority', x: 480, y: 0, params: { preference: 'hires_first' } }
+        },
+        edges: [['sAll', 'yr'], ['yr', 'ex'], ['ex', 'prio']]
+      }
+    }, v2Ctx);
+    // v1 excluded by year, v4 excluded as played, v5 excluded as negative bandit reward -> leaves v3 (24-bit) then v2 (16-bit)
+    assert.deepEqual(pipeExec.outputTracks.map((t) => t.id), ['v3', 'v2']);
+
+    // 3. Format & Quality Tier filter (24-bit / DSD vs Lossy)
+    const hiresExec = executeFlowGraph({
+      id: 'v2-tier',
+      graph: {
+        nodes: {
+          sAll: { id: 'sAll', type: 'source:all', x: 0, y: 0, params: { pool: 'audio' } },
+          tier: { id: 'tier', type: 'filter:format_tier', x: 160, y: 0, params: { tier: 'hires_24bit' } }
+        },
+        edges: [['sAll', 'tier']]
+      }
+    }, v2Ctx);
+    assert.deepEqual(hiresExec.outputTracks.map((t) => t.id), ['v3', 'v4', 'v5']);
+
+    // 4. sanitizeFlowGraph allows all V2 node types
+    const sanitizedV2 = sanitizeFlowGraph({
+      nodes: {
+        n1: { id: 'n1', type: 'source:recently_added', x: 10, y: 10, params: { withinDays: 14 } },
+        n2: { id: 'n2', type: 'filter:year', x: 20, y: 20, params: { minYear: 2020, maxYear: 2026 } },
+        n3: { id: 'n3', type: 'filter:exclude_played', x: 30, y: 30, params: { mode: 'both' } },
+        n4: { id: 'n4', type: 'filter:format_tier', x: 40, y: 40, params: { tier: 'hires_24bit' } },
+        n5: { id: 'n5', type: 'sorter:format_priority', x: 50, y: 50, params: { preference: 'lossless_first' } }
+      },
+      edges: [['n1', 'n2'], ['n2', 'n3'], ['n3', 'n4'], ['n4', 'n5']]
+    });
+    assert.equal(Object.keys(sanitizedV2.nodes).length, 5);
+    assert.equal(sanitizedV2.edges.length, 4);
+
+    // 5. buildM3u8Content CRLF/NUL injection prevention & formatting
+    const m3u = buildM3u8Content([
+      { filePath: 'C:\\Music\\HiRes24.flac', artist: 'Artist\r\nInject', title: 'Master\nTrack', durationSec: 300.4 },
+      { filePath: 'C:\\Music\\Evil\n#EXTINF:0,Fake.mp3', artist: 'Bad', title: 'Path', durationSec: 100 },
+      { filePath: '', artist: 'Empty', title: 'Skip', durationSec: 100 }
+    ], { playlistName: 'Night\nDrive' });
+    assert.equal(m3u.exportedCount, 1);
+    assert.match(m3u.content, /^#EXTM3U\n#PLAYLIST:Night Drive\n#EXTINF:300,Artist Inject - Master Track\nC:\\Music\\HiRes24\.flac\n$/);
+
+    // 6. pathSecurityService PLAYLIST_EXTENSIONS validation
+    const tmpExportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-m3u8-'));
+    const validM3u8 = validateSafeFilePath(path.join(tmpExportDir, 'mix.m3u8'), {
+      allowedExtensions: PLAYLIST_EXTENSIONS,
+      mustExist: false
+    });
+    assert.ok(validM3u8 && validM3u8.endsWith('.m3u8'));
+    assert.equal(
+      validateSafeFilePath(path.join(tmpExportDir, 'mix.exe'), { allowedExtensions: PLAYLIST_EXTENSIONS, mustExist: false }),
+      null
+    );
+    assert.equal(
+      validateSafeFilePath(path.join(tmpExportDir, 'mix.m3u8:ads'), { allowedExtensions: PLAYLIST_EXTENSIONS, mustExist: false }),
+      null
+    );
+    assert.equal(
+      validateSafeFilePath('\\\\evil-share\\mix.m3u8', { allowedExtensions: PLAYLIST_EXTENSIONS, mustExist: false }),
+      null
+    );
+    fs.rmSync(tmpExportDir, { recursive: true, force: true });
   });
 });
