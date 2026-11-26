@@ -86,7 +86,9 @@ function isPathInsideDir(rootDir, candidatePath) {
  */
 function resolveSafeVaultSubfolder(vaultRoot, subfolder = '') {
   if (typeof subfolder !== 'string') return null;
-  const key = subfolder.trim().replaceAll('\\', '/').replace(/^\/+|\/+$/g, '').toLowerCase();
+  let key = subfolder.trim().replaceAll('\\', '/').toLowerCase();
+  while (key.startsWith('/')) key = key.slice(1);
+  while (key.endsWith('/')) key = key.slice(0, -1);
   if (!Object.hasOwn(VAULT_SUBFOLDER_MAP, key)) {
     return null;
   }
@@ -209,6 +211,103 @@ function isPathAuthorizedInScope(canonicalFilePath, scope = {}) {
   return false;
 }
 
+/**
+ * Resolves an untrusted host path strictly from a set of trusted root directories by walking
+ * real OS directory entries (`fs.readdirSync`), ensuring the returned string never contains
+ * tainted user input and never traverses symlinks/junctions or blocked system segments.
+ * @param {string} rawPath - Untrusted path input.
+ * @param {Iterable<string>} trustedRoots - Trusted root directories (e.g. drive roots, VAULT_ROOT).
+ * @param {object} [options={}] - Resolution options.
+ * @param {'file'|'dir'|'any'} [options.expect='any'] - Expected filesystem entry kind.
+ * @param {Set<string>|null} [options.allowedExtensions=null] - Optional lowercase extension allowlist for files.
+ * @param {Set<string>|null} [options.blockedSegments=null] - Optional lowercase directory segment blocklist.
+ * @returns {string|null} Server-constructed canonical path, or null if invalid/not found.
+ */
+function resolveFromTrustedRoots(rawPath, trustedRoots, options = {}) {
+  const { expect = 'any', allowedExtensions = null, blockedSegments = null } = options;
+  if (!hasSafePathSyntax(rawPath)) return null;
+
+  const targetResolved = path.resolve(rawPath.trim());
+  const targetCmp = toComparisonPath(targetResolved);
+
+  // Pick the longest matching trusted root
+  let matchedRoot = null;
+  let matchedRootCmp = '';
+  for (const root of trustedRoots || []) {
+    if (!root) continue;
+    const rootCanon = canonicalizePath(root);
+    const rootCmp = toComparisonPath(rootCanon);
+    const prefix = rootCmp.endsWith(path.sep) ? rootCmp : `${rootCmp}${path.sep}`;
+    if (targetCmp === rootCmp || targetCmp.startsWith(prefix)) {
+      if (rootCmp.length > matchedRootCmp.length) {
+        matchedRoot = rootCanon;
+        matchedRootCmp = rootCmp;
+      }
+    }
+  }
+  if (!matchedRoot) return null;
+
+  const rel = path.relative(matchedRoot, targetResolved);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+
+  const segments = rel ? rel.split(path.sep).filter(Boolean) : [];
+  let current = matchedRoot;
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg === '.' || seg === '..' || WINDOWS_RESERVED_DEVICE_RE.test(seg)) return null;
+    if (blockedSegments && blockedSegments.has(seg.toLowerCase())) return null;
+
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+
+    const segCmp = process.platform === 'win32' ? seg.toLowerCase() : seg;
+    const match = entries.find((e) => (process.platform === 'win32' ? e.name.toLowerCase() : e.name) === segCmp);
+    if (!match) return null;
+
+    const isLast = i === segments.length - 1;
+    const nextPath = path.join(current, match.name);
+    if (!isLast) {
+      if (!match.isDirectory()) {
+        if (!match.isSymbolicLink()) return null;
+        try {
+          if (!fs.statSync(nextPath).isDirectory()) return null;
+        } catch {
+          return null;
+        }
+      }
+      current = nextPath;
+    } else {
+      let isFile = match.isFile();
+      let isDir = match.isDirectory();
+      if (match.isSymbolicLink()) {
+        try {
+          const st = fs.statSync(nextPath);
+          isFile = st.isFile();
+          isDir = st.isDirectory();
+        } catch {
+          return null;
+        }
+      }
+      if (expect === 'file' && !isFile) return null;
+      if (expect === 'dir' && !isDir) return null;
+      if (!isFile && !isDir) return null;
+      if (isFile && allowedExtensions) {
+        const ext = path.extname(match.name).toLowerCase();
+        if (!allowedExtensions.has(ext)) return null;
+      }
+      current = nextPath;
+    }
+  }
+
+  if (segments.length === 0 && expect === 'file') return null;
+  return canonicalizePath(current);
+}
+
 module.exports = {
   SUBTITLE_EXTENSIONS,
   IMAGE_EXTENSIONS,
@@ -219,5 +318,6 @@ module.exports = {
   resolveSafeVaultSubfolder,
   validateSafeFilePath,
   validateSafeDirectoryPath,
-  isPathAuthorizedInScope
+  isPathAuthorizedInScope,
+  resolveFromTrustedRoots
 };

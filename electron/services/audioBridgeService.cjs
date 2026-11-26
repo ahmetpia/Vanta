@@ -76,7 +76,7 @@ function parseFfmpegProbeOutput(stderrText) {
   let bitrateKbps = 0;
 
   const lines = text.split(/\r?\n/);
-  const audioRawLine = lines.find((ln) => /^\s*Stream\s+#\d+:\d+[^\r\n]*?:\s*Audio:/i.test(ln));
+  const audioRawLine = lines.find((ln) => ln.includes('Stream #') && /:\s?Audio:/i.test(ln));
   if (audioRawLine) {
     const audioMarkerIdx = audioRawLine.toLowerCase().indexOf('audio:');
     const info = audioMarkerIdx >= 0 ? audioRawLine.slice(audioMarkerIdx + 6).trim() : '';
@@ -115,7 +115,7 @@ function parseFfmpegProbeOutput(stderrText) {
   let videoCodec = '';
   let videoWidth = 0;
   let videoHeight = 0;
-  const videoRawLine = lines.find((ln) => /^\s*Stream\s+#\d+:\d+[^\r\n]*?:\s*Video:/i.test(ln));
+  const videoRawLine = lines.find((ln) => ln.includes('Stream #') && /:\s?Video:/i.test(ln));
   if (videoRawLine) {
     const videoMarkerIdx = videoRawLine.toLowerCase().indexOf('video:');
     const rest = videoMarkerIdx >= 0 ? videoRawLine.slice(videoMarkerIdx + 6).trim() : '';
@@ -388,6 +388,8 @@ async function measureEbuR128Loudness(filePath, targetLufs = -14.0) {
   });
 }
 
+const knownWasapiDeviceIds = new Map();
+
 /**
  * Enumerates active Windows WASAPI output endpoints via vanta-audio-engine.exe.
  * @returns {Promise<Array<{id: string, name: string, isDefault: boolean}>>}
@@ -398,7 +400,14 @@ async function listWasapiDevices() {
   try {
     const { stdout } = await execFileAsync(engineBin, ['--list-devices'], { timeout: 5000 });
     const parsed = JSON.parse(String(stdout || '[]').trim());
-    return Array.isArray(parsed) ? parsed : [];
+    const devices = Array.isArray(parsed) ? parsed : [];
+    knownWasapiDeviceIds.clear();
+    for (const dev of devices) {
+      if (dev && typeof dev.id === 'string' && dev.id.trim()) {
+        knownWasapiDeviceIds.set(dev.id.trim(), dev.id.trim());
+      }
+    }
+    return devices;
   } catch (err) {
     logger.warn('WasapiBridge', 'Failed enumerating WASAPI devices', { error: err.message });
     return [];
@@ -583,14 +592,14 @@ class NativeWasapiPlayer {
       throw new Error('Invalid or rejected audio file path');
     }
 
-    const safeDeviceId =
-      typeof options.deviceId === 'string' &&
-      options.deviceId.trim() &&
-      !options.deviceId.trim().startsWith('-') &&
-      !/[\r\n\0]/.test(options.deviceId) &&
-      options.deviceId.trim().length <= 256
-        ? options.deviceId.trim()
-        : '';
+    let safeDeviceId = '';
+    if (typeof options.deviceId === 'string' && options.deviceId.trim()) {
+      const requestedId = options.deviceId.trim();
+      if (!knownWasapiDeviceIds.has(requestedId)) {
+        await listWasapiDevices();
+      }
+      safeDeviceId = knownWasapiDeviceIds.get(requestedId) || '';
+    }
     const safeGain = Number.isFinite(Number(options.linearGain))
       ? Math.max(0, Math.min(4.0, Number(options.linearGain)))
       : 1.0;

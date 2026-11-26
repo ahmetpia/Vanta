@@ -22,10 +22,10 @@ const logger = require('./services/loggerService.cjs');
 const {
   SUBTITLE_EXTENSIONS,
   IMAGE_EXTENSIONS,
+  hasSafePathSyntax,
+  canonicalizePath,
   resolveSafeVaultSubfolder,
-  validateSafeFilePath,
-  validateSafeDirectoryPath,
-  isPathAuthorizedInScope
+  resolveFromTrustedRoots
 } = require('./services/pathSecurityService.cjs');
 const {
   resolveFfmpegBinary,
@@ -266,38 +266,78 @@ function registerSecureIpcHandler(channel, handler) {
   });
 }
 
-/**
- * Returns the active authorized file-access scope (Vault + watched folders/files + approved cover/FX assets).
- */
-function getAuthorizedMediaScope() {
-  const extraFiles = [];
-  if (libraryStore.stageFxVideoPath) extraFiles.push(libraryStore.stageFxVideoPath);
-  for (const sp of libraryStore.smartPlaylists || []) {
-    if (sp?.visual?.imagePath) extraFiles.push(sp.visual.imagePath);
-  }
-  return {
-    vaultRoot: VAULT_ROOT,
-    watchedFolders,
-    watchedFiles,
-    extraFiles,
-    allowSiblingInWatchedFileDirs: true
-  };
+const authorizedMediaFiles = new Map();
+const authorizedExplorerDirs = new Map();
+
+function toNormKey(p) {
+  const norm = path.resolve(String(p || '').trim());
+  return process.platform === 'win32' ? norm.toLowerCase() : norm;
+}
+
+function registerAuthorizedMediaFile(canonPath) {
+  if (!canonPath) return;
+  authorizedMediaFiles.set(toNormKey(canonPath), canonPath);
+}
+
+function registerAuthorizedExplorerDir(canonDir) {
+  if (!canonDir) return;
+  authorizedExplorerDirs.set(toNormKey(canonDir), canonDir);
 }
 
 /**
- * Validates syntax, regular-file status, extension allowlist, and application scope for a media/image path.
+ * Returns trusted root directories allowed for media/subtitle access.
+ */
+function getAuthorizedMediaRoots() {
+  const roots = [VAULT_ROOT, ...watchedFolders];
+  for (const wf of watchedFiles) {
+    if (wf) roots.push(path.dirname(wf));
+  }
+  return roots;
+}
+
+/**
+ * Returns trusted OS drive & user roots for Computer Explorer navigation.
+ */
+function getTrustedExplorerRoots() {
+  const roots = [VAULT_ROOT, ...watchedFolders];
+  for (const r of getComputerRoots()) {
+    if (r?.path) {
+      roots.push(r.path);
+      registerAuthorizedExplorerDir(r.path);
+    }
+  }
+  return roots;
+}
+
+/**
+ * Resolves an untrusted media/subtitle/image path strictly from server-side registries or
+ * OS directory walks (`resolveFromTrustedRoots`), returning a zero-taint canonical path.
  * @param {string} rawPath - Untrusted path.
  * @param {Set<string>} allowedExtensions - Allowed lowercase extensions.
- * @returns {string|null} Canonical safe path or null if rejected.
+ * @returns {string|null} Server-originated canonical safe path or null if rejected.
  */
 function resolveAuthorizedFile(rawPath, allowedExtensions) {
-  const safePath = validateSafeFilePath(rawPath, { allowedExtensions, mustExist: true });
-  if (!safePath) return null;
-  if (!isPathAuthorizedInScope(safePath, getAuthorizedMediaScope())) {
-    logger.warn('SecurityBoundary', 'Blocked out-of-scope file access attempt', { path: safePath });
-    return null;
+  if (!hasSafePathSyntax(rawPath)) return null;
+  const key = toNormKey(rawPath);
+  const cached = authorizedMediaFiles.get(key);
+  if (cached) {
+    const ext = path.extname(cached).toLowerCase();
+    if ((!allowedExtensions || allowedExtensions.has(ext)) && fs.existsSync(cached)) {
+      return cached;
+    }
   }
-  return safePath;
+
+  const resolved = resolveFromTrustedRoots(rawPath, getAuthorizedMediaRoots(), {
+    expect: 'file',
+    allowedExtensions,
+    blockedSegments: BLOCKED_INGEST_DIR_NAMES
+  });
+  if (resolved) {
+    registerAuthorizedMediaFile(resolved);
+    return resolved;
+  }
+  logger.warn('SecurityBoundary', 'Blocked out-of-scope or invalid file access attempt', { rawPath });
+  return null;
 }
 
 /**
@@ -544,6 +584,9 @@ function registerIpcHandlers() {
       saveLibraryStore(libraryStore, STORE_PATH);
     }
     const merged = mergeCatalogTracks(folderTracks, explicitTracks);
+    for (const t of merged) {
+      if (t?.filePath) registerAuthorizedMediaFile(canonicalizePath(t.filePath));
+    }
     return applyAnnotationsToCatalog(merged);
   }
 
@@ -557,17 +600,17 @@ function registerIpcHandlers() {
     const addedFolders = [];
     const addedFiles = [];
     let hiddenList = Array.isArray(libraryStore.hiddenPaths) ? [...libraryStore.hiddenPaths] : [];
+    const explorerRoots = getTrustedExplorerRoots();
 
     for (const raw of Array.isArray(rawPaths) ? rawPaths : []) {
       if (!raw) continue;
-      const safeDir = validateSafeDirectoryPath(String(raw), { mustExist: true });
+      const safeDir = resolveFromTrustedRoots(String(raw), explorerRoots, {
+        expect: 'dir',
+        blockedSegments: BLOCKED_INGEST_DIR_NAMES
+      });
       if (safeDir) {
-        const segments = safeDir.toLowerCase().split(path.sep).filter(Boolean);
-        if (segments.some((seg) => BLOCKED_INGEST_DIR_NAMES.has(seg))) {
-          logger.warn('SecurityBoundary', 'Blocked ingesting protected system/credential directory', { dir: safeDir });
-          continue;
-        }
         watchedFolders.add(safeDir);
+        registerAuthorizedExplorerDir(safeDir);
         addedFolders.push(safeDir);
         const normLower = safeDir.toLowerCase();
         const prefix = normLower.endsWith(path.sep) ? normLower : `${normLower}${path.sep}`;
@@ -578,9 +621,14 @@ function registerIpcHandlers() {
         continue;
       }
 
-      const safeFile = validateSafeFilePath(String(raw), { allowedExtensions: ALL_MEDIA_EXTENSIONS, mustExist: true });
+      const safeFile = resolveFromTrustedRoots(String(raw), explorerRoots, {
+        expect: 'file',
+        allowedExtensions: ALL_MEDIA_EXTENSIONS,
+        blockedSegments: BLOCKED_INGEST_DIR_NAMES
+      });
       if (safeFile) {
         watchedFiles.add(safeFile);
+        registerAuthorizedMediaFile(safeFile);
         addedFiles.push(safeFile);
         const normLower = safeFile.toLowerCase();
         hiddenList = hiddenList.filter(
@@ -614,11 +662,35 @@ function registerIpcHandlers() {
   });
 
   registerSecureIpcHandler('vanta:get-computer-roots', () => {
-    return getComputerRoots();
+    const roots = getComputerRoots();
+    for (const r of roots) {
+      if (r?.path) registerAuthorizedExplorerDir(canonicalizePath(r.path));
+    }
+    return roots;
   });
 
   registerSecureIpcHandler('vanta:list-dir', (_event, dirPath) => {
-    return listDirectoryEntries(dirPath, libraryStore.hiddenExplorerDirs || []);
+    if (!hasSafePathSyntax(dirPath)) {
+      return { path: '', entries: [], error: 'Invalid or unsafe directory path' };
+    }
+    const key = toNormKey(dirPath);
+    const trustedDir =
+      authorizedExplorerDirs.get(key) ||
+      resolveFromTrustedRoots(dirPath, getTrustedExplorerRoots(), {
+        expect: 'dir',
+        blockedSegments: BLOCKED_INGEST_DIR_NAMES
+      });
+    if (!trustedDir) {
+      return { path: '', entries: [], error: 'Directory rejected by security policy' };
+    }
+    registerAuthorizedExplorerDir(trustedDir);
+    const res = listDirectoryEntries(trustedDir, libraryStore.hiddenExplorerDirs || []);
+    for (const entry of res?.entries || []) {
+      if (entry.type === 'folder' && entry.path) {
+        registerAuthorizedExplorerDir(entry.path);
+      }
+    }
+    return res;
   });
 
   registerSecureIpcHandler('vanta:get-hidden-explorer-dirs', () => {
@@ -842,6 +914,8 @@ function registerIpcHandlers() {
       };
     }
 
+    const requestedImg = String(playlist.visual?.imagePath || '').trim();
+    const safeCoverImg = requestedImg ? (resolveAuthorizedFile(requestedImg, IMAGE_EXTENSIONS) || '') : '';
     const normalized = {
       id: normalizedId,
       name: cleanName,
@@ -850,7 +924,7 @@ function registerIpcHandlers() {
         ? {
             mode: ['auto', 'preset', 'image'].includes(playlist.visual.mode) ? playlist.visual.mode : 'auto',
             presetKey: String(playlist.visual.presetKey || 'synth').slice(0, 24),
-            imagePath: String(playlist.visual.imagePath || '').trim()
+            imagePath: safeCoverImg
           }
         : { mode: 'auto', presetKey: 'synth', imagePath: '' },
       filters: playlist.filters && typeof playlist.filters === 'object' ? playlist.filters : {}
@@ -917,6 +991,7 @@ function registerIpcHandlers() {
       const safeId = String(payload.playlistId || 'draft').replace(/[^a-zA-Z0-9_-]/g, '');
       const destPath = path.join(coversDir, `${safeId}-${Date.now()}.jpg`);
       fs.writeFileSync(destPath, thumb.toJPEG(90));
+      registerAuthorizedMediaFile(canonicalizePath(destPath));
       logger.info('LibraryStore', 'Saved optimized 256x256 playlist cover thumbnail', { destPath });
 
       return { canceled: false, imagePath: destPath };
@@ -945,6 +1020,7 @@ function registerIpcHandlers() {
   registerSecureIpcHandler('vanta:get-fx-video', () => {
     const saved = libraryStore.stageFxVideoPath;
     if (saved && fs.existsSync(saved)) {
+      registerAuthorizedMediaFile(canonicalizePath(saved));
       return { videoPath: saved, fileName: path.basename(saved) };
     }
     const defaults = [
@@ -953,6 +1029,7 @@ function registerIpcHandlers() {
       path.join(VAULT_ROOT, 'effect1.mpg')
     ];
     const found = defaults.find((p) => fs.existsSync(p)) || '';
+    if (found) registerAuthorizedMediaFile(canonicalizePath(found));
     return { videoPath: found, fileName: found ? path.basename(found) : '' };
   });
 
@@ -967,7 +1044,8 @@ function registerIpcHandlers() {
     if (result.canceled || !result.filePaths.length) {
       return { canceled: true };
     }
-    const chosen = path.normalize(result.filePaths[0]);
+    const chosen = canonicalizePath(result.filePaths[0]);
+    registerAuthorizedMediaFile(chosen);
     libraryStore.stageFxVideoPath = chosen;
     saveLibraryStore(libraryStore, STORE_PATH);
     logger.info('LibraryStore', `Updated Stage FX background video to ${chosen}`);

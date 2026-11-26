@@ -97,6 +97,7 @@ const {
   validateSafeFilePath,
   validateSafeDirectoryPath,
   isPathAuthorizedInScope,
+  resolveFromTrustedRoots,
   SUBTITLE_EXTENSIONS
 } = require('../electron/services/pathSecurityService.cjs');
 
@@ -1057,6 +1058,19 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
       assert.equal(isPathAuthorizedInScope(outsideMp3, scope), true);
       assert.equal(isPathAuthorizedInScope(outsideSrt, scope), true);
       assert.ok(validateSafeFilePath(outsideSrt, { allowedExtensions: SUBTITLE_EXTENSIONS }));
+
+      // 3B. Server-side resolveFromTrustedRoots reconstructs paths from OS directory entries and blocks escapes/blocked segments
+      const trustedResolved = resolveFromTrustedRoots(vaultMp3, [vaultRoot], {
+        expect: 'file',
+        allowedExtensions: new Set(['.mp3'])
+      });
+      assert.equal(trustedResolved, fs.realpathSync(vaultMp3));
+      assert.equal(resolveFromTrustedRoots(outsideMp3, [vaultRoot], { expect: 'file' }), null);
+      assert.equal(resolveFromTrustedRoots(secretFile, [outsideDir], { expect: 'file', allowedExtensions: new Set(['.mp3']) }), null);
+      assert.equal(
+        resolveFromTrustedRoots(path.join(vaultRoot, '..', 'Outside', 'external.mp3'), [vaultRoot], { expect: 'file' }),
+        null
+      );
 
       // 4. ID3 service rejects non-MP3 / traversal / ADS targets cleanly
       const id3Reject = updateMp3MetadataOnDisk(secretFile, { title: 'Pwned' });
