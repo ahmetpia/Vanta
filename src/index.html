@@ -1454,47 +1454,63 @@
   </div>
 
   <!-- VANTA Playlist Flow Studio Fullscreen Modal (Node-Graph Playlist Automation) -->
-  <div id="flowStudioModal" data-testid="flow-studio-modal" class="vanta-modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="flowStudioTitle">
+  <div id="flowStudioModal" data-testid="flow-studio-modal" class="vanta-modal-backdrop flow-studio-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="flowStudioTitle">
     <div class="vanta-modal-card flow-studio-modal-card">
-      <!-- Top Studio Header -->
+      <!-- Compact Single-Row Studio Header -->
       <div class="flow-studio-topbar">
         <div class="flow-studio-brand">
-          <div id="flowCoverPreview" class="smart-rule-cover-preview"></div>
-          <div class="flow-studio-identity">
+          <div id="flowCoverPreview" class="flow-topbar-cover-preview"></div>
+          <div class="flow-studio-title-group">
             <div class="flow-studio-title-row">
-              <h3 id="flowStudioTitle" class="vanta-modal-title">VANTA Playlist Flow Studio</h3>
+              <h3 id="flowStudioTitle" class="vanta-modal-title flow-studio-heading">Flow Studio</h3>
               <span id="flowDagStatusBadge" class="flow-dag-badge ok">DAG Valid</span>
               <span id="flowScheduleSummary" class="flow-schedule-summary"></span>
             </div>
-            <div class="flow-studio-inputs-row">
-              <input id="flowStudioNameInput" data-testid="flow-studio-name-input" type="text" class="smart-rule-input flow-name-input" aria-label="Flow Playlist Name" placeholder="Flow Playlist Name (e.g. Night Drive Peak-Hour Mix)" />
-              <input id="flowStudioDescInput" type="text" maxlength="140" class="smart-rule-input flow-desc-input" aria-label="Optional Studio Note or Description" placeholder="Optional studio note / description" />
-            </div>
+          </div>
+          <div class="flow-studio-inputs-row">
+            <input id="flowStudioNameInput" data-testid="flow-studio-name-input" type="text" class="smart-rule-input flow-name-input" aria-label="Flow Playlist Name" placeholder="Flow Playlist Name..." />
+            <input id="flowStudioDescInput" type="text" maxlength="140" class="smart-rule-input flow-desc-input" aria-label="Optional Studio Note or Description" placeholder="Optional studio note..." />
           </div>
         </div>
 
         <div class="flow-studio-top-actions">
-          <div id="flowCoverSwatches" class="cover-swatches-row"></div>
-          <button id="btnUploadFlowCover" type="button" class="btn btn-ghost explorer-hdr-btn" title="Choose a custom cover image">📷 Cover</button>
-          <button id="btnFlowAutoLayout" type="button" class="btn btn-ghost explorer-hdr-btn" title="Align nodes left-to-right by DAG topological depth">Auto-Layout</button>
-          <button id="btnFlowRunBatch" type="button" class="btn btn-primary explorer-hdr-btn" title="Simulate topological batch execution">▶ Run Batch</button>
+          <div class="flow-popover-anchor">
+            <button id="btnFlowTemplatesMenu" type="button" class="btn btn-ghost explorer-hdr-btn" aria-haspopup="true" aria-expanded="false" title="Load a starter flow template">Templates ▾</button>
+            <div id="flowTemplatesMenu" class="flow-popover-menu hidden" role="menu">
+              <div class="flow-popover-title">Starter Flow Templates</div>
+              <div id="flowTemplatesList" class="flow-templates-list"></div>
+            </div>
+          </div>
+
+          <div class="flow-popover-anchor">
+            <button id="btnFlowCoverMenu" type="button" class="btn btn-ghost explorer-hdr-btn" aria-haspopup="true" aria-expanded="false" title="Customize playlist cover art">🎨 Cover ▾</button>
+            <div id="flowCoverMenu" class="flow-popover-menu flow-cover-popover hidden" role="dialog" aria-label="Cover Style">
+              <div class="flow-popover-title">Cover Style</div>
+              <div id="flowCoverSwatches" class="cover-swatches-row"></div>
+              <button id="btnUploadFlowCover" type="button" class="btn btn-ghost explorer-hdr-btn" title="Choose a custom cover image">📷 Upload Custom Image…</button>
+            </div>
+          </div>
+
+          <div class="segmented-group flow-drawer-toggles" aria-label="Workspace Panels">
+            <button id="btnToggleFlowPalette" type="button" class="seg-btn active" title="Show/Hide Left Node Palette">Palette</button>
+            <button id="btnFlowFocusCanvas" type="button" class="seg-btn" title="Canvas Focus Mode: hide both side panels (Shift+F)">Focus</button>
+            <button id="btnToggleFlowRight" type="button" class="seg-btn active" title="Show/Hide Right Inspector &amp; Stream">Inspector</button>
+          </div>
+
+          <button id="btnFlowAutoLayout" type="button" class="btn btn-ghost explorer-hdr-btn" title="Align nodes cleanly inside workspace">Auto-Layout</button>
+          <button id="btnFlowRunBatch" type="button" class="btn btn-primary explorer-hdr-btn" title="Simulate topological batch execution">▶ Run</button>
+          <button id="btnFlowMaximizeWin" type="button" class="btn btn-ghost btn-dsp-close" title="Maximize / Restore VANTA Window" aria-label="Maximize Window">⛶</button>
           <button id="btnCloseFlowStudio" type="button" class="btn btn-ghost btn-dsp-close" aria-label="Close Flow Studio">✕</button>
         </div>
       </div>
 
-      <!-- Starter Templates Strip -->
-      <div class="flow-templates-strip">
-        <span class="flow-templates-label">Templates:</span>
-        <div id="flowTemplatesList" class="flow-templates-list"></div>
-        <span id="flowWireBanner" class="flow-wire-banner hidden">Wiring active — click target input port ● (Esc or canvas to cancel)</span>
-      </div>
-
       <!-- 3-Column Studio Body -->
-      <div class="flow-studio-body">
+      <div id="flowStudioBody" class="flow-studio-body">
         <!-- Left: Node Palette -->
         <aside class="flow-palette-pane">
           <div class="flow-pane-hdr">
             <span>Node Palette</span>
+            <button id="btnCollapsePaletteInline" type="button" class="flow-pane-collapse-btn" title="Collapse Palette">‹</button>
           </div>
           <input id="flowPaletteSearch" type="search" class="smart-rule-input flow-palette-search" aria-label="Filter Flow Nodes" placeholder="Filter nodes..." />
           <div id="flowPaletteList" class="flow-palette-list"></div>
@@ -1502,17 +1518,26 @@
 
         <!-- Center: Interactive DAG Canvas -->
         <section id="flowCanvasViewport" class="flow-canvas-viewport" data-testid="flow-canvas-viewport">
+          <span id="flowWireBanner" class="flow-wire-banner hidden">Wiring active — click target input port ● (Esc or canvas to cancel)</span>
           <div id="flowCanvasWorld" class="flow-canvas-world">
             <div id="flowCanvasStage" class="flow-canvas-stage">
               <svg id="flowWireSvg" class="flow-wire-svg"></svg>
               <div id="flowNodesLayer" class="flow-nodes-layer"></div>
             </div>
           </div>
+
+          <!-- Bottom-Left Interactive Minimap -->
+          <div id="flowMinimap" class="flow-minimap" data-testid="flow-minimap" title="Click or drag to pan workspace">
+            <svg id="flowMinimapSvg" class="flow-minimap-svg"></svg>
+          </div>
+
+          <!-- Bottom-Right Zoom & Fit HUD -->
           <div class="flow-canvas-hud" data-testid="flow-canvas-hud">
             <button id="btnFlowZoomOut" type="button" class="flow-hud-btn" title="Zoom Out (-)">−</button>
             <span id="flowZoomLabel" class="flow-hud-zoom">100%</span>
             <button id="btnFlowZoomIn" type="button" class="flow-hud-btn" title="Zoom In (+)">+</button>
-            <button id="btnFlowZoomFit" type="button" class="flow-hud-btn flow-hud-fit" title="Fit all nodes into view">Fit</button>
+            <button id="btnFlowZoomReset" type="button" class="flow-hud-btn" title="Reset Zoom to 100%">1:1</button>
+            <button id="btnFlowZoomFit" type="button" class="flow-hud-btn flow-hud-fit" title="Fit entire flow into view">Fit</button>
           </div>
         </section>
 
@@ -1521,7 +1546,10 @@
           <div class="flow-inspector-card">
             <div class="flow-pane-hdr">
               <span>Node Inspector</span>
-              <span id="flowInspectorCatPill" class="flow-inspector-cat-pill">None</span>
+              <div class="flow-pane-hdr-right">
+                <span id="flowInspectorCatPill" class="flow-inspector-cat-pill">None</span>
+                <button id="btnCollapseRightInline" type="button" class="flow-pane-collapse-btn" title="Collapse Inspector">›</button>
+              </div>
             </div>
             <div id="flowInspectorBody" class="flow-inspector-body"></div>
           </div>

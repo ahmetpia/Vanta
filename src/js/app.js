@@ -184,6 +184,7 @@ class VantaStudioApp {
       onSaveFlow: (flowObj, isEdit) => this.saveSmartPlaylistObject(flowObj, isEdit, 'flowValidationMsg'),
       onPlayTracks: (tracks, title) => this.playAdHocFlowPreview(tracks, title),
       onExportM3u8: (tracks, name) => this.exportPlaylistM3u8(tracks, name),
+      onToggleMaximizeWin: () => window.vantaAPI?.windowControl?.('maximize'),
       onToast: (msg) => this.setToast(msg)
     });
     this.activeTrackTags = null;

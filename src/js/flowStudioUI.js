@@ -69,6 +69,9 @@ export class FlowStudioController {
     this.zoom = 1;
     this.panX = 0;
     this.panY = 0;
+    this.paletteCollapsed = false;
+    this.rightCollapsed = false;
+    this._minimapBounds = null;
     this._previewWireEl = null;
     this._lastEval = null;
     this._nodeDomById = new Map();
@@ -155,7 +158,66 @@ export class FlowStudioController {
 
     document.getElementById('btnFlowZoomOut')?.addEventListener('click', () => this.setZoom(this.zoom - 0.15));
     document.getElementById('btnFlowZoomIn')?.addEventListener('click', () => this.setZoom(this.zoom + 0.15));
-    document.getElementById('btnFlowZoomFit')?.addEventListener('click', () => this.fitToView({ maxZoom: 1.05 }));
+    document.getElementById('btnFlowZoomReset')?.addEventListener('click', () => this.setZoom(1));
+    document.getElementById('btnFlowZoomFit')?.addEventListener('click', () => this.fitToView({ minZoom: 0.45, maxZoom: 1.05 }));
+
+    document.getElementById('btnFlowMaximizeWin')?.addEventListener('click', () => {
+      this.host.onToggleMaximizeWin?.();
+      setTimeout(() => {
+        if (this.isOpen) this.fitToView({ minZoom: 0.75, maxZoom: 1 });
+      }, 140);
+    });
+
+    document.getElementById('btnToggleFlowPalette')?.addEventListener('click', () => this.togglePalette());
+    document.getElementById('btnCollapsePaletteInline')?.addEventListener('click', () => this.togglePalette(true));
+    document.getElementById('btnToggleFlowRight')?.addEventListener('click', () => this.toggleRightPane());
+    document.getElementById('btnCollapseRightInline')?.addEventListener('click', () => this.toggleRightPane(true));
+    document.getElementById('btnFlowFocusCanvas')?.addEventListener('click', () => this.toggleFocusMode());
+
+    const templatesBtn = document.getElementById('btnFlowTemplatesMenu');
+    const templatesMenu = document.getElementById('flowTemplatesMenu');
+    const coverBtn = document.getElementById('btnFlowCoverMenu');
+    const coverMenu = document.getElementById('flowCoverMenu');
+    templatesBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const willOpen = templatesMenu?.classList.contains('hidden');
+      this._closePopovers();
+      if (willOpen) {
+        templatesMenu?.classList.remove('hidden');
+        templatesBtn.setAttribute('aria-expanded', 'true');
+      }
+    });
+    coverBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const willOpen = coverMenu?.classList.contains('hidden');
+      this._closePopovers();
+      if (willOpen) {
+        coverMenu?.classList.remove('hidden');
+        coverBtn.setAttribute('aria-expanded', 'true');
+      }
+    });
+    modal.addEventListener('click', (e) => {
+      if (!e.target.closest('.flow-popover-anchor')) this._closePopovers();
+    });
+
+    const minimap = document.getElementById('flowMinimap');
+    minimap?.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      e.preventDefault();
+      this._panFromMinimapEvent(e);
+      const onMove = (mv) => this._panFromMinimapEvent(mv);
+      const onUp = () => {
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+      };
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+    });
+
+    window.addEventListener('resize', () => {
+      if (this.isOpen) this._renderMinimap();
+    });
 
     const viewport = document.getElementById('flowCanvasViewport');
     viewport?.addEventListener('mousemove', (e) => this._updateWiringRubberBand(e));
@@ -205,7 +267,9 @@ export class FlowStudioController {
     document.addEventListener('keydown', (e) => {
       if (!this.isOpen) return;
       if (e.key === 'Escape') {
-        if (this.wiringFromId) {
+        if (this._hasOpenPopover()) {
+          this._closePopovers();
+        } else if (this.wiringFromId) {
           this.wiringFromId = null;
           this._clearPreviewWire();
           this._renderCanvas();
@@ -214,9 +278,14 @@ export class FlowStudioController {
         }
         return;
       }
-      if ((e.key === 'Delete' || e.key === 'Backspace') && this.selectedNodeId) {
-        const tag = document.activeElement?.tagName;
-        if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+      const tag = document.activeElement?.tagName;
+      const isTyping = tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
+      if (!isTyping && e.shiftKey && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        this.toggleFocusMode();
+        return;
+      }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && this.selectedNodeId && !isTyping) {
         e.preventDefault();
         this.deleteNode(this.selectedNodeId);
       }
@@ -273,15 +342,17 @@ export class FlowStudioController {
     const saveBtn = document.getElementById('btnSaveFlowStudio');
     if (nameInp) nameInp.value = this.flowName;
     if (descInp) descInp.value = this.flowDescription;
-    if (titleEl) titleEl.textContent = this.editingFlowId ? 'Edit Flow Playlist' : 'VANTA Playlist Flow Studio';
+    if (titleEl) titleEl.textContent = this.editingFlowId ? 'Edit Flow' : 'Flow Studio';
     if (saveBtn) saveBtn.textContent = this.editingFlowId ? 'Update Flow' : 'Save Flow';
 
+    this._closePopovers();
+    this._syncDrawerState();
     this._evaluate();
     this._renderAll();
     modal.classList.remove('hidden');
-    this.fitToView({ maxZoom: 1 });
+    this.fitToView({ minZoom: 0.75, maxZoom: 1 });
     requestAnimationFrame(() => {
-      if (this.isOpen) this.fitToView({ maxZoom: 1 });
+      if (this.isOpen) this.fitToView({ minZoom: 0.75, maxZoom: 1 });
     });
     nameInp?.focus();
   }
@@ -294,6 +365,7 @@ export class FlowStudioController {
     if (!modal) return;
     this.isOpen = false;
     this.wiringFromId = null;
+    this._closePopovers();
     this._clearPreviewWire();
     modal.classList.add('hidden');
   }
@@ -305,6 +377,7 @@ export class FlowStudioController {
   loadTemplate(templateKey) {
     const tpl = FLOW_PRESET_TEMPLATES.find((t) => t.key === templateKey);
     if (!tpl) return;
+    this._closePopovers();
     this.nodes = JSON.parse(JSON.stringify(tpl.graph.nodes));
     this.edges = JSON.parse(JSON.stringify(tpl.graph.edges));
     if (!this.editingFlowId) {
@@ -322,7 +395,7 @@ export class FlowStudioController {
     this.wiringFromId = null;
     this._evaluate();
     this._renderAll();
-    this.fitToView({ maxZoom: 1 });
+    this.fitToView({ minZoom: 0.75, maxZoom: 1 });
     this.host.onToast?.(`Loaded template: "${tpl.name}"`);
   }
 
@@ -596,6 +669,153 @@ export class FlowStudioController {
     if (zoomLabel) {
       zoomLabel.textContent = `${Math.round(this.zoom * 100)}%`;
     }
+    this._renderMinimap();
+  }
+
+  _hasOpenPopover() {
+    const t = document.getElementById('flowTemplatesMenu');
+    const c = document.getElementById('flowCoverMenu');
+    return Boolean((t && !t.classList.contains('hidden')) || (c && !c.classList.contains('hidden')));
+  }
+
+  _closePopovers() {
+    document.getElementById('flowTemplatesMenu')?.classList.add('hidden');
+    document.getElementById('btnFlowTemplatesMenu')?.setAttribute('aria-expanded', 'false');
+    document.getElementById('flowCoverMenu')?.classList.add('hidden');
+    document.getElementById('btnFlowCoverMenu')?.setAttribute('aria-expanded', 'false');
+  }
+
+  _syncDrawerState() {
+    const body = document.getElementById('flowStudioBody');
+    if (body) {
+      body.classList.toggle('palette-collapsed', this.paletteCollapsed);
+      body.classList.toggle('right-collapsed', this.rightCollapsed);
+    }
+    document.getElementById('btnToggleFlowPalette')?.classList.toggle('active', !this.paletteCollapsed);
+    document.getElementById('btnToggleFlowRight')?.classList.toggle('active', !this.rightCollapsed);
+    document.getElementById('btnFlowFocusCanvas')?.classList.toggle('active', this.paletteCollapsed && this.rightCollapsed);
+    requestAnimationFrame(() => {
+      if (this.isOpen) this._renderMinimap();
+    });
+  }
+
+  /**
+   * Toggles the left Node Palette drawer.
+   * @param {boolean} [forceCollapsed] - Optional explicit collapsed state.
+   */
+  togglePalette(forceCollapsed) {
+    this.paletteCollapsed = typeof forceCollapsed === 'boolean' ? forceCollapsed : !this.paletteCollapsed;
+    this._syncDrawerState();
+  }
+
+  /**
+   * Toggles the right Inspector & Live Stream Tap drawer.
+   * @param {boolean} [forceCollapsed] - Optional explicit collapsed state.
+   */
+  toggleRightPane(forceCollapsed) {
+    this.rightCollapsed = typeof forceCollapsed === 'boolean' ? forceCollapsed : !this.rightCollapsed;
+    this._syncDrawerState();
+  }
+
+  /**
+   * Toggles Canvas Focus Mode by hiding/restoring both side drawers simultaneously.
+   */
+  toggleFocusMode() {
+    const shouldCollapseBoth = !(this.paletteCollapsed && this.rightCollapsed);
+    this.paletteCollapsed = shouldCollapseBoth;
+    this.rightCollapsed = shouldCollapseBoth;
+    this._syncDrawerState();
+  }
+
+  _renderMinimap() {
+    const svg = document.getElementById('flowMinimapSvg');
+    const viewport = document.getElementById('flowCanvasViewport');
+    if (!svg || !viewport) return;
+
+    const allNodes = Object.values(this.nodes);
+    const viewW = viewport.clientWidth || 800;
+    const viewH = viewport.clientHeight || 500;
+    const mapW = 156;
+    const mapH = 92;
+
+    let minX = 0;
+    let minY = 0;
+    let maxX = viewW;
+    let maxY = viewH;
+
+    if (allNodes.length) {
+      minX = Infinity;
+      minY = Infinity;
+      maxX = -Infinity;
+      maxY = -Infinity;
+      for (const n of allNodes) {
+        minX = Math.min(minX, n.x);
+        minY = Math.min(minY, n.y);
+        maxX = Math.max(maxX, n.x + NODE_WIDTH);
+        maxY = Math.max(maxY, n.y + NODE_HEIGHT);
+      }
+      const vpLeft = -this.panX / this.zoom;
+      const vpTop = -this.panY / this.zoom;
+      const vpRight = vpLeft + viewW / this.zoom;
+      const vpBottom = vpTop + viewH / this.zoom;
+      minX = Math.min(minX, vpLeft) - 40;
+      minY = Math.min(minY, vpTop) - 40;
+      maxX = Math.max(maxX, vpRight) + 40;
+      maxY = Math.max(maxY, vpBottom) + 40;
+    }
+
+    const spanW = Math.max(200, maxX - minX);
+    const spanH = Math.max(120, maxY - minY);
+    const scale = Math.min((mapW - 8) / spanW, (mapH - 8) / spanH);
+    const offX = (mapW - spanW * scale) / 2 - minX * scale;
+    const offY = (mapH - spanH * scale) / 2 - minY * scale;
+
+    this._minimapBounds = { scale, offX, offY, mapW, mapH };
+    svg.replaceChildren();
+
+    for (const n of allNodes) {
+      const def = FLOW_NODE_REGISTRY[n.type];
+      const color = FLOW_NODE_CATEGORIES[def?.category || 'source']?.accent || '#38bdf8';
+      const rect = createSvgEl('rect', {
+        x: Math.round(n.x * scale + offX),
+        y: Math.round(n.y * scale + offY),
+        width: Math.max(6, Math.round(NODE_WIDTH * scale)),
+        height: Math.max(4, Math.round(NODE_HEIGHT * scale)),
+        rx: 2,
+        fill: color,
+        opacity: n.id === this.selectedNodeId ? '0.95' : '0.62'
+      });
+      svg.appendChild(rect);
+    }
+
+    const vpX = (-this.panX / this.zoom) * scale + offX;
+    const vpY = (-this.panY / this.zoom) * scale + offY;
+    const vpW = (viewW / this.zoom) * scale;
+    const vpH = (viewH / this.zoom) * scale;
+
+    const vpRect = createSvgEl('rect', {
+      x: Math.round(vpX),
+      y: Math.round(vpY),
+      width: Math.max(12, Math.round(vpW)),
+      height: Math.max(10, Math.round(vpH)),
+      class: 'flow-minimap-viewport'
+    });
+    svg.appendChild(vpRect);
+  }
+
+  _panFromMinimapEvent(e) {
+    const minimap = document.getElementById('flowMinimap');
+    const viewport = document.getElementById('flowCanvasViewport');
+    if (!minimap || !viewport || !this._minimapBounds) return;
+    const rect = minimap.getBoundingClientRect();
+    const { scale, offX, offY } = this._minimapBounds;
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const worldX = (mx - offX) / scale;
+    const worldY = (my - offY) / scale;
+    this.panX = Math.round(viewport.clientWidth / 2 - worldX * this.zoom);
+    this.panY = Math.round(viewport.clientHeight / 2 - worldY * this.zoom);
+    this._applyCanvasTransform();
   }
 
   /**
@@ -623,8 +843,10 @@ export class FlowStudioController {
   }
 
   /**
-   * Fits and centers all current graph nodes comfortably inside the center canvas viewport.
+   * Fits and centers graph nodes comfortably inside the center canvas viewport,
+   * preserving readability via `minZoom` (defaults to `0.75` for auto-fit).
    * @param {object} [options={}] - Fit bounds options.
+   * @param {number} [options.minZoom=0.75] - Minimum readable scale floor.
    * @param {number} [options.maxZoom=1] - Upper cap on zoom scale so normal graphs remain crisp.
    */
   fitToView(options = {}) {
@@ -654,12 +876,17 @@ export class FlowStudioController {
     const pad = 28;
     const availW = Math.max(180, viewport.clientWidth - pad * 2);
     const availH = Math.max(180, viewport.clientHeight - pad * 2);
+    const minZ = options.minZoom ?? 0.75;
     const maxZ = options.maxZoom ?? 1.0;
-    const scale = Math.max(0.45, Math.min(maxZ, availW / contentW, availH / contentH));
+    const scale = Math.max(minZ, Math.min(maxZ, availW / contentW, availH / contentH));
 
     this.zoom = Number(scale.toFixed(3));
-    this.panX = Math.round((viewport.clientWidth - contentW * this.zoom) / 2 - minX * this.zoom);
-    this.panY = Math.round((viewport.clientHeight - contentH * this.zoom) / 2 - minY * this.zoom);
+    this.panX = contentW * this.zoom <= viewport.clientWidth
+      ? Math.round((viewport.clientWidth - contentW * this.zoom) / 2 - minX * this.zoom)
+      : Math.round(24 - minX * this.zoom);
+    this.panY = contentH * this.zoom <= viewport.clientHeight
+      ? Math.round((viewport.clientHeight - contentH * this.zoom) / 2 - minY * this.zoom)
+      : Math.round(24 - minY * this.zoom);
     this._applyCanvasTransform();
   }
 
@@ -816,6 +1043,7 @@ export class FlowStudioController {
           card.style.left = `${node.x}px`;
           card.style.top = `${node.y}px`;
           this._renderWiresOnly();
+          this._renderMinimap();
         };
 
         const onUp = () => {
@@ -825,6 +1053,14 @@ export class FlowStudioController {
 
         window.addEventListener('mousemove', onMove);
         window.addEventListener('mouseup', onUp);
+      });
+
+      card.addEventListener('dblclick', (e) => {
+        if (e.target.closest('button')) return;
+        this.selectedNodeId = node.id;
+        if (this.rightCollapsed) this.toggleRightPane(false);
+        this._renderInspector();
+        this._renderStreamTap();
       });
 
       this._nodeDomById.set(node.id, card);
@@ -1131,7 +1367,7 @@ export class FlowStudioController {
         this.host.buildCoverElement(
           { name: this.flowName || 'Flow', visual: this.draftVisual },
           outputTracks,
-          'md'
+          'sm'
         )
       );
     }
@@ -1300,8 +1536,8 @@ export class FlowStudioController {
     }
 
     this._renderCanvas();
-    this.fitToView({ maxZoom: 1 });
-    this.host.onToast?.('Aligned flow nodes to fit workspace');
+    this.fitToView({ minZoom: 0.75, maxZoom: 1 });
+    this.host.onToast?.('Aligned flow nodes at readable scale');
   }
 
   /**
