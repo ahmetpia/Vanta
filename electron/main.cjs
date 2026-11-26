@@ -1117,7 +1117,15 @@ function registerIpcHandlers() {
   });
 
   registerSecureIpcHandler('vanta:wasapi-play', async (_event, payload = {}) => {
-    const { filePath: rawPath, exclusive = true, dop = false, deviceId = '', linearGain = 1.0, seekSec = 0 } = payload;
+    const {
+      filePath: rawPath,
+      exclusive = true,
+      dop = false,
+      deviceId = '',
+      linearGain = 1.0,
+      seekSec = 0,
+      dspSpec = ''
+    } = payload;
     const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
     if (!filePath) {
       return { ok: false, error: 'Audio file not found or rejected by path policy' };
@@ -1132,6 +1140,7 @@ function registerIpcHandlers() {
         deviceId,
         linearGain,
         seekSec,
+        dspSpec,
         probe
       });
       return { ok: true, probe };
@@ -1141,11 +1150,37 @@ function registerIpcHandlers() {
     }
   });
 
+  registerSecureIpcHandler('vanta:wasapi-queue-next', async (_event, payload = {}) => {
+    const { filePath: rawPath, dop = false, linearGain = 1.0, seq = 0 } = payload;
+    const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
+    if (!filePath) {
+      return { ok: false, queued: false, error: 'Audio file not found or rejected by path policy' };
+    }
+    try {
+      const cache = libraryStore.loudnessCache || {};
+      const cached = cache[filePath];
+      const probe = cached?.probe || (await probeAudioStreamInfo(filePath));
+      const res = await wasapiPlayer.queueNext(filePath, {
+        dop: Boolean(dop),
+        linearGain,
+        seq,
+        probe
+      });
+      return { ...res, r128: cached?.r128 || null };
+    } catch (err) {
+      return { ok: false, queued: false, error: err.message };
+    }
+  });
+
   registerSecureIpcHandler('vanta:wasapi-cmd', async (_event, cmd) => {
-    if (cmd === 'STOP') {
+    const cleanCmd = typeof cmd === 'string' ? cmd.trim().slice(0, 220) : '';
+    if (cleanCmd === 'STOP') {
       await wasapiPlayer.stopAsync();
-    } else {
-      wasapiPlayer.sendCommand(cmd);
+    } else if (cleanCmd === 'CLEAR_QUEUE') {
+      wasapiPlayer.clearQueuedNext();
+      wasapiPlayer.sendCommand('CLEAR_QUEUE');
+    } else if (/^(?:PAUSE|RESUME|LIMITER (?:ON|OFF)|GAIN [0-9.]+|DSP [0-9.,\-+|]+)$/.test(cleanCmd)) {
+      wasapiPlayer.sendCommand(cleanCmd);
     }
     return { ok: true };
   });
@@ -1268,9 +1303,34 @@ function registerIpcHandlers() {
 const coverBinaryCache = new Map();
 
 app.whenReady().then(() => {
-  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    const allowedPermissions = new Set(['media', 'speaker-selection']);
-    callback(allowedPermissions.has(permission));
+  const allowedPermissions = new Set(['media', 'speaker-selection', 'fullscreen']);
+  const cmpUrl = (u) => (process.platform === 'win32' ? String(u || '').toLowerCase() : String(u || ''));
+  const isTrustedPermissionSource = (webContents, candidateUrl) => {
+    if (!mainWindow || mainWindow.isDestroyed() || !webContents || webContents !== mainWindow.webContents) {
+      return false;
+    }
+    const currentUrl = cmpUrl(webContents.getURL());
+    if (!currentUrl.startsWith(cmpUrl(INDEX_FILE_URL))) {
+      return false;
+    }
+    const reqUrl = cmpUrl(candidateUrl);
+    return !reqUrl || reqUrl.startsWith(cmpUrl(INDEX_FILE_URL)) || reqUrl === 'file://' || reqUrl === 'file:///';
+  };
+
+  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
+    if (!allowedPermissions.has(permission)) return false;
+    return isTrustedPermissionSource(webContents, requestingOrigin);
+  });
+
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const granted = allowedPermissions.has(permission) && isTrustedPermissionSource(webContents, details?.requestingUrl);
+    if (!granted) {
+      logger.warn('SecurityBoundary', 'Rejected renderer permission request', {
+        permission,
+        requestingUrl: details?.requestingUrl || ''
+      });
+    }
+    callback(granted);
   });
 
   volumeBridge.start();
@@ -1361,9 +1421,16 @@ app.whenReady().then(() => {
           const ffArgs = ['-hide_banner', '-loglevel', 'error'];
           if (seekSec > 0) ffArgs.push('-ss', String(seekSec.toFixed(3)));
           ffArgs.push('-i', filePath, '-vn');
-          // Cap DSD (DSF/DFF) streams cleanly for Chromium Studio DSP HTML5 WAV decoding
+          // Cap DSD (DSF/DFF) streams with 64-bit Kaiser-Sinc resampling + Shibata noise-shaping for Studio DSP WAV decoding
           if (['.dsf', '.dff'].includes(ext)) {
-            ffArgs.push('-ar', '176400', '-ac', '2');
+            const { buildHighPrecisionResampleArgs } = require('./services/audioBridgeService.cjs');
+            ffArgs.push(
+              ...buildHighPrecisionResampleArgs(0, 176400, { force: true, ditherMethod: 'shibata' }),
+              '-ar',
+              '176400',
+              '-ac',
+              '2'
+            );
           }
           ffArgs.push('-f', 'wav', '-acodec', 'pcm_s24le', '-');
           const ff = spawn(ffmpegBin, ffArgs, { windowsHide: true });

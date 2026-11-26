@@ -29,6 +29,10 @@ import {
   executeSemanticSearch,
   buildVibeRadioQueue,
   buildTimeCapsuleAnalytics,
+  buildAlbumCollections,
+  buildArtistCollections,
+  resolveQueueRowNumIndicator,
+  resolveRowClickAction,
   applyProSmartFilter,
   isMusicVideoTagged,
   isLongFeatureVideo,
@@ -720,6 +724,12 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
     assert.equal(resolveStagePalette('track', { key: 'F min' }).label, 'Warm Club');
     assert.equal(resolveStagePalette('track', { key: 'G min' }).label, 'Aurora Ice');
     assert.equal(resolveStagePalette('warm', { key: 'A min' }).label, 'Warm Club');
+
+    // Moderate-bass & compressed-mix step jump also trigger kick detection cleanly
+    const modBars = new Float32Array(24).fill(0.1);
+    for (let i = 0; i < 5; i++) modBars[i] = 0.28;
+    const modKick = computeStageSpectralMetrics(modBars, { bass: 0.2, avgBass: 0.22, rawBass: 0.21 }, true);
+    assert.equal(modKick.kickDetected, true);
   });
 
   it('11. 4K Video Container Probe, Zero-Copy Remux Strategy & SRT-to-VTT Converter', () => {
@@ -1085,12 +1095,422 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
       assert.ok(elapsed < 50, `Semantic parser took too long on adversarial input: ${elapsed}ms`);
       assert.ok(adv.moodTags.includes('melancholic'));
 
-      // 6. Strict CSP in index.html has no 'unsafe-inline'
+      // 6. Strict CSP in index.html has no 'unsafe-inline' and main.cjs allows trusted fullscreen permission
       const htmlSrc = fs.readFileSync(path.join(process.cwd(), 'src', 'index.html'), 'utf8');
       assert.equal(htmlSrc.includes("'unsafe-inline'"), false);
       assert.ok(htmlSrc.includes("object-src 'none'"));
+      const mainSrc = fs.readFileSync(path.join(process.cwd(), 'electron', 'main.cjs'), 'utf8');
+      assert.ok(mainSrc.includes("'fullscreen'"), 'setPermissionRequestHandler must permit fullscreen for Theater video mode');
     } finally {
       fs.rmSync(tmpSecDir, { recursive: true, force: true });
     }
+  });
+
+  it('15. Albums Collection Engine: groups tagged albums & folder releases, computes stats, filters & sorts', () => {
+    const sampleTracks = [
+      {
+        id: 'a1',
+        title: 'Midnight City',
+        artist: 'M83',
+        album: "Hurry Up, We're Dreaming",
+        genre: 'Synth-Pop',
+        year: '2011',
+        ext: 'FLAC',
+        bitDepth: 24,
+        bpm: 105,
+        durationSec: 244,
+        stars: 5,
+        favorite: true,
+        filePath: 'D:\\Music\\M83\\01 Midnight City.flac'
+      },
+      {
+        id: 'a2',
+        title: 'Intro',
+        artist: 'M83',
+        album: "Hurry Up, We're Dreaming",
+        genre: 'Synth-Pop',
+        year: '2011',
+        ext: 'FLAC',
+        bitDepth: 24,
+        bpm: 95,
+        durationSec: 322,
+        stars: 4,
+        filePath: 'D:\\Music\\M83\\02 Intro.flac'
+      },
+      {
+        id: 'f1',
+        title: 'Tokyo Cafe Jazz',
+        artist: 'Local Studio Artist',
+        album: '',
+        ext: 'MP3',
+        bpm: 88,
+        durationSec: 300,
+        stars: 3,
+        filePath: 'C:\\Vanta\\VantaVault\\YouTube\\Tokyo Cafe.mp3'
+      },
+      {
+        id: 'c1',
+        title: 'Track 1',
+        artist: 'Artist A',
+        album: 'Club Compilation',
+        ext: 'MP3',
+        bpm: 128,
+        durationSec: 200,
+        filePath: 'D:\\Music\\Comp\\t1.mp3'
+      },
+      {
+        id: 'c2',
+        title: 'Track 2',
+        artist: 'Artist B',
+        album: 'Club Compilation',
+        ext: 'MP3',
+        bpm: 130,
+        durationSec: 210,
+        filePath: 'D:\\Music\\Comp\\t2.mp3'
+      },
+      {
+        id: 'c3',
+        title: 'Track 3',
+        artist: 'Artist C',
+        album: 'Club Compilation',
+        ext: 'MP3',
+        bpm: 126,
+        durationSec: 190,
+        filePath: 'D:\\Music\\Comp\\t3.mp3'
+      }
+    ];
+
+    const all = buildAlbumCollections(sampleTracks, { mode: 'all' });
+    assert.equal(all.length, 3);
+    const m83 = all.find((g) => g.title === "Hurry Up, We're Dreaming");
+    assert.ok(m83);
+    assert.equal(m83.kind, 'album');
+    assert.equal(m83.artist, 'M83');
+    assert.equal(m83.year, '2011');
+    assert.equal(m83.trackCount, 2);
+    assert.equal(m83.totalDurationSec, 566);
+    assert.equal(m83.avgBpm, 100);
+    assert.equal(m83.avgStars, 4.5);
+    assert.equal(m83.isLossless, true);
+
+    const comp = all.find((g) => g.title === 'Club Compilation');
+    assert.ok(comp);
+    assert.equal(comp.isCompilation, true);
+    assert.equal(comp.artist, 'Various Artists');
+
+    const taggedOnly = buildAlbumCollections(sampleTracks, { mode: 'tagged' });
+    assert.equal(taggedOnly.length, 2);
+    assert.equal(taggedOnly.every((g) => g.kind === 'album'), true);
+
+    const folderOnly = buildAlbumCollections(sampleTracks, { mode: 'folder' });
+    assert.equal(folderOnly.length, 1);
+    assert.equal(folderOnly[0].title, 'YouTube');
+
+    const queried = buildAlbumCollections(sampleTracks, { mode: 'all', query: 'midnight' });
+    assert.equal(queried.length, 1);
+    assert.equal(queried[0].title, "Hurry Up, We're Dreaming");
+
+    const byTracks = buildAlbumCollections(sampleTracks, { mode: 'all', sortBy: 'tracks-desc' });
+    assert.equal(byTracks[0].title, 'Club Compilation');
+  });
+
+  it('16. Queue Row Click Toggle & # Column Play/Pause Indicator', () => {
+    assert.equal(resolveRowClickAction({ clickedKey: 'C:\\a.mp3', loadedKey: 'C:\\a.mp3' }), 'toggle');
+    assert.equal(resolveRowClickAction({ clickedKey: 'C:\\b.mp3', loadedKey: 'C:\\a.mp3' }), 'select');
+    assert.equal(resolveRowClickAction({ clickedKey: 'C:\\a.mp3', loadedKey: null }), 'select');
+
+    assert.equal(
+      resolveQueueRowNumIndicator({
+        index: 2,
+        trackKey: 'C:\\a.mp3',
+        loadedKey: 'C:\\a.mp3',
+        isPlaying: true,
+        pausedTrackKey: null,
+        isSelected: true
+      }),
+      '▶'
+    );
+    assert.equal(
+      resolveQueueRowNumIndicator({
+        index: 2,
+        trackKey: 'C:\\a.mp3',
+        loadedKey: 'C:\\a.mp3',
+        isPlaying: false,
+        pausedTrackKey: 'C:\\a.mp3',
+        isSelected: true
+      }),
+      '⏸\uFE0E'
+    );
+    assert.equal(
+      resolveQueueRowNumIndicator({
+        index: 0,
+        trackKey: 'C:\\a.mp3',
+        loadedKey: null,
+        isPlaying: false,
+        pausedTrackKey: null,
+        isSelected: true
+      }),
+      '1'
+    );
+  });
+
+  it('17. Artists Collection Engine: groups artists, prioritizes curated over generic, computes discography & filters', () => {
+    const sampleTracks = [
+      {
+        id: 'ar1',
+        title: 'Midnight City',
+        artist: 'M83',
+        album: "Hurry Up, We're Dreaming",
+        genre: 'Synth-Pop',
+        ext: 'FLAC',
+        bitDepth: 24,
+        bpm: 105,
+        durationSec: 244,
+        stars: 5,
+        favorite: true,
+        filePath: 'D:\\Music\\M83\\01 Midnight City.flac'
+      },
+      {
+        id: 'ar2',
+        title: 'Wait',
+        artist: 'M83',
+        album: "Hurry Up, We're Dreaming",
+        genre: 'Synth-Pop',
+        ext: 'FLAC',
+        bitDepth: 24,
+        bpm: 84,
+        durationSec: 343,
+        stars: 4,
+        filePath: 'D:\\Music\\M83\\02 Wait.flac'
+      },
+      {
+        id: 'ar3',
+        title: 'Oblivion',
+        artist: 'M83',
+        album: 'Oblivion OST',
+        genre: 'Soundtrack',
+        ext: 'MP3',
+        bpm: 112,
+        durationSec: 356,
+        stars: 5,
+        filePath: 'D:\\Music\\M83\\Oblivion.mp3'
+      },
+      {
+        id: 'ar4',
+        title: 'Solo Track',
+        artist: 'Aria Nova',
+        album: 'Single',
+        genre: 'Ambient',
+        ext: 'MP3',
+        bpm: 90,
+        durationSec: 200,
+        stars: 0,
+        filePath: 'D:\\Music\\Aria\\solo.mp3'
+      },
+      {
+        id: 'ar5',
+        title: 'Vault Demo 1',
+        artist: 'Local Studio Artist',
+        album: '',
+        ext: 'MP3',
+        bpm: 120,
+        durationSec: 180,
+        filePath: 'C:\\Vanta\\VantaVault\\Local\\demo1.mp3'
+      },
+      {
+        id: 'ar6',
+        title: 'Vault Demo 2',
+        artist: 'Local Studio Artist',
+        album: '',
+        ext: 'MP3',
+        bpm: 124,
+        durationSec: 190,
+        filePath: 'C:\\Vanta\\VantaVault\\Local\\demo2.mp3'
+      }
+    ];
+
+    const curated = buildArtistCollections(sampleTracks, { mode: 'all', sortBy: 'curated' });
+    assert.equal(curated.length, 3);
+    assert.equal(curated[0].name, 'M83');
+    assert.equal(curated[curated.length - 1].name, 'Local Studio Artist');
+    assert.equal(curated[curated.length - 1].isGeneric, true);
+
+    const m83 = curated[0];
+    assert.equal(m83.trackCount, 3);
+    assert.equal(m83.releaseCount, 2);
+    assert.equal(m83.primaryGenre, 'Synth-Pop');
+    assert.equal(m83.isLossless, true);
+    assert.equal(m83.avgStars, 4.7);
+
+    const multiOnly = buildArtistCollections(sampleTracks, { mode: 'multi' });
+    assert.equal(multiOnly.length, 2);
+    assert.equal(multiOnly.every((a) => a.trackCount >= 2), true);
+
+    const ratedOnly = buildArtistCollections(sampleTracks, { mode: 'rated' });
+    assert.equal(ratedOnly.length, 1);
+    assert.equal(ratedOnly[0].name, 'M83');
+
+    const queried = buildArtistCollections(sampleTracks, { mode: 'all', query: 'oblivion' });
+    assert.equal(queried.length, 1);
+    assert.equal(queried[0].name, 'M83');
+  });
+
+  it('18. Phase 1 Signal Purity: FFmpeg Kaiser-Sinc resample helper and PitchWorklet Hermite/Hann DSP math', async () => {
+    const bridgeMod = await import('../electron/services/audioBridgeService.cjs');
+    const buildHighPrecisionResampleArgs =
+      bridgeMod.buildHighPrecisionResampleArgs || bridgeMod.default?.buildHighPrecisionResampleArgs;
+    assert.equal(typeof buildHighPrecisionResampleArgs, 'function');
+
+    // Native PCM pass-through (44.1 -> 44.1, 96 -> 96) emits ZERO resampling filter args
+    assert.deepEqual(buildHighPrecisionResampleArgs(44100, 44100), []);
+    assert.deepEqual(buildHighPrecisionResampleArgs(192000, 192000), []);
+
+    // DSD->DXD or forced sample rate conversion emits 64-bit dblp Kaiser-Sinc filter args
+    const dsdArgs = buildHighPrecisionResampleArgs(2822400, 352800);
+    assert.equal(dsdArgs.length, 2);
+    assert.equal(dsdArgs[0], '-af');
+    assert.match(
+      dsdArgs[1],
+      /aresample=resampler=swr:tsf=dblp:filter_type=kaiser:filter_size=128:phase_shift=12:kaiser_beta=14:cutoff=0\.95:osr=352800/
+    );
+
+    const studioDsdArgs = buildHighPrecisionResampleArgs(0, 176400, { force: true, ditherMethod: 'shibata' });
+    assert.equal(studioDsdArgs[0], '-af');
+    assert.match(studioDsdArgs[1], /osr=176400:dither_method=shibata/);
+
+    const pitchMod = await import('../src/js/pitchWorklet.js');
+    assert.equal(typeof pitchMod.hermiteInterpolate4, 'function');
+    assert.equal(typeof pitchMod.hannWindowFromPhase, 'function');
+
+    // Hermite passes through exact knot points and smooths midpoint accurately
+    assert.equal(pitchMod.hermiteInterpolate4(0.0, 0.25, 0.75, 1.0, 0.0), 0.25);
+    assert.equal(pitchMod.hermiteInterpolate4(0.0, 0.25, 0.75, 1.0, 1.0), 0.75);
+    const linearMid = pitchMod.hermiteInterpolate4(-1, 0, 1, 2, 0.5);
+    assert.ok(Math.abs(linearMid - 0.5) < 1e-12);
+
+    // Complementary Hann overlap windows sum to unity across all phases
+    for (const ph of [0, 0.13, 0.25, 0.37, 0.49]) {
+      const sum = pitchMod.hannWindowFromPhase(ph) + pitchMod.hannWindowFromPhase(ph + 0.5);
+      assert.ok(Math.abs(sum - 1.0) < 1e-12);
+    }
+  });
+
+  it('19. Phase 2 PurePath 64: Native EQ/Crossfeed serialization, WASAPI vs Studio routing & Signal Path Inspector', async () => {
+    const bridgeMod = await import('../electron/services/audioBridgeService.cjs');
+    const serializeNativeDspConfig =
+      bridgeMod.serializeNativeDspConfig || bridgeMod.default?.serializeNativeDspConfig;
+    const sanitizeNativeDspSpec =
+      bridgeMod.sanitizeNativeDspSpec || bridgeMod.default?.sanitizeNativeDspSpec;
+
+    const engineMod = await import('../src/js/audioEngine.js');
+    const {
+      computeEffectiveEqGains,
+      requiresStudioDsp,
+      serializeNativeDspSpecFromState,
+      buildSignalPathDescriptor
+    } = engineMod;
+
+    // 1. Native DSP serializer clamps bounds and rejects injection characters
+    const flatSpec = serializeNativeDspSpecFromState({
+      eqEnabled: false,
+      gains: [4, 2, 0, 0, 0, 0, 0, 0, 0, 0],
+      deviceProfile: 'Bit-Perfect (Flat)',
+      bassBoost: false,
+      bassBoostDb: 5.5,
+      crossfeed: false,
+      crossfeedLevelPct: 55,
+      limiter: false
+    });
+    assert.equal(flatSpec, '0,0,0,0,0,0,0,0,0,0|0|5.5|0|55|0');
+    assert.equal(sanitizeNativeDspSpec(flatSpec), flatSpec);
+    assert.equal(sanitizeNativeDspSpec('0,0|0|5.5|0|55|0; rm -rf /'), '');
+
+    const cjsSpec = serializeNativeDspConfig({
+      bandGains: [20, -25, 1.5, 0, 0, 0, 0, 0, 0, 3],
+      bassBoost: true,
+      bassBoostDb: 12,
+      crossfeed: true,
+      crossfeedLevelPct: 75,
+      limiter: true
+    });
+    assert.equal(cjsSpec, '12,-12,1.5,0,0,0,0,0,0,3|1|9|1|75|1');
+
+    // 2. PurePath 64 keeps EQ/Profile/Bass/Crossfeed/Limiter on native WASAPI; only Spatial/Reverb/Pitch/Crossfade require Studio DSP
+    const purePathState = {
+      eqEnabled: true,
+      gains: [2, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+      deviceProfile: 'Harman Target (In-Ear)',
+      bassBoost: true,
+      crossfeed: true,
+      limiter: true,
+      spatial: false,
+      exciter: false,
+      reverb: false,
+      karaoke: false,
+      vinyl: false,
+      nightMode: false,
+      pitchSemitones: 0,
+      playbackRate: 1.0,
+      crossfadeSeconds: 0
+    };
+    assert.equal(requiresStudioDsp(purePathState), false);
+    const effGains = computeEffectiveEqGains(purePathState);
+    assert.equal(effGains[0], 5); // +2 manual + 3 Harman
+    assert.equal(effGains[1], 2.5); // 0 manual + 2.5 Harman
+    assert.equal(requiresStudioDsp({ ...purePathState, spatial: true }), true);
+    assert.equal(requiresStudioDsp({ ...purePathState, pitchSemitones: 2 }), true);
+    assert.equal(requiresStudioDsp({ ...purePathState, crossfadeSeconds: 3 }), true);
+
+    // 3. Signal Path Descriptor reports Bit-Exact vs PurePath 64 vs DoP vs Studio DSP accurately
+    const bitExactPath = buildSignalPathDescriptor({
+      engineMode: 'wasapi',
+      isVideo: false,
+      filePath: 'C:\\Music\\track.flac',
+      probe: { codec: 'FLAC', sampleRate: 96000, bitDepth: 24, channels: 2 },
+      wasapiEvent: {
+        mode: 'exclusive',
+        sampleRate: 96000,
+        bitsPerSample: 24,
+        validBits: 24,
+        bitExact: true,
+        bufferFrames: 960,
+        deviceName: 'Reference DAC'
+      },
+      dspState: {
+        eqEnabled: false,
+        gains: new Array(10).fill(0),
+        deviceProfile: 'Bit-Perfect (Flat)',
+        bassBoost: false,
+        crossfeed: false,
+        limiter: false
+      },
+      linearGain: 1.0,
+      gaplessQueued: true
+    });
+    assert.equal(bitExactPath.qualityTone, 'bit_exact');
+    assert.equal(bitExactPath.qualityBadge, 'BIT-EXACT LOSSLESS PATH');
+    assert.match(bitExactPath.stages[1].detail, /pass-through/i);
+    assert.match(bitExactPath.stages[4].detail, /0 ms Gapless Primed/);
+
+    const purePathDesc = buildSignalPathDescriptor({
+      engineMode: 'wasapi',
+      isVideo: false,
+      filePath: 'C:\\Music\\track.dsf',
+      probe: { codec: 'DSD_LSBF_PLANAR', sampleRate: 2822400, bitDepth: 1, channels: 2 },
+      wasapiEvent: {
+        mode: 'exclusive',
+        sampleRate: 352800,
+        bitsPerSample: 32,
+        validBits: 24,
+        bitExact: false,
+        deviceName: 'Reference DAC'
+      },
+      dspState: purePathState,
+      linearGain: 1.0
+    });
+    assert.equal(purePathDesc.qualityTone, 'purepath');
+    assert.match(purePathDesc.stages[1].detail, /Kaiser-Sinc.*352\.8 kHz/);
+    assert.match(purePathDesc.stages[2].detail, /64-bit/i);
+    assert.match(purePathDesc.stages[3].detail, /True-Peak Limiter.*TPDF Dither/);
   });
 });

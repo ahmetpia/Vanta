@@ -591,3 +591,385 @@ export function parseStructuredLyrics(rawLyrics) {
   }
   return tokens;
 }
+
+const LOSSLESS_FORMATS = new Set(['FLAC', 'WAV', 'W64', 'AIFF', 'AIF', 'ALAC', 'DSF', 'DFF', 'APE', 'WV']);
+
+/**
+ * Extracts the immediate parent directory name from a file path for folder-based release grouping.
+ * @param {string} filePath - Track file path.
+ * @returns {string} Parent folder name or empty string.
+ */
+function extractParentFolderName(filePath) {
+  const dir = extractFolderOnly(filePath);
+  if (!dir) return '';
+  const parts = dir.split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+
+/**
+ * Creates an empty track collection metric accumulator shared by Album and Artist grouping.
+ * @param {string} id - Unique collection ID.
+ * @param {object} [extra={}] - Extra initial fields.
+ * @returns {object} Metric bucket.
+ */
+function createMetricBucket(id, extra = {}) {
+  return {
+    id,
+    ...extra,
+    tracks: [],
+    artistCounts: new Map(),
+    genreCounts: new Map(),
+    yearCounts: new Map(),
+    formatSet: new Set(),
+    totalDurationSec: 0,
+    bpmSum: 0,
+    bpmCount: 0,
+    starSum: 0,
+    ratedCount: 0,
+    maxStars: 0,
+    favoriteCount: 0,
+    isLossless: false,
+    latestIso: ''
+  };
+}
+
+/**
+ * Accumulates a track's metadata & audio metrics into a collection bucket.
+ * @param {object} bucket - Target metric bucket.
+ * @param {object} track - Track object.
+ */
+function accumulateTrackIntoBucket(bucket, track) {
+  bucket.tracks.push(track);
+
+  const artist = String(track.artist || '').trim();
+  if (artist) {
+    bucket.artistCounts.set(artist, (bucket.artistCounts.get(artist) || 0) + 1);
+  }
+
+  const genre = String(track.genre || '').trim();
+  if (genre) {
+    bucket.genreCounts.set(genre, (bucket.genreCounts.get(genre) || 0) + 1);
+  }
+
+  const yearMatch = /\b(19\d{2}|20\d{2})\b/.exec(String(track.year || ''));
+  if (yearMatch) {
+    bucket.yearCounts.set(yearMatch[1], (bucket.yearCounts.get(yearMatch[1]) || 0) + 1);
+  }
+
+  const ext = String(track.ext || '').trim().toUpperCase();
+  if (ext) {
+    bucket.formatSet.add(ext);
+    if (LOSSLESS_FORMATS.has(ext) || Number(track.bitDepth) >= 24) {
+      bucket.isLossless = true;
+    }
+  }
+
+  const dur = Number(track.durationSec) || 0;
+  if (dur > 0) bucket.totalDurationSec += dur;
+
+  const bpm = Number(track.bpm) || 0;
+  if (bpm > 0) {
+    bucket.bpmSum += bpm;
+    bucket.bpmCount += 1;
+  }
+
+  const stars = Number(track.stars) || 0;
+  if (stars > 0) {
+    bucket.starSum += stars;
+    bucket.ratedCount += 1;
+    if (stars > bucket.maxStars) bucket.maxStars = stars;
+  }
+  if (track.favorite) bucket.favoriteCount += 1;
+
+  const iso = String(track.createdAt || track.modifiedAt || '');
+  if (iso && iso > bucket.latestIso) {
+    bucket.latestIso = iso;
+  }
+}
+
+/**
+ * Returns keys from a frequency map sorted descending by occurrence count.
+ * @param {Map<string, number>} countMap - Count map.
+ * @param {string} [fallback=''] - Fallback when map is empty.
+ * @returns {string} Top key.
+ */
+function pickTopKeyFromMap(countMap, fallback = '') {
+  let bestKey = fallback;
+  let bestCount = -1;
+  for (const [k, c] of countMap.entries()) {
+    if (c > bestCount) {
+      bestCount = c;
+      bestKey = k;
+    }
+  }
+  return bestKey;
+}
+
+/**
+ * Builds structured Album & Release Collections from catalog tracks.
+ * Groups tracks with `album` metadata into Album Releases and falls back to parent folder
+ * collections for untagged tracks so every library feels cohesive and browsable.
+ * @param {object[]} [tracks=[]] - Audio / #MusicVideo track pool.
+ * @param {object} [options={}] - Grouping, filter, and sorting options.
+ * @param {'all'|'tagged'|'folder'} [options.mode='all'] - Release source filter.
+ * @param {string} [options.query=''] - Search filter matching album title, artist, genre, year, or track title.
+ * @param {'smart'|'title-asc'|'artist-asc'|'tracks-desc'|'rating-desc'|'recent-desc'|'year-desc'} [options.sortBy='smart'] - Sort order.
+ * @returns {object[]} Sorted album collection descriptors.
+ */
+export function buildAlbumCollections(tracks = [], options = {}) {
+  const mode = options.mode === 'tagged' || options.mode === 'folder' ? options.mode : 'all';
+  const query = String(options.query || '').trim().toLowerCase();
+  const sortBy = options.sortBy || 'smart';
+
+  const groupsMap = new Map();
+
+  for (const track of Array.isArray(tracks) ? tracks : []) {
+    if (!track) continue;
+    const rawAlbum = String(track.album || '').trim();
+    const hasExplicitAlbum = Boolean(rawAlbum && !/^vanta media vault$/i.test(rawAlbum));
+
+    let kind = 'single';
+    let groupKey = 'single:vault';
+    let displayTitle = 'Singles & Loose Tracks';
+    let folderPath = '';
+
+    if (hasExplicitAlbum) {
+      kind = 'album';
+      groupKey = `album:${rawAlbum.toLowerCase()}`;
+      displayTitle = rawAlbum;
+    } else if (track.filePath) {
+      folderPath = extractFolderOnly(track.filePath);
+      const folderName = extractParentFolderName(track.filePath);
+      kind = 'folder';
+      groupKey = `folder:${folderPath.toLowerCase()}`;
+      displayTitle = folderName || 'Local Folder';
+    }
+
+    if (mode === 'tagged' && kind !== 'album') continue;
+    if (mode === 'folder' && kind !== 'folder') continue;
+
+    let bucket = groupsMap.get(groupKey);
+    if (!bucket) {
+      bucket = createMetricBucket(groupKey, { kind, title: displayTitle, folderPath });
+      groupsMap.set(groupKey, bucket);
+    }
+    accumulateTrackIntoBucket(bucket, track);
+  }
+
+  let collections = [];
+  for (const b of groupsMap.values()) {
+    const specificArtists = [...b.artistCounts.keys()].filter(
+      (a) => !/^local studio artist$/i.test(a) && !/^unknown artist$/i.test(a)
+    );
+    const isCompilation = specificArtists.length > 2;
+    const primaryArtist = isCompilation
+      ? 'Various Artists'
+      : specificArtists.length >= 1
+        ? pickTopKeyFromMap(new Map(specificArtists.map((a) => [a, b.artistCounts.get(a) || 1])), specificArtists[0])
+        : pickTopKeyFromMap(b.artistCounts, 'Local Studio Artist');
+
+    const sortedTracks = [...b.tracks].sort((a, bTrack) =>
+      String(a.title || '').localeCompare(String(bTrack.title || ''))
+    );
+
+    const albumObj = {
+      id: b.id,
+      kind: b.kind,
+      title: b.title,
+      artist: primaryArtist,
+      artists: specificArtists.length ? specificArtists : [...b.artistCounts.keys()],
+      isCompilation,
+      year: pickTopKeyFromMap(b.yearCounts, ''),
+      genre: pickTopKeyFromMap(b.genreCounts, ''),
+      trackCount: sortedTracks.length,
+      totalDurationSec: Math.round(b.totalDurationSec),
+      avgBpm: b.bpmCount > 0 ? Math.round(b.bpmSum / b.bpmCount) : 0,
+      avgStars: b.ratedCount > 0 ? Number((b.starSum / b.ratedCount).toFixed(1)) : 0,
+      maxStars: b.maxStars,
+      favoriteCount: b.favoriteCount,
+      isLossless: b.isLossless,
+      formats: [...b.formatSet],
+      latestIso: b.latestIso,
+      tracks: sortedTracks
+    };
+
+    if (query) {
+      const hay = [
+        albumObj.title,
+        albumObj.artist,
+        albumObj.genre,
+        albumObj.year,
+        ...albumObj.formats,
+        ...sortedTracks.map((t) => `${t.title || ''} ${t.artist || ''}`)
+      ]
+        .join(' ')
+        .toLowerCase();
+      if (!hay.includes(query)) continue;
+    }
+
+    collections.push(albumObj);
+  }
+
+  const sorters = {
+    smart: (a, b) =>
+      (a.kind === 'album' ? 0 : a.kind === 'folder' ? 1 : 2) -
+        (b.kind === 'album' ? 0 : b.kind === 'folder' ? 1 : 2) ||
+      b.trackCount - a.trackCount ||
+      a.title.localeCompare(b.title),
+    'title-asc': (a, b) => a.title.localeCompare(b.title),
+    'artist-asc': (a, b) => a.artist.localeCompare(b.artist) || a.title.localeCompare(b.title),
+    'tracks-desc': (a, b) => b.trackCount - a.trackCount || a.title.localeCompare(b.title),
+    'rating-desc': (a, b) =>
+      b.avgStars - a.avgStars || b.favoriteCount - a.favoriteCount || b.trackCount - a.trackCount,
+    'recent-desc': (a, b) => String(b.latestIso || '').localeCompare(String(a.latestIso || '')) || a.title.localeCompare(b.title),
+    'year-desc': (a, b) =>
+      (Number(b.year) || 0) - (Number(a.year) || 0) || a.title.localeCompare(b.title)
+  };
+
+  collections.sort(sorters[sortBy] || sorters.smart);
+  return collections;
+}
+
+const GENERIC_ARTIST_RE = /^(?:local studio artist|unknown artist|various artists)$/i;
+
+/**
+ * Builds structured Artist Collections with discography releases, genre summaries,
+ * lossless detection, and curated sorting from catalog tracks.
+ * @param {object[]} [tracks=[]] - Audio / #MusicVideo track pool.
+ * @param {object} [options={}] - Grouping, filter, and sorting options.
+ * @param {'all'|'multi'|'rated'} [options.mode='all'] - Artist filter mode.
+ * @param {string} [options.query=''] - Search query matching artist, genre, album, or track titles.
+ * @param {'curated'|'tracks-desc'|'name-asc'|'rating-desc'|'recent-desc'} [options.sortBy='curated'] - Sort order.
+ * @returns {object[]} Sorted artist collection descriptors.
+ */
+export function buildArtistCollections(tracks = [], options = {}) {
+  const mode = options.mode === 'multi' || options.mode === 'rated' ? options.mode : 'all';
+  const query = String(options.query || '').trim().toLowerCase();
+  const sortBy = options.sortBy || 'curated';
+
+  const groupsMap = new Map();
+  for (const track of Array.isArray(tracks) ? tracks : []) {
+    if (!track) continue;
+    const rawArtist = String(track.artist || '').trim() || 'Unknown Artist';
+    const key = `artist:${rawArtist.toLowerCase()}`;
+    let bucket = groupsMap.get(key);
+    if (!bucket) {
+      bucket = createMetricBucket(key, {
+        name: rawArtist,
+        isGeneric: GENERIC_ARTIST_RE.test(rawArtist)
+      });
+      groupsMap.set(key, bucket);
+    }
+    accumulateTrackIntoBucket(bucket, track);
+  }
+
+  const artists = [];
+  for (const b of groupsMap.values()) {
+    const sortedTracks = [...b.tracks].sort((a, bTrack) =>
+      String(a.title || '').localeCompare(String(bTrack.title || ''))
+    );
+    const releases = buildAlbumCollections(sortedTracks, { mode: 'all', sortBy: 'tracks-desc' });
+    const topGenres = [...b.genreCounts.entries()]
+      .sort((a, bG) => bG[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 3)
+      .map(([g]) => g);
+
+    const artistObj = {
+      id: b.id,
+      name: b.name,
+      isGeneric: b.isGeneric,
+      genres: topGenres,
+      primaryGenre: topGenres[0] || '',
+      trackCount: sortedTracks.length,
+      releaseCount: releases.length,
+      releases,
+      totalDurationSec: Math.round(b.totalDurationSec),
+      avgBpm: b.bpmCount > 0 ? Math.round(b.bpmSum / b.bpmCount) : 0,
+      avgStars: b.ratedCount > 0 ? Number((b.starSum / b.ratedCount).toFixed(1)) : 0,
+      maxStars: b.maxStars,
+      favoriteCount: b.favoriteCount,
+      isLossless: b.isLossless,
+      formats: [...b.formatSet],
+      latestIso: b.latestIso,
+      tracks: sortedTracks
+    };
+
+    if (mode === 'multi' && artistObj.trackCount < 2) continue;
+    if (mode === 'rated' && artistObj.avgStars <= 0 && artistObj.favoriteCount <= 0) continue;
+
+    if (query) {
+      const hay = [
+        artistObj.name,
+        ...artistObj.genres,
+        ...artistObj.formats,
+        ...releases.map((r) => r.title),
+        ...sortedTracks.map((t) => t.title || '')
+      ]
+        .join(' ')
+        .toLowerCase();
+      if (!hay.includes(query)) continue;
+    }
+
+    artists.push(artistObj);
+  }
+
+  const sorters = {
+    curated: (a, b) =>
+      Number(a.isGeneric) - Number(b.isGeneric) ||
+      b.trackCount - a.trackCount ||
+      b.avgStars - a.avgStars ||
+      a.name.localeCompare(b.name),
+    'tracks-desc': (a, b) => b.trackCount - a.trackCount || a.name.localeCompare(b.name),
+    'name-asc': (a, b) => a.name.localeCompare(b.name),
+    'rating-desc': (a, b) =>
+      b.avgStars - a.avgStars || b.favoriteCount - a.favoriteCount || b.trackCount - a.trackCount,
+    'recent-desc': (a, b) => String(b.latestIso || '').localeCompare(String(a.latestIso || '')) || a.name.localeCompare(b.name)
+  };
+
+  artists.sort(sorters[sortBy] || sorters.curated);
+  return artists;
+}
+
+/**
+ * Resolves the `#` column display indicator for a queue row ('▶', '⏸︎', or 1-based track index).
+ * @param {object} state - Row and playback state.
+ * @param {number} state.index - Zero-based row index.
+ * @param {string|null} state.trackKey - Row track key (`filePath || id`).
+ * @param {string|null} state.loadedKey - Currently loaded track key.
+ * @param {boolean} state.isPlaying - Whether primary playback is active.
+ * @param {string|null} state.pausedTrackKey - Key of explicitly paused track.
+ * @param {boolean} [state.isSelected=false] - Whether row is currently selected.
+ * @returns {string} Display text for the `#` column cell.
+ */
+export function resolveQueueRowNumIndicator({
+  index,
+  trackKey,
+  loadedKey,
+  isPlaying,
+  pausedTrackKey,
+  isSelected = false
+}) {
+  const matchesLoaded = Boolean(trackKey && loadedKey && trackKey === loadedKey);
+  if ((matchesLoaded || isSelected) && isPlaying) {
+    return '▶';
+  }
+  if ((matchesLoaded || isSelected) && !isPlaying && trackKey && pausedTrackKey === trackKey) {
+    return '⏸\uFE0E';
+  }
+  return String(index + 1);
+}
+
+/**
+ * Determines whether clicking a queue row should toggle Play/Pause on the loaded track
+ * or select and start playing a new track.
+ * @param {object} params - Click context.
+ * @param {string|null} params.clickedKey - Clicked row track key.
+ * @param {string|null} params.loadedKey - Currently loaded track key.
+ * @returns {'toggle'|'select'} Action to perform.
+ */
+export function resolveRowClickAction({ clickedKey, loadedKey }) {
+  if (clickedKey && loadedKey && clickedKey === loadedKey) {
+    return 'toggle';
+  }
+  return 'select';
+}

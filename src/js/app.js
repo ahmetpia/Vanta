@@ -4,13 +4,25 @@
  * 60 FPS Spline Spectrum Visualizer, MIR Song DNA, Vibe Radio AI, and Electron IPC Vault Bridge.
  */
 
-import { VantaAudioEngine, EQ_FREQUENCIES, EQ_PRESETS, DEVICE_EQ_PROFILES } from './audioEngine.js';
+import {
+  VantaAudioEngine,
+  EQ_FREQUENCIES,
+  EQ_PRESETS,
+  DEVICE_EQ_PROFILES,
+  requiresStudioDsp,
+  serializeNativeDspSpecFromState,
+  buildSignalPathDescriptor
+} from './audioEngine.js';
 import { VantaVisualizer } from './visualizer.js';
 import { StageLightEngine, STAGE_FX_MODES, STAGE_PALETTES } from './stageLights.js';
 import {
   applyProSmartFilter,
   buildVibeRadioQueue,
   buildTimeCapsuleAnalytics,
+  buildAlbumCollections,
+  buildArtistCollections,
+  resolveQueueRowNumIndicator,
+  resolveRowClickAction,
   isMusicVideoTagged,
   isLongFeatureVideo,
   GENRE_TAXONOMY,
@@ -53,6 +65,17 @@ class VantaStudioApp {
     this.displayedTracks = [];
     this.smartPlaylists = [];
     this.activeSmartPlaylistId = null;
+    this.albumsMode = 'all';
+    this.albumsSortBy = 'smart';
+    this.albumsViewMode = 'grid';
+    this.selectedAlbumId = null;
+    this.albumCollections = [];
+    this.artistsMode = 'all';
+    this.artistsSortBy = 'curated';
+    this.artistsViewMode = 'grid';
+    this.selectedArtistId = null;
+    this.selectedArtistReleaseId = null;
+    this.artistCollections = [];
     this.editingSmartRuleId = null;
     this.draftRuleVisual = { mode: 'auto', presetKey: 'synth', imagePath: '' };
     this.doctorReport = { issues: [], healthScore: 100 };
@@ -73,6 +96,7 @@ class VantaStudioApp {
     this.editingTrackKey = null;
     this.banditRewards = {};
     this.currentLoadedTrack = null;
+    this._pausedTrackKey = null;
     this._navigatingHistory = false;
     this._activeInlineEdit = false;
     this._rowClickTimer = null;
@@ -518,7 +542,24 @@ class VantaStudioApp {
     if (navId === 'playlists' && this.activeSmartPlaylistId) {
       return [...this.catalog];
     }
-    return this.catalog.filter((t) => !t.isVideo || isMusicVideoTagged(t));
+    const audioPool = this.catalog.filter((t) => !t.isVideo || isMusicVideoTagged(t));
+    if (navId === 'albums' && this.selectedAlbumId) {
+      const groups = buildAlbumCollections(audioPool, { mode: this.albumsMode });
+      const activeAlbum = groups.find((g) => g.id === this.selectedAlbumId);
+      if (activeAlbum) return activeAlbum.tracks;
+    }
+    if (navId === 'artists' && this.selectedArtistId) {
+      const artists = buildArtistCollections(audioPool, { mode: 'all' });
+      const activeArtist = artists.find((a) => a.id === this.selectedArtistId);
+      if (activeArtist) {
+        if (this.selectedArtistReleaseId) {
+          const rel = activeArtist.releases.find((r) => r.id === this.selectedArtistReleaseId);
+          if (rel) return rel.tracks;
+        }
+        return activeArtist.tracks;
+      }
+    }
+    return audioPool;
   }
 
   /**
@@ -533,32 +574,64 @@ class VantaStudioApp {
 
     if (this.activeNav === 'vibe' && anchor) {
       this.displayedTracks = buildVibeRadioQueue(anchor, this.displayedTracks, this.banditRewards);
+    } else if (this.activeNav === 'albums' && !this.selectedAlbumId && (!this.filterState.sortBy || this.filterState.sortBy === 'default')) {
+      this.displayedTracks.sort(
+        (a, b) =>
+          String(a.album || '').localeCompare(String(b.album || '')) ||
+          String(a.title || '').localeCompare(String(b.title || ''))
+      );
+    } else if (this.activeNav === 'artists' && !this.selectedArtistId && (!this.filterState.sortBy || this.filterState.sortBy === 'default')) {
+      this.displayedTracks.sort(
+        (a, b) =>
+          String(a.artist || '').localeCompare(String(b.artist || '')) ||
+          String(a.title || '').localeCompare(String(b.title || ''))
+      );
     }
 
     if (resetIndex) {
       this.activeTrackIndex = 0;
     }
 
+    if (this.activeNav === 'albums') {
+      this.renderAlbumsWorkspace();
+    } else if (this.activeNav === 'artists') {
+      this.renderArtistsWorkspace();
+    }
+
     const matchBadge = document.getElementById('listMatchCount');
     if (matchBadge) {
-      matchBadge.textContent = `${this.displayedTracks.length} / ${baseList.length} ${this.activeNav === 'videos' ? 'videos' : 'tracks'}`;
+      if (this.activeNav === 'albums' && !this.selectedAlbumId && this.albumsViewMode === 'grid') {
+        matchBadge.textContent = `${this.albumCollections.length} release${this.albumCollections.length === 1 ? '' : 's'}`;
+      } else if (this.activeNav === 'artists' && !this.selectedArtistId && this.artistsViewMode === 'grid') {
+        matchBadge.textContent = `${this.artistCollections.length} artist${this.artistCollections.length === 1 ? '' : 's'}`;
+      } else {
+        matchBadge.textContent = `${this.displayedTracks.length} / ${baseList.length} ${this.activeNav === 'videos' ? 'videos' : 'tracks'}`;
+      }
     }
 
     this.renderQueue();
   }
 
   /**
-   * Updates the track, video, and Quality Doctor counters in the Left Sidebar.
+   * Updates the track, album, artist, video, and Quality Doctor counters in the Left Sidebar.
    */
   updateSidebarBadges() {
     const trackBadge = document.getElementById('badgeTrackCount');
+    const albumBadge = document.getElementById('badgeAlbumCount');
+    const artistBadge = document.getElementById('badgeArtistCount');
     const videoBadge = document.getElementById('badgeVideoCount');
     const doctorBadge = document.getElementById('badgeDoctorCount');
     const doctorBtn = document.getElementById('btnRepairDoctorInline');
 
+    const audioTracks = this.catalog.filter((t) => !t.isVideo || isMusicVideoTagged(t));
     if (trackBadge) {
-      const aCount = this.catalog.filter((t) => !t.isVideo || isMusicVideoTagged(t)).length;
-      trackBadge.textContent = String(aCount);
+      trackBadge.textContent = String(audioTracks.length);
+    }
+    if (albumBadge) {
+      albumBadge.textContent = String(buildAlbumCollections(audioTracks, { mode: 'all' }).length);
+    }
+    if (artistBadge) {
+      artistBadge.textContent = String(buildArtistCollections(audioTracks, { mode: 'all' }).length);
     }
     if (videoBadge) {
       const vCount = this.catalog.filter((t) => t.isVideo).length;
@@ -668,18 +741,15 @@ class VantaStudioApp {
         const clickRatio = 1 - Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
         const newDb = Math.round(clickRatio * 24 - 12);
         this.audioEngine.bindElements(this.audioEl, this.videoEl, this.deckBEl);
-        if (this.engineMode === 'wasapi') {
-          await this.setEngineMode('dsp', true);
-        } else {
-          await this.audioEngine.resumeEngine();
-        }
         this.audioEngine.setEqBandGain(idx, newDb);
+        await this.ensurePlaybackEngineForCurrentDsp(false);
         const newPct = Math.round(((newDb + 12) / 24) * 82 + 14);
         bar.style.height = `${newPct}%`;
         dbSpan.textContent = `${newDb > 0 ? '+' : ''}${newDb}`;
         col.title = `${fullLabel}: ${newDb > 0 ? '+' : ''}${newDb} dB`;
         this._syncAllDspUi();
         this._saveProDspSettings();
+        this.updateStreamTelemetry();
         this.setToast(`EQ ${fullLabel} set to ${newDb > 0 ? '+' : ''}${newDb} dB`);
       });
 
@@ -1083,16 +1153,63 @@ class VantaStudioApp {
   /**
    * Updates the real-time Right Dock audio telemetry badge (codec, kHz/bit, WASAPI/DSP, R128 LUFS).
    */
+  /**
+   * Pushes PurePath 64 native DSP settings (10-band EQ, Sub-Bass, Bauer Crossfeed, Limiter)
+   * over the active WASAPI named-pipe without interrupting Bit-Perfect exclusive playback.
+   */
+  syncNativeWasapiDsp() {
+    if (this.engineMode !== 'wasapi' || !window.vantaAPI) return;
+    const spec = serializeNativeDspSpecFromState(this.audioEngine.state);
+    window.vantaAPI.wasapiCmd(`DSP ${spec}`).catch(() => {});
+  }
+
+  /**
+   * Keeps WASAPI PurePath 64 active for EQ/Bass/Crossfeed/Limiter changes, and seamlessly
+   * transitions to Studio DSP only when Web Audio-exclusive processors (Spatial/Reverb/Pitch) engage.
+   * @param {boolean} [actionRequiresStudio=false] - Whether the triggering action requires Studio DSP.
+   */
+  async ensurePlaybackEngineForCurrentDsp(actionRequiresStudio = false) {
+    const needsStudio = Boolean(actionRequiresStudio) || requiresStudioDsp(this.audioEngine.state);
+    if (this.engineMode === 'wasapi') {
+      if (needsStudio) {
+        await this.setEngineMode('dsp', true);
+      } else {
+        this.syncNativeWasapiDsp();
+        this.updateStreamTelemetry();
+      }
+    } else if (this.engineMode === 'dsp') {
+      await this.audioEngine.resumeEngine();
+      this.updateStreamTelemetry();
+    }
+  }
+
+  /**
+   * Builds and applies live audio Signal Path telemetry to both the dock pill and Signal Path modal.
+   */
+  getSignalPathDescriptor() {
+    const activeTrack = this.currentLoadedTrack || this.displayedTracks[this.activeTrackIndex] || null;
+    return buildSignalPathDescriptor({
+      engineMode: this.engineMode,
+      isVideo: Boolean(activeTrack?.isVideo),
+      filePath: activeTrack?.filePath || '',
+      trackTitle: activeTrack?.title || '',
+      probe: this.activeTrackProbe,
+      r128: this.activeTrackR128,
+      wasapiEvent: this.lastWasapiReadyEvent,
+      dspState: this.audioEngine.state,
+      deviceName: this.lastWasapiReadyEvent?.deviceName || '',
+      linearGain: this.engineMode === 'wasapi' ? this.getEffectiveWasapiGain() : this.getEffectiveReplayGain(),
+      gaplessQueued: Boolean(this._wasapiGaplessTarget)
+    });
+  }
+
   updateStreamTelemetry() {
     const el = document.getElementById('dockStreamTelemetry');
     if (!el) return;
     const activeTrack = this.currentLoadedTrack || this.displayedTracks[this.activeTrackIndex];
-    const parts = [];
-    if (this.engineMode === 'wasapi' && !activeTrack?.isVideo) {
-      parts.push(`⚡ ${this.wasapiStatusMode}`);
-    } else {
-      parts.push('🎛️ STUDIO DSP (32-BIT FLOAT)');
-    }
+    const desc = this.getSignalPathDescriptor();
+    const parts = [desc.summaryLabel];
+
     if (this.activeTrackProbe) {
       const srKhz = `${(this.activeTrackProbe.sampleRate / 1000).toFixed(1).replace(/\.0$/, '')}kHz`;
       const bits = this.activeTrackProbe.bitDepth ? `${this.activeTrackProbe.bitDepth}bit` : '16bit';
@@ -1103,7 +1220,111 @@ class VantaStudioApp {
     if (this.audioEngine.state.lufs && this.activeTrackR128?.integratedLufs !== undefined) {
       parts.push(`R128 ${this.activeTrackR128.integratedLufs.toFixed(1)} LUFS`);
     }
-    el.textContent = parts.join(' · ');
+
+    el.classList.remove('tone-bit-exact', 'tone-purepath', 'tone-dop');
+    if (this.engineMode === 'wasapi' && !activeTrack?.isVideo) {
+      if (desc.qualityTone === 'bit_exact') el.classList.add('tone-bit-exact');
+      else if (desc.qualityTone === 'purepath') el.classList.add('tone-purepath');
+      else if (desc.qualityTone === 'dop') el.classList.add('tone-dop');
+    }
+
+    const icon = desc.qualityTone === 'bit_exact'
+      ? '◆'
+      : desc.qualityTone === 'purepath'
+        ? '◈'
+        : desc.qualityTone === 'dop'
+          ? '⚡'
+          : '🎛️';
+    el.textContent = `${icon} ${parts.join(' · ')} ▾`;
+
+    const modal = document.getElementById('signalPathModal');
+    if (modal && !modal.classList.contains('hidden')) {
+      this.renderSignalPathModal(desc);
+    }
+  }
+
+  /**
+   * Renders the Live Signal Path Inspector chain cleanly via createElement (zero innerHTML).
+   * @param {object|null} [precomputed=null] - Optional precomputed descriptor.
+   */
+  renderSignalPathModal(precomputed = null) {
+    const desc = precomputed || this.getSignalPathDescriptor();
+    const led = document.getElementById('signalPathLed');
+    const badge = document.getElementById('signalPathQualityBadge');
+    const list = document.getElementById('signalPathStagesList');
+    if (!list) return;
+
+    const toneClass = `tone-${desc.qualityTone}`;
+    if (led) led.className = `signal-path-led ${toneClass}`;
+    if (badge) {
+      badge.className = `signal-path-quality-badge ${toneClass}`;
+      badge.textContent = desc.qualityBadge;
+    }
+
+    const statusGlyph = {
+      bit_exact: '◆',
+      purepath: '◈',
+      dop: '⚡',
+      enhanced: '●',
+      dsp: '●'
+    };
+
+    const rows = desc.stages.map((st) => {
+      const row = document.createElement('div');
+      row.className = 'signal-stage-row';
+
+      const node = document.createElement('div');
+      node.className = `signal-stage-node status-${st.status}`;
+      node.textContent = statusGlyph[st.status] || '●';
+
+      const body = document.createElement('div');
+      body.className = 'signal-stage-body';
+
+      const top = document.createElement('div');
+      top.className = 'signal-stage-top';
+
+      const titleEl = document.createElement('span');
+      titleEl.className = 'signal-stage-title';
+      titleEl.textContent = st.title;
+
+      const specEl = document.createElement('span');
+      specEl.className = 'signal-stage-spec';
+      specEl.textContent = st.spec;
+
+      const detailEl = document.createElement('div');
+      detailEl.className = 'signal-stage-detail';
+      detailEl.textContent = st.detail;
+
+      top.appendChild(titleEl);
+      top.appendChild(specEl);
+      body.appendChild(top);
+      body.appendChild(detailEl);
+      row.appendChild(node);
+      row.appendChild(body);
+      return row;
+    });
+
+    list.replaceChildren(...rows);
+  }
+
+  _bindSignalPathModal() {
+    const modal = document.getElementById('signalPathModal');
+    const trigger = document.getElementById('dockStreamTelemetry');
+    const closeBtn = document.getElementById('btnCloseSignalPath');
+    if (!modal || !trigger) return;
+
+    const closeModal = () => modal.classList.add('hidden');
+    trigger.addEventListener('click', () => {
+      this.renderSignalPathModal();
+      modal.classList.remove('hidden');
+    });
+    closeBtn?.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) closeModal();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal();
+    });
   }
 
   /**
@@ -1221,18 +1442,176 @@ class VantaStudioApp {
    * Handles native WASAPI C++ engine telemetry events (ready, spectrum, ended, error).
    * @param {object} evt - Parsed telemetry packet from Main Process.
    */
+  _getNextTrackForWasapiGapless() {
+    if (this.repeatMode === 'one' || (Number(this.audioEngine?.state?.crossfadeSeconds) || 0) > 0) {
+      return null;
+    }
+    if (!this.displayedTracks.length) return null;
+    let nextIdx = -1;
+    if (this.activeTrackIndex + 1 < this.displayedTracks.length) {
+      nextIdx = this.activeTrackIndex + 1;
+    } else if (this.repeatMode === 'queue') {
+      nextIdx = 0;
+    }
+    if (nextIdx < 0) return null;
+    const nextTrack = this.displayedTracks[nextIdx];
+    if (!nextTrack?.filePath || nextTrack.isVideo) return null;
+    if (/\.(?:dsf|dff)$/i.test(nextTrack.filePath)) return null;
+    return { index: nextIdx, track: nextTrack };
+  }
+
+  _maybeQueueGaplessWasapiNext(positionSec, totalSec) {
+    if (!window.vantaAPI?.wasapiQueueNext || this.engineMode !== 'wasapi' || !this.isPlaying) return;
+    if (!Number.isFinite(totalSec) || totalSec <= 8.0) return;
+    const remaining = totalSec - positionSec;
+    if (remaining > 6.5 || remaining <= 0.15) return;
+
+    const currentTrack = this.currentLoadedTrack || this.displayedTracks[this.activeTrackIndex];
+    const currentKey = currentTrack?.filePath || currentTrack?.id;
+    const nextInfo = this._getNextTrackForWasapiGapless();
+    if (!currentKey || !nextInfo) return;
+
+    const pairKey = `${currentKey}==>${nextInfo.track.filePath}`;
+    if (this._wasapiGaplessQueuedKey === pairKey) return;
+    this._wasapiGaplessQueuedKey = pairKey;
+
+    const seq = (this._gaplessSeqCounter = (this._gaplessSeqCounter || 0) + 1);
+    window.vantaAPI
+      .wasapiQueueNext({
+        filePath: nextInfo.track.filePath,
+        dop: Boolean(this.dopEnabled),
+        linearGain: this.getEffectiveWasapiGain(),
+        seq
+      })
+      .then((res) => {
+        if (res?.ok && res.queued) {
+          this._wasapiGaplessTarget = {
+            seq,
+            index: nextInfo.index,
+            track: nextInfo.track,
+            probe: res.probe || null,
+            r128: res.r128 || null
+          };
+          this.updateStreamTelemetry();
+        } else {
+          this._wasapiGaplessTarget = null;
+        }
+      })
+      .catch(() => {
+        this._wasapiGaplessTarget = null;
+      });
+  }
+
+  _commitGaplessWasapiAdvance(evt) {
+    const target = this._wasapiGaplessTarget;
+    if (!target || target.seq !== Number(evt.seq)) return false;
+
+    const prevTrack = this.currentLoadedTrack;
+    const prevKey = prevTrack ? (prevTrack.filePath || prevTrack.id) : null;
+    const nextTrack = target.track;
+    const resolvedIdx = this.displayedTracks.indexOf(nextTrack);
+    const nextIdx = resolvedIdx >= 0 ? resolvedIdx : Math.max(0, Math.min(this.displayedTracks.length - 1, target.index));
+
+    if (prevTrack && prevKey && prevKey !== (nextTrack.filePath || nextTrack.id)) {
+      const top = this.playbackHistory[this.playbackHistory.length - 1];
+      if (!top || top.key !== prevKey) {
+        this.playbackHistory.push({ key: prevKey, title: prevTrack.title, artist: prevTrack.artist || '' });
+        if (this.playbackHistory.length > 30) this.playbackHistory.shift();
+        this._savePlaybackHistory();
+      }
+    }
+
+    this._wasapiGaplessTarget = null;
+    this._wasapiGaplessQueuedKey = null;
+    this.currentLoadedTrack = nextTrack;
+    this.activeTrackIndex = nextIdx;
+    this._pausedTrackKey = null;
+    this.wasapiCurrentPositionSec = 0;
+    this.activeTrackProbe = target.probe || evt.probe || null;
+    this.activeTrackR128 = target.r128 || null;
+    if (this.lastWasapiReadyEvent) {
+      this.lastWasapiReadyEvent = {
+        ...this.lastWasapiReadyEvent,
+        sampleRate: evt.sampleRate ?? this.lastWasapiReadyEvent.sampleRate,
+        bitExact: evt.bitExact ?? this.lastWasapiReadyEvent.bitExact,
+        signalMode: evt.signalMode ?? this.lastWasapiReadyEvent.signalMode
+      };
+    }
+
+    document.getElementById('dockTrackTitle').textContent = nextTrack.title;
+    document.getElementById('dockTrackSubtitle').textContent = `${nextTrack.artist} · ${nextTrack.bpm} BPM · ${nextTrack.key}`;
+    const artBox = document.getElementById('dockArtworkBox');
+    const miniThumb = document.getElementById('footerMiniThumb');
+    const coverSrc = this._getTrackCoverSrc(nextTrack);
+    if (coverSrc && artBox && miniThumb) {
+      artBox.style.backgroundImage = `url("${coverSrc}")`;
+      artBox.textContent = '';
+      miniThumb.style.backgroundImage = `url("${coverSrc}")`;
+      miniThumb.textContent = '';
+    } else if (artBox && miniThumb) {
+      artBox.style.backgroundImage = '';
+      artBox.style.background = nextTrack.grad || 'linear-gradient(135deg, var(--a1), var(--a2), var(--a3))';
+      artBox.textContent = '🎧';
+      miniThumb.style.backgroundImage = '';
+      miniThumb.style.background = nextTrack.grad || 'linear-gradient(135deg, var(--a1), var(--a3))';
+      miniThumb.textContent = '🎧';
+    }
+
+    this.visualizer.setProgress(0);
+    window.vantaAPI?.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
+    if (!this.activeTrackR128) {
+      void this.probeActiveTrack(nextTrack).catch(() => {});
+    }
+    this._updateLastPlayedButton();
+    this.updateStreamTelemetry();
+    this.renderQueue();
+    return true;
+  }
+
   handleWasapiEvent(evt) {
     if (!evt || typeof evt !== 'object') return;
     if (evt.event === 'ready') {
+      this.lastWasapiReadyEvent = evt;
       const rateKhz = evt.sampleRate ? `${(evt.sampleRate / 1000).toFixed(1).replace(/\.0$/, '')}kHz` : 'Native';
       if (evt.mode === 'dop_exclusive') {
         this.wasapiStatusMode = `NATIVE DoP v1.1 (${evt.dsdRate || 'DSD'} @ ${rateKhz})`;
       } else if (evt.mode === 'exclusive') {
-        this.wasapiStatusMode = `WASAPI EXCLUSIVE (${rateKhz})`;
+        this.wasapiStatusMode = evt.bitExact
+          ? `BIT-EXACT WASAPI (${rateKhz})`
+          : `PUREPATH 64 WASAPI (${rateKhz})`;
       } else {
         this.wasapiStatusMode = 'WASAPI SHARED (Auto-Fallback)';
       }
       this.updateStreamTelemetry();
+      return;
+    }
+    if (evt.event === 'dsp_state') {
+      if (this.lastWasapiReadyEvent) {
+        this.lastWasapiReadyEvent = {
+          ...this.lastWasapiReadyEvent,
+          bitExact: evt.bitExact,
+          eqActive: evt.eqActive,
+          bass: evt.bass,
+          crossfeed: evt.crossfeed,
+          limiter: evt.limiter,
+          signalMode: evt.signalMode
+        };
+      }
+      const rateKhz = this.lastWasapiReadyEvent?.sampleRate
+        ? `${(this.lastWasapiReadyEvent.sampleRate / 1000).toFixed(1).replace(/\.0$/, '')}kHz`
+        : 'Native';
+      if (this.lastWasapiReadyEvent?.mode === 'exclusive') {
+        this.wasapiStatusMode = evt.bitExact
+          ? `BIT-EXACT WASAPI (${rateKhz})`
+          : `PUREPATH 64 WASAPI (${rateKhz})`;
+      }
+      this.updateStreamTelemetry();
+      return;
+    }
+    if (evt.event === 'track_advanced') {
+      if (!this._commitGaplessWasapiAdvance(evt)) {
+        this.updateStreamTelemetry();
+      }
       return;
     }
     if (evt.event === 'spectrum') {
@@ -1243,11 +1622,14 @@ class VantaStudioApp {
         this.wasapiCurrentPositionSec = Number(evt.positionSec) || 0;
         const totalSec = Number(evt.durationSec) || this.activeTrackProbe?.durationSec || 0;
         this.updateTimelineUi(this.wasapiCurrentPositionSec, totalSec);
+        this._maybeQueueGaplessWasapiNext(this.wasapiCurrentPositionSec, totalSec);
       }
       return;
     }
     if (evt.event === 'ended') {
       this.audioEngine.setExternalSpectrum(null);
+      this._wasapiGaplessTarget = null;
+      this._wasapiGaplessQueuedKey = null;
       if (this.engineMode === 'wasapi' && this.isPlaying) {
         this.wasapiCurrentPositionSec = 0;
         this.wasapiPausedTrackKey = null;
@@ -2054,7 +2436,21 @@ class VantaStudioApp {
     switch (col.id) {
       case 'num': {
         cell.classList.add('rb-cell-num');
-        cell.textContent = isSelected && this.isPlaying ? '▶' : String(idx + 1);
+        const trackKey = track?.filePath || track?.id || null;
+        const loadedKey = this.currentLoadedTrack ? (this.currentLoadedTrack.filePath || this.currentLoadedTrack.id || null) : null;
+        const indicator = resolveQueueRowNumIndicator({
+          index: idx,
+          trackKey,
+          loadedKey,
+          isPlaying: this.isPlaying,
+          pausedTrackKey: this._pausedTrackKey,
+          isSelected
+        });
+        cell.textContent = indicator;
+        if (indicator !== String(idx + 1)) {
+          cell.classList.add('rb-cell-num-state');
+          cell.title = this.isPlaying ? 'Playing (click row to pause)' : 'Paused (click row to resume)';
+        }
         break;
       }
       case 'title': {
@@ -2465,6 +2861,13 @@ class VantaStudioApp {
         clearTimeout(this._rowClickTimer);
         const fireSelect = () => {
           if (this._activeInlineEdit) return;
+          const clickedKey = track?.filePath || track?.id || null;
+          const loadedKey = this.currentLoadedTrack ? (this.currentLoadedTrack.filePath || this.currentLoadedTrack.id || null) : null;
+          if (resolveRowClickAction({ clickedKey, loadedKey }) === 'toggle') {
+            this.activeTrackIndex = idx;
+            this.togglePlay();
+            return;
+          }
           this.banditRewards[track.id] = (this.banditRewards[track.id] || 0) + 0.25;
           this.selectTrack(idx, true);
         };
@@ -2492,7 +2895,17 @@ class VantaStudioApp {
 
     const matchBadge = document.getElementById('listMatchCount');
     if (matchBadge) {
-      matchBadge.textContent = `${this.displayedTracks.length} / ${this.catalog.length} tracks`;
+      if (this.activeNav === 'albums' && !this.selectedAlbumId && this.albumsViewMode === 'grid') {
+        matchBadge.textContent = `${this.albumCollections.length} release${this.albumCollections.length === 1 ? '' : 's'}`;
+      } else if (this.activeNav === 'artists' && !this.selectedArtistId && this.artistsViewMode === 'grid') {
+        matchBadge.textContent = `${this.artistCollections.length} artist${this.artistCollections.length === 1 ? '' : 's'}`;
+      } else {
+        const poolTotal =
+          (this.activeNav === 'albums' && this.selectedAlbumId) || (this.activeNav === 'artists' && this.selectedArtistId)
+            ? this._getTracksPoolForNav(this.activeNav).length
+            : this.catalog.length;
+        matchBadge.textContent = `${this.displayedTracks.length} / ${poolTotal} ${this.activeNav === 'videos' ? 'videos' : 'tracks'}`;
+      }
     }
     const clearBtn = document.getElementById('btnClearPlaylist');
     if (clearBtn) {
@@ -2652,6 +3065,9 @@ class VantaStudioApp {
       }
     }
     this.currentLoadedTrack = incomingTrack;
+    if (prevKey !== incomingKey) {
+      this._pausedTrackKey = null;
+    }
     this._updateLastPlayedButton();
 
     this.activeTrackIndex = clampedIdx;
@@ -2792,6 +3208,7 @@ class VantaStudioApp {
     const mySeq = ++this._playbackSeq;
     this.audioEngine.bindElements(this.audioEl, this.videoEl, this.deckBEl);
     this.audioEngine.setReplayGainLinear(this.getEffectiveReplayGain());
+    this._pausedTrackKey = null;
     this.isPlaying = true;
     this.visualizer.isPlaying = true;
 
@@ -2821,6 +3238,8 @@ class VantaStudioApp {
           : (Number(seekSecOverride) || 0);
       this.wasapiPausedTrackKey = null;
       this.wasapiResumeSec = 0;
+      this._wasapiGaplessTarget = null;
+      this._wasapiGaplessQueuedKey = null;
       this.wasapiCurrentPositionSec = resumeOffset;
       window.vantaAPI
         .wasapiPlay({
@@ -2829,7 +3248,8 @@ class VantaStudioApp {
           dop: Boolean(this.dopEnabled),
           deviceId: this.selectedDeviceId || '',
           linearGain: this.getEffectiveWasapiGain(),
-          seekSec: resumeOffset
+          seekSec: resumeOffset,
+          dspSpec: serializeNativeDspSpecFromState(this.audioEngine.state)
         })
         .then((res) => {
           if (mySeq !== this._playbackSeq) return;
@@ -2846,6 +3266,9 @@ class VantaStudioApp {
         });
     } else if (track.filePath) {
       this.audioEngine.stopProceduralSynthPreview();
+      if (!track.isVideo) {
+        this.videoEl?.pause();
+      }
       if (window.vantaAPI) await window.vantaAPI.wasapiCmd('STOP').catch(() => {});
       if (mySeq !== this._playbackSeq) return;
       if (track.isVideo && Boolean(this._videoProbePromise)) {
@@ -2906,6 +3329,8 @@ class VantaStudioApp {
     const track = this.displayedTracks[this.activeTrackIndex];
     this.isPlaying = false;
     this.visualizer.isPlaying = false;
+    const pausedTarget = this.currentLoadedTrack || track;
+    this._pausedTrackKey = pausedTarget ? (pausedTarget.filePath || pausedTarget.id || null) : null;
     this.audioEl.pause();
     this.deckBEl?.pause();
     this.videoEl.pause();
@@ -2915,6 +3340,9 @@ class VantaStudioApp {
     if (this.engineMode === 'wasapi' && window.vantaAPI && track?.filePath && !track.isVideo) {
       this.wasapiPausedTrackKey = track.filePath || track.id;
       this.wasapiResumeSec = Math.max(0, Number(this.wasapiCurrentPositionSec) || 0);
+      this._wasapiGaplessTarget = null;
+      this._wasapiGaplessQueuedKey = null;
+      this.lastWasapiReadyEvent = null;
       window.vantaAPI.wasapiCmd('STOP').catch(() => {});
       this.wasapiStatusMode = 'WASAPI EXCLUSIVE (RELEASED)';
       this.updateStreamTelemetry();
@@ -3074,6 +3502,13 @@ class VantaStudioApp {
       return;
     }
     this.activeNav = navId;
+    if (navId !== 'albums') {
+      this.selectedAlbumId = null;
+    }
+    if (navId !== 'artists') {
+      this.selectedArtistId = null;
+      this.selectedArtistReleaseId = null;
+    }
     if (navId !== 'playlists' && this.activeSmartPlaylistId) {
       this.activeSmartPlaylistId = null;
       this.filterState = {
@@ -3165,26 +3600,46 @@ class VantaStudioApp {
         break;
       }
       case 'albums': {
-        this.displayedTracks = [...audioPool].sort((a, b) =>
-          String(a.album || '').localeCompare(String(b.album || '')) ||
-          String(a.title || '').localeCompare(String(b.title || ''))
+        this.selectedAlbumId = null;
+        const filteredAudio = applyProSmartFilter(audioPool, this.filterState, audioPool[0] || null);
+        this.displayedTracks = [...filteredAudio].sort(
+          (a, b) =>
+            String(a.album || '').localeCompare(String(b.album || '')) ||
+            String(a.title || '').localeCompare(String(b.title || ''))
         );
-        const albumCount = new Set(audioPool.map((t) => t.album).filter(Boolean)).size;
-        badgeEl.textContent = 'ALBUMS COLLECTION';
-        headlineEl.innerHTML = `Albums: <span class="grad-text">${albumCount} Release Groups</span>`;
-        descEl.textContent = 'Tracks organized by Album metadata alongside BPM, Camelot Key, and Energy.';
+        const allAlbums = buildAlbumCollections(audioPool, { mode: 'all' });
+        const taggedCount = allAlbums.filter((g) => g.kind === 'album').length;
+        const folderCount = allAlbums.filter((g) => g.kind === 'folder').length;
+        badgeEl.textContent = 'ALBUMS & RELEASE COLLECTIONS';
+        headlineEl.replaceChildren();
+        headlineEl.append('Albums: ');
+        const grad = document.createElement('span');
+        grad.className = 'grad-text';
+        grad.textContent = `${allAlbums.length} Release Group${allAlbums.length === 1 ? '' : 's'}`;
+        headlineEl.appendChild(grad);
+        descEl.textContent = `${taggedCount} tagged album${taggedCount === 1 ? '' : 's'} and ${folderCount} folder collection${folderCount === 1 ? '' : 's'} with instant cover-art playback and tracklist drill-down.`;
         queueTitleEl.textContent = 'Albums Collection';
         break;
       }
       case 'artists': {
-        this.displayedTracks = [...audioPool].sort((a, b) =>
-          String(a.artist || '').localeCompare(String(b.artist || '')) ||
-          String(a.title || '').localeCompare(String(b.title || ''))
+        this.selectedArtistId = null;
+        this.selectedArtistReleaseId = null;
+        const filteredAudio = applyProSmartFilter(audioPool, this.filterState, audioPool[0] || null);
+        this.displayedTracks = [...filteredAudio].sort(
+          (a, b) =>
+            String(a.artist || '').localeCompare(String(b.artist || '')) ||
+            String(a.title || '').localeCompare(String(b.title || ''))
         );
-        const artistCount = new Set(audioPool.map((t) => t.artist || 'Unknown Artist')).size;
-        badgeEl.textContent = 'ARTISTS COLLECTION';
-        headlineEl.innerHTML = `Artists: <span class="grad-text">${artistCount} Studio Artists</span>`;
-        descEl.textContent = 'Tracks grouped and sorted by Artist name across your entire library.';
+        const allArtists = buildArtistCollections(audioPool, { mode: 'all' });
+        const multiCount = allArtists.filter((a) => a.trackCount >= 2).length;
+        badgeEl.textContent = 'ARTISTS & DISCOGRAPHY';
+        headlineEl.replaceChildren();
+        headlineEl.append('Artists: ');
+        const grad = document.createElement('span');
+        grad.className = 'grad-text';
+        grad.textContent = `${allArtists.length} Studio Artist${allArtists.length === 1 ? '' : 's'}`;
+        headlineEl.appendChild(grad);
+        descEl.textContent = `${multiCount} artist${multiCount === 1 ? '' : 's'} with multiple tracks. Explore circular artist portraits, discography releases, and instant Vibe Radio.`;
         queueTitleEl.textContent = 'Artists Collection';
         break;
       }
@@ -3238,6 +3693,13 @@ class VantaStudioApp {
     }
     this.syncHeroPlaylistShowcase();
     this.renderSmartPlaylistBar();
+    this.renderAlbumsWorkspace();
+    this.renderArtistsWorkspace();
+    if (this.activeNav === 'albums' && !this.selectedAlbumId && this.albumsViewMode === 'grid' && matchBadge) {
+      matchBadge.textContent = `${this.albumCollections.length} release${this.albumCollections.length === 1 ? '' : 's'}`;
+    } else if (this.activeNav === 'artists' && !this.selectedArtistId && this.artistsViewMode === 'grid' && matchBadge) {
+      matchBadge.textContent = `${this.artistCollections.length} artist${this.artistCollections.length === 1 ? '' : 's'}`;
+    }
     this.renderQueue();
     this.setToast(`Active Module: ${navId.toUpperCase()}`);
   }
@@ -3426,6 +3888,811 @@ class VantaStudioApp {
           this.clearActiveSmartRule();
         } else {
           this.applySmartPlaylistRule(rule);
+        }
+      });
+
+      frag.appendChild(card);
+    }
+
+    gridEl.appendChild(frag);
+  }
+
+  /**
+   * Formats total album duration in minutes/hours for release summary headers.
+   * @param {number} totalSec - Total duration in seconds.
+   * @returns {string} Human-readable runtime string.
+   */
+  _formatAlbumDuration(totalSec) {
+    const sec = Math.max(0, Math.round(Number(totalSec) || 0));
+    if (!sec) return '';
+    const hrs = Math.floor(sec / 3600);
+    const mins = Math.floor((sec % 3600) / 60);
+    const remSec = sec % 60;
+    if (hrs > 0) return `${hrs} hr ${mins} min`;
+    if (mins > 0) return `${mins}m ${String(remSec).padStart(2, '0')}s`;
+    return `${remSec}s`;
+  }
+
+  /**
+   * Builds a crisp cover element (1 full cover, 2x2 mosaic, or gradient monogram) shared by Albums & Artists.
+   * @param {object[]} tracks - Tracks supplying cover art.
+   * @param {string} label - Display title/name for alt text and monogram initials.
+   * @param {string} frameClass - CSS class for container shape (`album-art-frame card`, `artist-art-frame detail`, etc.).
+   * @returns {HTMLElement}
+   */
+  _buildCollectionArtworkElement(tracks = [], label = 'V', frameClass = 'album-art-frame card') {
+    const box = document.createElement('div');
+    box.className = frameClass;
+
+    const uniqueCovers = [];
+    const seen = new Set();
+    for (const t of tracks || []) {
+      const cover = this._getTrackCoverSrc(t);
+      if (cover && !seen.has(cover)) {
+        seen.add(cover);
+        uniqueCovers.push(cover);
+        if (uniqueCovers.length >= 4) break;
+      }
+    }
+
+    const applyMonogramFallback = () => {
+      box.replaceChildren();
+      const titleStr = String(label || 'V');
+      let hash = 0;
+      for (let i = 0; i < titleStr.length; i++) hash = (hash * 31 + titleStr.charCodeAt(i)) >>> 0;
+      const preset = PLAYLIST_VISUAL_PRESETS[hash % PLAYLIST_VISUAL_PRESETS.length];
+      box.style.background = preset.grad;
+
+      const mono = document.createElement('div');
+      mono.className = 'album-art-monogram';
+      const words = titleStr.replace(/[^a-zA-Z0-9\s]/g, ' ').trim().split(/\s+/).filter(Boolean);
+      const initials =
+        words.length >= 2
+          ? `${words[0][0]}${words[1][0]}`.toUpperCase()
+          : titleStr.slice(0, 2).toUpperCase() || 'VA';
+      const disc = document.createElement('span');
+      disc.className = 'album-monogram-initials';
+      disc.textContent = initials;
+      mono.appendChild(disc);
+      box.appendChild(mono);
+    };
+
+    if (uniqueCovers.length === 1) {
+      const img = document.createElement('img');
+      img.className = 'album-art-img';
+      img.alt = `${label} artwork`;
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.draggable = false;
+      img.src = uniqueCovers[0];
+      img.addEventListener('error', applyMonogramFallback);
+      box.appendChild(img);
+      return box;
+    }
+
+    if (uniqueCovers.length >= 2) {
+      const mosaic = document.createElement('div');
+      mosaic.className = 'playlist-cover-mosaic';
+      const tiles =
+        uniqueCovers.length === 2
+          ? [uniqueCovers[0], uniqueCovers[1], uniqueCovers[1], uniqueCovers[0]]
+          : uniqueCovers.length === 3
+            ? [uniqueCovers[0], uniqueCovers[1], uniqueCovers[2], uniqueCovers[0]]
+            : uniqueCovers;
+      for (const src of tiles) {
+        const tile = document.createElement('div');
+        tile.className = 'playlist-cover-mosaic-tile';
+        tile.style.backgroundImage = `url("${src}")`;
+        mosaic.appendChild(tile);
+      }
+      box.appendChild(mosaic);
+      return box;
+    }
+
+    applyMonogramFallback();
+    return box;
+  }
+
+  /**
+   * Builds a square album artwork element.
+   * @param {object} album - Album collection descriptor.
+   * @param {'card'|'detail'} [variant='card'] - Layout size token.
+   * @returns {HTMLElement}
+   */
+  buildAlbumCoverElement(album, variant = 'card') {
+    return this._buildCollectionArtworkElement(album?.tracks || [], album?.title || 'Album', `album-art-frame ${variant}`);
+  }
+
+  /**
+   * Builds a circular artist portrait/collage element.
+   * @param {object} artist - Artist collection descriptor.
+   * @param {'card'|'detail'} [variant='card'] - Layout size token.
+   * @returns {HTMLElement}
+   */
+  buildArtistCoverElement(artist, variant = 'card') {
+    return this._buildCollectionArtworkElement(artist?.tracks || [], artist?.name || 'Artist', `artist-art-frame ${variant}`);
+  }
+
+  /**
+   * Opens the Album Detail drill-down view for a specific album release group.
+   * @param {string} albumId - Target album collection ID.
+   */
+  openAlbumDetail(albumId) {
+    if (!albumId) return;
+    this.selectedAlbumId = albumId;
+    this.applyFiltersAndRender(true);
+    const activeAlbum = this.albumCollections.find((a) => a.id === albumId);
+    if (activeAlbum) {
+      this.setToast(`Opened Album: "${activeAlbum.title}" (${activeAlbum.trackCount} tracks)`);
+    }
+  }
+
+  /**
+   * Closes Album Detail drill-down and returns to the Albums Gallery Grid.
+   */
+  closeAlbumDetail() {
+    if (!this.selectedAlbumId) return;
+    this.selectedAlbumId = null;
+    this.applyFiltersAndRender(true);
+    this.setToast('Showing all Albums');
+  }
+
+  /**
+   * Plays an Album collection immediately (sequentially or shuffled).
+   * @param {object} album - Album descriptor.
+   * @param {boolean} [shuffle=false] - Whether to shuffle playback order.
+   */
+  playAlbumCollection(album, shuffle = false) {
+    if (!album || !Array.isArray(album.tracks) || !album.tracks.length) {
+      this.setToast('This album has no playable tracks');
+      return;
+    }
+    this.selectedAlbumId = album.id;
+    this.applyFiltersAndRender(true);
+    if (!this.displayedTracks.length) {
+      this.setToast(`No matching tracks in "${album.title}"`);
+      return;
+    }
+    if (shuffle) {
+      const btnShuffle = document.getElementById('btnShuffle');
+      if (btnShuffle && !btnShuffle.classList.contains('active')) {
+        btnShuffle.click();
+      }
+      const randIdx = Math.floor(Math.random() * this.displayedTracks.length);
+      this.selectTrack(randIdx, true);
+    } else {
+      this.selectTrack(0, true);
+    }
+  }
+
+  /**
+   * Renders the professional Albums Gallery Grid and Album Detail View inside #queuePanel.
+   */
+  renderAlbumsWorkspace() {
+    const workspaceEl = document.getElementById('albumsWorkspace');
+    const toolbarEl = document.getElementById('albumsToolbar');
+    const detailHeroEl = document.getElementById('albumsDetailHero');
+    const gridScrollEl = document.getElementById('albumsGridScroll');
+    const gridEl = document.getElementById('albumsGrid');
+    const tableViewportEl = document.getElementById('rbTableViewport');
+    const queueTitleEl = document.getElementById('queuePanelTitle');
+    if (!workspaceEl || !gridEl || !tableViewportEl) return;
+
+    const isAlbumsNav = this.activeNav === 'albums';
+    const listSortEl = document.getElementById('listSortSelect');
+    const searchInputEl = document.getElementById('listSearchInput');
+    workspaceEl.classList.toggle('hidden', !isAlbumsNav);
+    if (!isAlbumsNav) {
+      workspaceEl.classList.remove('albums-workspace-full');
+      if (this.activeNav !== 'artists') {
+        tableViewportEl.classList.remove('hidden');
+        listSortEl?.classList.remove('hidden');
+        if (searchInputEl) {
+          searchInputEl.placeholder = 'Search title, artist, #tag, bpm:120-130, key:8A, star:4+...';
+        }
+      }
+      return;
+    }
+
+    const audioBase = this.catalog.filter((t) => !t.isVideo || isMusicVideoTagged(t));
+    // Apply Smart Focus bar filters (except album drill-down) so BPM/Key/Stars/Search narrow album cards cleanly
+    const nonAlbumFilters = { ...this.filterState, query: '' };
+    const smartFilteredPool = applyProSmartFilter(audioBase, nonAlbumFilters, audioBase[0] || null);
+
+    const allCollections = buildAlbumCollections(smartFilteredPool, {
+      mode: 'all',
+      query: this.filterState.query,
+      sortBy: this.albumsSortBy
+    });
+    const modeCollections =
+      this.albumsMode === 'all'
+        ? allCollections
+        : buildAlbumCollections(smartFilteredPool, {
+            mode: this.albumsMode,
+            query: this.filterState.query,
+            sortBy: this.albumsSortBy
+          });
+    this.albumCollections = modeCollections;
+
+    // Update mode pill counts & active states
+    const taggedCount = allCollections.filter((a) => a.kind === 'album').length;
+    const folderCount = allCollections.filter((a) => a.kind === 'folder').length;
+    document.querySelectorAll('#albumsModeGroup [data-album-mode]').forEach((btn) => {
+      const m = btn.dataset.albumMode;
+      btn.classList.toggle('active', m === this.albumsMode);
+      if (m === 'all') btn.textContent = `All Releases (${allCollections.length})`;
+      else if (m === 'tagged') btn.textContent = `Album Tags (${taggedCount})`;
+      else if (m === 'folder') btn.textContent = `Folders (${folderCount})`;
+    });
+    document.querySelectorAll('#albumsViewGroup [data-album-view]').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.albumView === this.albumsViewMode);
+    });
+    const sortSel = document.getElementById('albumsSortSelect');
+    if (sortSel && sortSel.value !== this.albumsSortBy) sortSel.value = this.albumsSortBy;
+
+    // Check if drilled into a specific album
+    const activeAlbum = this.selectedAlbumId
+      ? buildAlbumCollections(audioBase, { mode: 'all' }).find((a) => a.id === this.selectedAlbumId) || null
+      : null;
+    if (this.selectedAlbumId && !activeAlbum) {
+      this.selectedAlbumId = null;
+    }
+
+    if (activeAlbum) {
+      workspaceEl.classList.remove('albums-workspace-full');
+      toolbarEl?.classList.add('hidden');
+      gridScrollEl?.classList.add('hidden');
+      detailHeroEl?.classList.remove('hidden');
+      tableViewportEl.classList.remove('hidden');
+      listSortEl?.classList.remove('hidden');
+      if (searchInputEl) {
+        searchInputEl.placeholder = `Search inside "${activeAlbum.title}"...`;
+      }
+
+      if (queueTitleEl) queueTitleEl.textContent = `Album · ${activeAlbum.title}`;
+
+      const artHost = document.getElementById('albumDetailArt');
+      const kindEl = document.getElementById('albumDetailReleaseKind');
+      const titleEl = document.getElementById('albumDetailTitle');
+      const subEl = document.getElementById('albumDetailSubtitle');
+      const statsEl = document.getElementById('albumDetailStats');
+
+      if (artHost) artHost.replaceChildren(this.buildAlbumCoverElement(activeAlbum, 'detail'));
+      if (kindEl) {
+        kindEl.textContent =
+          activeAlbum.kind === 'album'
+            ? activeAlbum.isCompilation
+              ? 'COMPILATION ALBUM'
+              : 'ALBUM RELEASE'
+            : activeAlbum.kind === 'folder'
+              ? 'FOLDER COLLECTION'
+              : 'SINGLES COLLECTION';
+      }
+      if (titleEl) titleEl.textContent = activeAlbum.title;
+      if (subEl) {
+        const subParts = [activeAlbum.artist];
+        if (activeAlbum.year) subParts.push(activeAlbum.year);
+        if (activeAlbum.genre) subParts.push(activeAlbum.genre);
+        subEl.textContent = subParts.filter(Boolean).join(' · ');
+      }
+      if (statsEl) {
+        statsEl.replaceChildren();
+        const addStatPill = (text, extraClass = '') => {
+          const pill = document.createElement('span');
+          pill.className = `album-stat-pill${extraClass ? ` ${extraClass}` : ''}`;
+          pill.textContent = text;
+          statsEl.appendChild(pill);
+        };
+        addStatPill(`${activeAlbum.trackCount} track${activeAlbum.trackCount === 1 ? '' : 's'}`);
+        const durLabel = this._formatAlbumDuration(activeAlbum.totalDurationSec);
+        if (durLabel) addStatPill(durLabel);
+        if (activeAlbum.avgBpm > 0) addStatPill(`Avg ${activeAlbum.avgBpm} BPM`);
+        if (activeAlbum.avgStars > 0) addStatPill(`★ ${activeAlbum.avgStars}`, 'star');
+        if (activeAlbum.isLossless) addStatPill('HI-RES LOSSLESS', 'lossless');
+        else if (activeAlbum.formats.length) addStatPill(activeAlbum.formats.slice(0, 2).join(' / '));
+      }
+      return;
+    }
+
+    // Gallery Grid vs Flat Table mode
+    detailHeroEl?.classList.add('hidden');
+    toolbarEl?.classList.remove('hidden');
+    if (queueTitleEl) queueTitleEl.textContent = 'Albums Collection';
+
+    if (this.albumsViewMode === 'table') {
+      workspaceEl.classList.remove('albums-workspace-full');
+      gridScrollEl?.classList.add('hidden');
+      tableViewportEl.classList.remove('hidden');
+      listSortEl?.classList.remove('hidden');
+      if (searchInputEl) {
+        searchInputEl.placeholder = 'Search title, artist, #tag, bpm:120-130, key:8A, star:4+...';
+      }
+      return;
+    }
+
+    workspaceEl.classList.add('albums-workspace-full');
+    gridScrollEl?.classList.remove('hidden');
+    tableViewportEl.classList.add('hidden');
+    listSortEl?.classList.add('hidden');
+    if (searchInputEl) {
+      searchInputEl.placeholder = 'Search albums, artists, genres, year, or tracks...';
+    }
+
+    gridEl.replaceChildren();
+    if (!modeCollections.length) {
+      const emptyEl = document.createElement('div');
+      emptyEl.className = 'albums-empty-state';
+      emptyEl.textContent =
+        this.albumsMode === 'tagged'
+          ? 'No tracks with embedded Album tags match your filters yet. Switch to "All Releases" or edit an Album cell in Tracks.'
+          : 'No albums or release folders match your active search and filters.';
+      gridEl.appendChild(emptyEl);
+      return;
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const album of modeCollections) {
+      const card = document.createElement('article');
+      card.className = 'album-card';
+      card.tabIndex = 0;
+      card.dataset.albumId = album.id;
+      card.setAttribute('role', 'button');
+      card.setAttribute('aria-label', `${album.title} by ${album.artist}, ${album.trackCount} tracks`);
+
+      const artWrap = document.createElement('div');
+      artWrap.className = 'album-card-art';
+      artWrap.appendChild(this.buildAlbumCoverElement(album, 'card'));
+
+      // Top-left release / lossless badge
+      if (album.isLossless || album.kind === 'folder') {
+        const topBadge = document.createElement('span');
+        topBadge.className = `album-card-badge ${album.isLossless ? 'lossless' : 'folder'}`;
+        topBadge.textContent = album.isLossless ? 'LOSSLESS' : 'FOLDER';
+        artWrap.appendChild(topBadge);
+      }
+
+      // Top-right track count pill
+      const countBadge = document.createElement('span');
+      countBadge.className = 'album-card-count';
+      countBadge.textContent = `${album.trackCount}`;
+      countBadge.title = `${album.trackCount} track${album.trackCount === 1 ? '' : 's'}`;
+      artWrap.appendChild(countBadge);
+
+      // Hover quick-play / shuffle overlay
+      const overlay = document.createElement('div');
+      overlay.className = 'album-card-overlay';
+
+      const playBtn = document.createElement('button');
+      playBtn.type = 'button';
+      playBtn.className = 'album-overlay-play';
+      playBtn.textContent = '▶';
+      playBtn.title = `Play "${album.title}"`;
+      playBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.playAlbumCollection(album, false);
+      });
+
+      const shuffleBtn = document.createElement('button');
+      shuffleBtn.type = 'button';
+      shuffleBtn.className = 'album-overlay-shuffle';
+      shuffleBtn.textContent = '🔀';
+      shuffleBtn.title = `Shuffle "${album.title}"`;
+      shuffleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.playAlbumCollection(album, true);
+      });
+
+      overlay.appendChild(playBtn);
+      overlay.appendChild(shuffleBtn);
+      artWrap.appendChild(overlay);
+
+      const meta = document.createElement('div');
+      meta.className = 'album-card-meta';
+
+      const titleEl = document.createElement('div');
+      titleEl.className = 'album-card-title';
+      titleEl.textContent = album.title;
+      titleEl.title = album.title;
+
+      const subEl = document.createElement('div');
+      subEl.className = 'album-card-sub';
+      subEl.textContent = album.year ? `${album.artist} · ${album.year}` : album.artist;
+      subEl.title = subEl.textContent;
+
+      const footerRow = document.createElement('div');
+      footerRow.className = 'album-card-footer';
+
+      const techEl = document.createElement('span');
+      techEl.className = 'album-card-tech';
+      const fmtText = album.formats.slice(0, 2).join(' · ');
+      const durText = this._formatAlbumDuration(album.totalDurationSec);
+      techEl.textContent = [fmtText, durText].filter(Boolean).join(' · ') || `${album.trackCount} tracks`;
+
+      const ratingEl = document.createElement('span');
+      ratingEl.className = 'album-card-rating';
+      if (album.avgStars > 0) {
+        ratingEl.textContent = `★ ${album.avgStars}`;
+      } else if (album.favoriteCount > 0) {
+        ratingEl.textContent = `♥ ${album.favoriteCount}`;
+      }
+
+      footerRow.appendChild(techEl);
+      if (ratingEl.textContent) footerRow.appendChild(ratingEl);
+
+      meta.appendChild(titleEl);
+      meta.appendChild(subEl);
+      meta.appendChild(footerRow);
+
+      card.appendChild(artWrap);
+      card.appendChild(meta);
+
+      card.addEventListener('click', () => this.openAlbumDetail(album.id));
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          this.openAlbumDetail(album.id);
+        }
+      });
+
+      frag.appendChild(card);
+    }
+
+    gridEl.appendChild(frag);
+  }
+
+  /**
+   * Opens the Artist Detail drill-down view for a specific artist.
+   * @param {string} artistId - Target artist ID.
+   */
+  openArtistDetail(artistId) {
+    if (!artistId) return;
+    this.selectedArtistId = artistId;
+    this.selectedArtistReleaseId = null;
+    this.applyFiltersAndRender(true);
+    const activeArtist = this.artistCollections.find((a) => a.id === artistId);
+    if (activeArtist) {
+      this.setToast(`Opened Artist: "${activeArtist.name}" (${activeArtist.trackCount} tracks)`);
+    }
+  }
+
+  /**
+   * Closes Artist Detail drill-down and returns to the Artists Gallery Grid.
+   */
+  closeArtistDetail() {
+    if (!this.selectedArtistId) return;
+    this.selectedArtistId = null;
+    this.selectedArtistReleaseId = null;
+    this.applyFiltersAndRender(true);
+    this.setToast('Showing all Artists');
+  }
+
+  /**
+   * Plays an Artist collection (sequential or shuffled) and optionally starts Vibe Radio.
+   * @param {object} artist - Artist descriptor.
+   * @param {boolean} [shuffle=false] - Whether to shuffle playback order.
+   */
+  playArtistCollection(artist, shuffle = false) {
+    if (!artist || !Array.isArray(artist.tracks) || !artist.tracks.length) {
+      this.setToast('This artist has no playable tracks');
+      return;
+    }
+    this.selectedArtistId = artist.id;
+    this.selectedArtistReleaseId = null;
+    this.applyFiltersAndRender(true);
+    if (!this.displayedTracks.length) {
+      this.setToast(`No matching tracks for "${artist.name}"`);
+      return;
+    }
+    if (shuffle) {
+      const btnShuffle = document.getElementById('btnShuffle');
+      if (btnShuffle && !btnShuffle.classList.contains('active')) {
+        btnShuffle.click();
+      }
+      const randIdx = Math.floor(Math.random() * this.displayedTracks.length);
+      this.selectTrack(randIdx, true);
+    } else {
+      this.selectTrack(0, true);
+    }
+  }
+
+  /**
+   * Launches harmonic Vibe Radio anchored on the artist's highest-rated track.
+   * @param {object} artist - Artist descriptor.
+   */
+  startArtistVibeRadio(artist) {
+    if (!artist || !Array.isArray(artist.tracks) || !artist.tracks.length) return;
+    const bestTrack = [...artist.tracks].sort(
+      (a, b) => (Number(b.stars) || 0) - (Number(a.stars) || 0) || Number(Boolean(b.favorite)) - Number(Boolean(a.favorite))
+    )[0];
+    this.selectedArtistId = null;
+    this.selectedArtistReleaseId = null;
+    const audioPool = this._getTracksPoolForNav('tracks');
+    const bestKey = bestTrack?.filePath || bestTrack?.id;
+    const anchor = audioPool.find((t) => (t.filePath || t.id) === bestKey) || bestTrack;
+    this.activeNav = 'vibe';
+    document.querySelectorAll('.sidebar .nav-item').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.nav === 'vibe' || (btn.dataset.nav === 'explorer' && this.explorerOpen));
+    });
+    this.displayedTracks = buildVibeRadioQueue(anchor, audioPool, this.banditRewards);
+    this.renderAlbumsWorkspace();
+    this.renderArtistsWorkspace();
+    this.renderSmartPlaylistBar();
+    this.syncHeroPlaylistShowcase();
+    const idx = Math.max(0, this.displayedTracks.findIndex((t) => (t.filePath || t.id) === bestKey));
+    this.selectTrack(idx, true);
+    this.setToast(`Vibe Radio seeded from ${artist.name}: "${anchor?.title || ''}"`);
+  }
+
+  /**
+   * Renders the professional Artists Gallery Grid (circular portraits) and Discography Detail View.
+   */
+  renderArtistsWorkspace() {
+    const workspaceEl = document.getElementById('artistsWorkspace');
+    const toolbarEl = document.getElementById('artistsToolbar');
+    const detailHeroEl = document.getElementById('artistsDetailHero');
+    const discogEl = document.getElementById('artistDiscographyStrip');
+    const gridScrollEl = document.getElementById('artistsGridScroll');
+    const gridEl = document.getElementById('artistsGrid');
+    const tableViewportEl = document.getElementById('rbTableViewport');
+    const queueTitleEl = document.getElementById('queuePanelTitle');
+    const listSortEl = document.getElementById('listSortSelect');
+    const searchInputEl = document.getElementById('listSearchInput');
+    if (!workspaceEl || !gridEl || !tableViewportEl) return;
+
+    const isArtistsNav = this.activeNav === 'artists';
+    workspaceEl.classList.toggle('hidden', !isArtistsNav);
+    if (!isArtistsNav) {
+      workspaceEl.classList.remove('albums-workspace-full');
+      if (this.activeNav !== 'albums') {
+        tableViewportEl.classList.remove('hidden');
+        listSortEl?.classList.remove('hidden');
+        if (searchInputEl) {
+          searchInputEl.placeholder = 'Search title, artist, #tag, bpm:120-130, key:8A, star:4+...';
+        }
+      }
+      return;
+    }
+
+    const audioBase = this.catalog.filter((t) => !t.isVideo || isMusicVideoTagged(t));
+    const nonQueryFilters = { ...this.filterState, query: '' };
+    const smartFilteredPool = applyProSmartFilter(audioBase, nonQueryFilters, audioBase[0] || null);
+
+    const allArtists = buildArtistCollections(smartFilteredPool, {
+      mode: 'all',
+      query: this.filterState.query,
+      sortBy: this.artistsSortBy
+    });
+    const modeArtists =
+      this.artistsMode === 'all'
+        ? allArtists
+        : buildArtistCollections(smartFilteredPool, {
+            mode: this.artistsMode,
+            query: this.filterState.query,
+            sortBy: this.artistsSortBy
+          });
+    this.artistCollections = modeArtists;
+
+    const multiCount = allArtists.filter((a) => a.trackCount >= 2).length;
+    const ratedCount = allArtists.filter((a) => a.avgStars > 0 || a.favoriteCount > 0).length;
+    document.querySelectorAll('#artistsModeGroup [data-artist-mode]').forEach((btn) => {
+      const m = btn.dataset.artistMode;
+      btn.classList.toggle('active', m === this.artistsMode);
+      if (m === 'all') btn.textContent = `All Artists (${allArtists.length})`;
+      else if (m === 'multi') btn.textContent = `2+ Tracks (${multiCount})`;
+      else if (m === 'rated') btn.textContent = `Top Rated ★ (${ratedCount})`;
+    });
+    document.querySelectorAll('#artistsViewGroup [data-artist-view]').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.artistView === this.artistsViewMode);
+    });
+    const sortSel = document.getElementById('artistsSortSelect');
+    if (sortSel && sortSel.value !== this.artistsSortBy) sortSel.value = this.artistsSortBy;
+
+    const activeArtist = this.selectedArtistId
+      ? buildArtistCollections(audioBase, { mode: 'all' }).find((a) => a.id === this.selectedArtistId) || null
+      : null;
+    if (this.selectedArtistId && !activeArtist) {
+      this.selectedArtistId = null;
+      this.selectedArtistReleaseId = null;
+    }
+
+    if (activeArtist) {
+      workspaceEl.classList.remove('albums-workspace-full');
+      toolbarEl?.classList.add('hidden');
+      gridScrollEl?.classList.add('hidden');
+      detailHeroEl?.classList.remove('hidden');
+      tableViewportEl.classList.remove('hidden');
+      listSortEl?.classList.remove('hidden');
+      if (searchInputEl) {
+        searchInputEl.placeholder = `Search inside "${activeArtist.name}"...`;
+      }
+      if (queueTitleEl) queueTitleEl.textContent = `Artist · ${activeArtist.name}`;
+
+      const artHost = document.getElementById('artistDetailArt');
+      const kindEl = document.getElementById('artistDetailKind');
+      const nameEl = document.getElementById('artistDetailName');
+      const subEl = document.getElementById('artistDetailSubtitle');
+      const statsEl = document.getElementById('artistDetailStats');
+
+      if (artHost) artHost.replaceChildren(this.buildArtistCoverElement(activeArtist, 'detail'));
+      if (kindEl) {
+        kindEl.textContent = activeArtist.isGeneric ? 'STUDIO COLLECTION' : 'STUDIO ARTIST';
+      }
+      if (nameEl) nameEl.textContent = activeArtist.name;
+      if (subEl) {
+        subEl.textContent = activeArtist.genres.length
+          ? activeArtist.genres.join(' · ')
+          : `${activeArtist.releaseCount} release${activeArtist.releaseCount === 1 ? '' : 's'} in library`;
+      }
+      if (statsEl) {
+        statsEl.replaceChildren();
+        const addPill = (text, extraClass = '') => {
+          const pill = document.createElement('span');
+          pill.className = `album-stat-pill${extraClass ? ` ${extraClass}` : ''}`;
+          pill.textContent = text;
+          statsEl.appendChild(pill);
+        };
+        addPill(`${activeArtist.trackCount} track${activeArtist.trackCount === 1 ? '' : 's'}`);
+        addPill(`${activeArtist.releaseCount} release${activeArtist.releaseCount === 1 ? '' : 's'}`);
+        const durLabel = this._formatAlbumDuration(activeArtist.totalDurationSec);
+        if (durLabel) addPill(durLabel);
+        if (activeArtist.avgBpm > 0) addPill(`Avg ${activeArtist.avgBpm} BPM`);
+        if (activeArtist.avgStars > 0) addPill(`★ ${activeArtist.avgStars}`, 'star');
+        if (activeArtist.isLossless) addPill('HI-RES LOSSLESS', 'lossless');
+        else if (activeArtist.formats.length) addPill(activeArtist.formats.slice(0, 2).join(' / '));
+      }
+
+      if (discogEl) {
+        discogEl.replaceChildren();
+        if (activeArtist.releases.length > 0) {
+          discogEl.classList.remove('hidden');
+          const allChip = document.createElement('button');
+          allChip.type = 'button';
+          allChip.className = `artist-discog-chip${!this.selectedArtistReleaseId ? ' active' : ''}`;
+          allChip.textContent = `All Releases (${activeArtist.trackCount})`;
+          allChip.addEventListener('click', () => {
+            this.selectedArtistReleaseId = null;
+            this.applyFiltersAndRender(true);
+          });
+          discogEl.appendChild(allChip);
+
+          for (const rel of activeArtist.releases) {
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = `artist-discog-chip${this.selectedArtistReleaseId === rel.id ? ' active' : ''}`;
+            chip.textContent = `${rel.title} (${rel.trackCount})`;
+            chip.title = `${rel.kind === 'album' ? 'Album' : 'Folder'}: ${rel.title}`;
+            chip.addEventListener('click', () => {
+              this.selectedArtistReleaseId = this.selectedArtistReleaseId === rel.id ? null : rel.id;
+              this.applyFiltersAndRender(true);
+            });
+            discogEl.appendChild(chip);
+          }
+        } else {
+          discogEl.classList.add('hidden');
+        }
+      }
+      return;
+    }
+
+    detailHeroEl?.classList.add('hidden');
+    toolbarEl?.classList.remove('hidden');
+    if (queueTitleEl) queueTitleEl.textContent = 'Artists Collection';
+
+    if (this.artistsViewMode === 'table') {
+      workspaceEl.classList.remove('albums-workspace-full');
+      gridScrollEl?.classList.add('hidden');
+      tableViewportEl.classList.remove('hidden');
+      listSortEl?.classList.remove('hidden');
+      if (searchInputEl) {
+        searchInputEl.placeholder = 'Search title, artist, #tag, bpm:120-130, key:8A, star:4+...';
+      }
+      return;
+    }
+
+    workspaceEl.classList.add('albums-workspace-full');
+    gridScrollEl?.classList.remove('hidden');
+    tableViewportEl.classList.add('hidden');
+    listSortEl?.classList.add('hidden');
+    if (searchInputEl) {
+      searchInputEl.placeholder = 'Search artists, genres, albums, or tracks...';
+    }
+
+    gridEl.replaceChildren();
+    if (!modeArtists.length) {
+      const emptyEl = document.createElement('div');
+      emptyEl.className = 'albums-empty-state';
+      emptyEl.textContent = 'No artists match your active search or filters.';
+      gridEl.appendChild(emptyEl);
+      return;
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const artist of modeArtists) {
+      const card = document.createElement('article');
+      card.className = 'artist-card';
+      card.tabIndex = 0;
+      card.dataset.artistId = artist.id;
+      card.setAttribute('role', 'button');
+      card.setAttribute('aria-label', `${artist.name}, ${artist.trackCount} tracks`);
+
+      const artWrap = document.createElement('div');
+      artWrap.className = 'artist-card-art';
+      artWrap.appendChild(this.buildArtistCoverElement(artist, 'card'));
+
+      const overlay = document.createElement('div');
+      overlay.className = 'artist-card-overlay';
+
+      const playBtn = document.createElement('button');
+      playBtn.type = 'button';
+      playBtn.className = 'album-overlay-play';
+      playBtn.textContent = '▶';
+      playBtn.title = `Play ${artist.name}`;
+      playBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.playArtistCollection(artist, false);
+      });
+
+      const shuffleBtn = document.createElement('button');
+      shuffleBtn.type = 'button';
+      shuffleBtn.className = 'album-overlay-shuffle';
+      shuffleBtn.textContent = '🔀';
+      shuffleBtn.title = `Shuffle ${artist.name}`;
+      shuffleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.playArtistCollection(artist, true);
+      });
+
+      overlay.appendChild(playBtn);
+      overlay.appendChild(shuffleBtn);
+      artWrap.appendChild(overlay);
+
+      const meta = document.createElement('div');
+      meta.className = 'artist-card-meta';
+
+      const nameEl = document.createElement('div');
+      nameEl.className = 'artist-card-name';
+      nameEl.textContent = artist.name;
+      nameEl.title = artist.name;
+
+      const subEl = document.createElement('div');
+      subEl.className = 'artist-card-sub';
+      const relPart = `${artist.releaseCount} release${artist.releaseCount === 1 ? '' : 's'}`;
+      const trkPart = `${artist.trackCount} track${artist.trackCount === 1 ? '' : 's'}`;
+      subEl.textContent = artist.primaryGenre ? `${artist.primaryGenre} · ${trkPart}` : `${trkPart} · ${relPart}`;
+      subEl.title = `${trkPart} · ${relPart}`;
+
+      const footerRow = document.createElement('div');
+      footerRow.className = 'artist-card-footer';
+
+      const techEl = document.createElement('span');
+      techEl.className = 'album-card-tech';
+      techEl.textContent = artist.isLossless ? 'LOSSLESS' : (artist.formats.slice(0, 2).join(' · ') || 'AUDIO');
+      footerRow.appendChild(techEl);
+
+      if (artist.avgStars > 0) {
+        const ratingEl = document.createElement('span');
+        ratingEl.className = 'album-card-rating';
+        ratingEl.textContent = `★ ${artist.avgStars}`;
+        footerRow.appendChild(ratingEl);
+      } else if (artist.favoriteCount > 0) {
+        const favEl = document.createElement('span');
+        favEl.className = 'album-card-rating';
+        favEl.textContent = `♥ ${artist.favoriteCount}`;
+        footerRow.appendChild(favEl);
+      }
+
+      meta.appendChild(nameEl);
+      meta.appendChild(subEl);
+      meta.appendChild(footerRow);
+
+      card.appendChild(artWrap);
+      card.appendChild(meta);
+
+      card.addEventListener('click', () => this.openArtistDetail(artist.id));
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          this.openArtistDetail(artist.id);
         }
       });
 
@@ -5013,6 +6280,62 @@ class VantaStudioApp {
   }
 
   /**
+   * Toggles video playback from either the Right Dock mini stage or Theater stage.
+   * Uses Option A (auto-switch): pauses active music (DSP or WASAPI) before playing an
+   * independent video so music and video audio never overlap.
+   */
+  async _toggleVideoStagePlayPause() {
+    const activeTrack = this.displayedTracks[this.activeTrackIndex];
+    if (activeTrack?.isVideo) {
+      const nextLabel = this.isPlaying ? '⏸ Paused' : '▶ Playing';
+      this.togglePlay();
+      if (this.theaterOpen) this._flashTheaterFeedback(nextLabel);
+      return;
+    }
+
+    const videoTrack = this._resolveLoadedVideoTrack();
+    if (!this._hasLoadedVideo() && !videoTrack?.filePath) {
+      this.setToast('Select a video file in your library first');
+      return;
+    }
+
+    if (!this._hasLoadedVideo() && videoTrack?.filePath) {
+      const url = this.buildVideoStreamUrl(videoTrack, this.activeVideoAudioIdx, this.studioSeekOffsetSec);
+      this.videoEl.src = url;
+      this._lastLoadedVideoUrl = url;
+    }
+
+    if (this.videoEl.paused) {
+      const pausedMusic = Boolean(this.isPlaying);
+      if (pausedMusic) {
+        this.pausePlayback();
+      }
+      this.audioEngine.bindElements(this.audioEl, this.videoEl, this.deckBEl);
+      await this.audioEngine.resumeEngine();
+      this.videoEl.muted = false;
+      try {
+        await this.videoEl.play();
+        if (this.theaterOpen) {
+          this._flashTheaterFeedback('▶ Playing');
+        } else {
+          this.setToast(pausedMusic ? 'Playing Video (Music Paused)' : 'Playing Video');
+        }
+      } catch (err) {
+        if (err?.name !== 'AbortError') {
+          this.setToast(`Video playback error: ${err.message}`);
+        }
+      }
+    } else {
+      this.videoEl.pause();
+      if (this.theaterOpen) {
+        this._flashTheaterFeedback('⏸ Paused');
+      } else {
+        this.setToast('Video Paused');
+      }
+    }
+  }
+
+  /**
    * Wires all 4K Theater Stage controls (Seekbar, Play/Pause, Volume, Speed, Loop, Fullscreen, Subtitles, Ambilight).
    */
   bindTheaterEvents() {
@@ -5038,20 +6361,7 @@ class VantaStudioApp {
     };
 
     const toggleTheaterPlayPause = () => {
-      const activeTrack = this.displayedTracks[this.activeTrackIndex];
-      if (activeTrack?.isVideo) {
-        const nextLabel = this.isPlaying ? '⏸ Paused' : '▶ Playing';
-        this.togglePlay();
-        this._flashTheaterFeedback(nextLabel);
-      } else if (this._hasLoadedVideo()) {
-        if (this.videoEl.paused) {
-          this.videoEl.play().catch(() => {});
-          this._flashTheaterFeedback('▶ Playing');
-        } else {
-          this.videoEl.pause();
-          this._flashTheaterFeedback('⏸ Paused');
-        }
-      }
+      void this._toggleVideoStagePlayPause().catch(() => {});
     };
 
     const seekVideoToSec = (targetSec) => {
@@ -5086,7 +6396,17 @@ class VantaStudioApp {
     };
 
     document.getElementById('btnOpenTheater')?.addEventListener('click', openTheaterIfReady);
-    dockMount?.addEventListener('dblclick', openTheaterIfReady);
+    let dockClickTimer = null;
+    dockMount?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      clearTimeout(dockClickTimer);
+      dockClickTimer = setTimeout(() => toggleTheaterPlayPause(), 190);
+    });
+    dockMount?.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      clearTimeout(dockClickTimer);
+      openTheaterIfReady();
+    });
     document.getElementById('btnTheaterClose')?.addEventListener('click', () => this.openTheaterStage(false));
     document.getElementById('btnTheaterFullscreen')?.addEventListener('click', toggleFullscreen);
 
@@ -5400,12 +6720,8 @@ class VantaStudioApp {
     this.setupCustomCombo('deviceProfileCombo', profileItems, this.audioEngine.state.deviceProfile, async (item) => {
       const next = item.value;
       this.audioEngine.state.deviceProfile = next;
-      if (next !== 'Bit-Perfect (Flat)' && this.engineMode === 'wasapi') {
-        await this.setEngineMode('dsp', true);
-      } else if (this.engineMode === 'dsp') {
-        await this.audioEngine.resumeEngine();
-      }
       this.audioEngine.syncDspState();
+      await this.ensurePlaybackEngineForCurrentDsp(false);
       this._saveProDspSettings();
       this.updateStreamTelemetry();
       this.setToast(`Acoustic Output Profile: ${next}`);
@@ -5467,6 +6783,108 @@ class VantaStudioApp {
 
     document.getElementById('btnClearActiveRule')?.addEventListener('click', () => {
       this.clearActiveSmartRule();
+    });
+
+    // 4B. Albums Gallery Toolbar & Detail Drill-Down Controls
+    document.querySelectorAll('#albumsModeGroup [data-album-mode]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const nextMode = btn.dataset.albumMode || 'all';
+        if (this.albumsMode === nextMode) return;
+        this.albumsMode = nextMode;
+        this.selectedAlbumId = null;
+        this.applyFiltersAndRender(true);
+      });
+    });
+
+    document.getElementById('albumsSortSelect')?.addEventListener('change', (e) => {
+      this.albumsSortBy = e.target.value || 'smart';
+      this.renderAlbumsWorkspace();
+    });
+
+    document.querySelectorAll('#albumsViewGroup [data-album-view]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const nextView = btn.dataset.albumView || 'grid';
+        if (this.albumsViewMode === nextView) return;
+        this.albumsViewMode = nextView;
+        this.selectedAlbumId = null;
+        this.applyFiltersAndRender(true);
+      });
+    });
+
+    document.getElementById('btnAlbumsBack')?.addEventListener('click', () => {
+      this.closeAlbumDetail();
+    });
+
+    document.getElementById('btnAlbumPlayAll')?.addEventListener('click', () => {
+      const audioPool = this._getTracksPoolForNav('tracks');
+      const album = buildAlbumCollections(audioPool, { mode: 'all' }).find((a) => a.id === this.selectedAlbumId);
+      if (album) this.playAlbumCollection(album, false);
+    });
+
+    document.getElementById('btnAlbumShuffle')?.addEventListener('click', () => {
+      const audioPool = this._getTracksPoolForNav('tracks');
+      const album = buildAlbumCollections(audioPool, { mode: 'all' }).find((a) => a.id === this.selectedAlbumId);
+      if (album) this.playAlbumCollection(album, true);
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !this.theaterOpen && !document.fullscreenElement) {
+        if (this.activeNav === 'albums' && this.selectedAlbumId) {
+          this.closeAlbumDetail();
+        } else if (this.activeNav === 'artists' && this.selectedArtistId) {
+          this.closeArtistDetail();
+        }
+      }
+    });
+
+    // 4C. Artists Gallery Toolbar & Discography Detail Controls
+    document.querySelectorAll('#artistsModeGroup [data-artist-mode]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const nextMode = btn.dataset.artistMode || 'all';
+        if (this.artistsMode === nextMode) return;
+        this.artistsMode = nextMode;
+        this.selectedArtistId = null;
+        this.selectedArtistReleaseId = null;
+        this.applyFiltersAndRender(true);
+      });
+    });
+
+    document.getElementById('artistsSortSelect')?.addEventListener('change', (e) => {
+      this.artistsSortBy = e.target.value || 'curated';
+      this.renderArtistsWorkspace();
+    });
+
+    document.querySelectorAll('#artistsViewGroup [data-artist-view]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const nextView = btn.dataset.artistView || 'grid';
+        if (this.artistsViewMode === nextView) return;
+        this.artistsViewMode = nextView;
+        this.selectedArtistId = null;
+        this.selectedArtistReleaseId = null;
+        this.applyFiltersAndRender(true);
+      });
+    });
+
+    document.getElementById('btnArtistsBack')?.addEventListener('click', () => {
+      this.closeArtistDetail();
+    });
+
+    document.getElementById('btnArtistPlayAll')?.addEventListener('click', () => {
+      const audioPool = this._getTracksPoolForNav('tracks');
+      const artist = buildArtistCollections(audioPool, { mode: 'all' }).find((a) => a.id === this.selectedArtistId);
+      if (artist) this.playArtistCollection(artist, false);
+    });
+
+    document.getElementById('btnArtistShuffle')?.addEventListener('click', () => {
+      const audioPool = this._getTracksPoolForNav('tracks');
+      const artist = buildArtistCollections(audioPool, { mode: 'all' }).find((a) => a.id === this.selectedArtistId);
+      if (artist) this.playArtistCollection(artist, true);
+    });
+
+    document.getElementById('btnArtistVibeRadio')?.addEventListener('click', () => {
+      const audioPool = this._getTracksPoolForNav('tracks');
+      const artist = buildArtistCollections(audioPool, { mode: 'all' }).find((a) => a.id === this.selectedArtistId);
+      if (artist) this.startArtistVibeRadio(artist);
     });
 
     document.getElementById('btnHeroPlayAll')?.addEventListener('click', () => {
@@ -5762,11 +7180,8 @@ class VantaStudioApp {
           return;
         }
 
-        if (active && flag !== 'limiter' && this.engineMode === 'wasapi') {
-          await this.setEngineMode('dsp', true);
-        } else if (this.engineMode === 'dsp') {
-          await this.audioEngine.resumeEngine();
-        }
+        const studioOnlyFlags = new Set(['spatial', 'exciter', 'reverb', 'karaoke', 'vinyl', 'saturation', 'nightMode']);
+        await this.ensurePlaybackEngineForCurrentDsp(active && studioOnlyFlags.has(flag));
         if (flag === 'vinyl' && active) this.switchStage('vinyl');
         if (flag === 'karaoke' && active) this.switchStage('lyrics');
         this.setToast(`DSP [${flag.toUpperCase()}] ${active ? 'ENABLED' : 'BYPASSED'}`);
@@ -5774,6 +7189,7 @@ class VantaStudioApp {
     });
 
     this._bindDspRackModal();
+    this._bindSignalPathModal();
 
     document.getElementById('btnCopyLyrics')?.addEventListener('click', async () => {
       const text = this._currentFormattedLyrics || '';
@@ -6122,15 +7538,12 @@ class VantaStudioApp {
         btn.textContent = presetName;
         btn.addEventListener('click', async () => {
           this.audioEngine.bindElements(this.audioEl, this.videoEl, this.deckBEl);
-          if (presetName !== 'Flat Reference' && this.engineMode === 'wasapi') {
-            await this.setEngineMode('dsp', true);
-          } else if (this.engineMode === 'dsp') {
-            await this.audioEngine.resumeEngine();
-          }
           this.audioEngine.applyEqPreset(presetName);
+          await this.ensurePlaybackEngineForCurrentDsp(false);
           this.renderEqColumns();
           this._syncAllDspUi();
           this._saveProDspSettings();
+          this.updateStreamTelemetry();
           this.setToast(`10-Band EQ Preset: ${presetName}`);
         });
         presetRow.appendChild(btn);
@@ -6139,12 +7552,12 @@ class VantaStudioApp {
 
     // Bind fine DSP parameter sliders
     const sliderBindings = [
-      { id: 'dspSpatialWidth', param: 'spatialWidthPct', flag: 'spatial' },
-      { id: 'dspCrossfeedLevel', param: 'crossfeedLevelPct', flag: 'crossfeed' },
-      { id: 'dspBassBoostDb', param: 'bassBoostDb', flag: 'bassBoost' },
-      { id: 'dspExciterMix', param: 'exciterMixPct', flag: 'exciter' },
-      { id: 'dspReverbMix', param: 'reverbMixPct', flag: 'reverb' },
-      { id: 'dspPitchSemitones', param: 'pitchSemitones', flag: null }
+      { id: 'dspSpatialWidth', param: 'spatialWidthPct', flag: 'spatial', studioOnly: true },
+      { id: 'dspCrossfeedLevel', param: 'crossfeedLevelPct', flag: 'crossfeed', studioOnly: false },
+      { id: 'dspBassBoostDb', param: 'bassBoostDb', flag: 'bassBoost', studioOnly: false },
+      { id: 'dspExciterMix', param: 'exciterMixPct', flag: 'exciter', studioOnly: true },
+      { id: 'dspReverbMix', param: 'reverbMixPct', flag: 'reverb', studioOnly: true },
+      { id: 'dspPitchSemitones', param: 'pitchSemitones', flag: null, studioOnly: true }
     ];
     for (const cfg of sliderBindings) {
       document.getElementById(cfg.id)?.addEventListener('input', async (e) => {
@@ -6153,12 +7566,9 @@ class VantaStudioApp {
         if (cfg.flag && !this.audioEngine.state[cfg.flag]) {
           this.audioEngine.state[cfg.flag] = true;
         }
-        if (this.engineMode === 'wasapi' && (cfg.flag || Math.abs(num) > 0)) {
-          await this.setEngineMode('dsp', true);
-        } else if (this.engineMode === 'dsp') {
-          await this.audioEngine.resumeEngine();
-        }
         this.audioEngine.setDspParam(cfg.param, num);
+        const needsStudio = cfg.studioOnly && (Boolean(cfg.flag) || Math.abs(num) > 0);
+        await this.ensurePlaybackEngineForCurrentDsp(needsStudio);
         this._syncAllDspUi();
         this._saveProDspSettings();
       });
@@ -6168,6 +7578,7 @@ class VantaStudioApp {
       this.audioEngine.setDspParam('pitchSemitones', 0);
       this._syncAllDspUi();
       this._saveProDspSettings();
+      this.updateStreamTelemetry();
       this.setToast('Pitch Key Shift reset to 0 st');
     });
 
@@ -6178,8 +7589,9 @@ class VantaStudioApp {
       this.renderEqColumns();
       this._syncAllDspUi();
       this._saveProDspSettings();
+      this.syncNativeWasapiDsp();
       this.updateStreamTelemetry();
-      this.setToast('Studio DSP reset to Bit-Perfect transparency (EBU R128 + Limiter active)');
+      this.setToast('DSP reset to Bit-Perfect transparency (Unity 0 dB)');
     });
 
     this._syncAllDspUi();

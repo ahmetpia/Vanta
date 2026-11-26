@@ -454,6 +454,40 @@ class NativeWasapiPlayer {
     this.currentFilePath = '';
     this.currentProbe = null;
     this.currentOptions = {};
+    this.activeSampleRate = 0;
+    this.activeChannels = 0;
+    this.activeUseDop = false;
+    this.nextQueued = null;
+  }
+
+  /**
+   * Tears down any staged 0 ms gapless next-track FFmpeg process or named-pipe server.
+   */
+  clearQueuedNext() {
+    const q = this.nextQueued;
+    this.nextQueued = null;
+    if (!q) return;
+    if (q.pcmSocket) {
+      try {
+        q.pcmSocket.destroy();
+      } catch {
+        // Ignore
+      }
+    }
+    if (q.pcmServer) {
+      try {
+        q.pcmServer.close();
+      } catch {
+        // Ignore
+      }
+    }
+    if (q.ffmpegProc) {
+      try {
+        q.ffmpegProc.kill();
+      } catch {
+        // Ignore
+      }
+    }
   }
 
   /**
@@ -461,6 +495,10 @@ class NativeWasapiPlayer {
    */
   stop() {
     this.sessionId++;
+    this.clearQueuedNext();
+    this.activeSampleRate = 0;
+    this.activeChannels = 0;
+    this.activeUseDop = false;
     if (this.ctrlSocket) {
       try {
         this.ctrlSocket.write('STOP\n');
@@ -503,6 +541,10 @@ class NativeWasapiPlayer {
    */
   async stopAsync() {
     this.sessionId++;
+    this.clearQueuedNext();
+    this.activeSampleRate = 0;
+    this.activeChannels = 0;
+    this.activeUseDop = false;
     const proc = this.engineProc;
     const hadProc = Boolean(proc && proc.exitCode === null && !proc.killed);
 
@@ -611,8 +653,10 @@ class NativeWasapiPlayer {
       throw new Error('Missing ffmpeg-static or vanta-audio-engine.exe');
     }
 
+    const safeDspSpec = sanitizeNativeDspSpec(options.dspSpec);
     this.currentFilePath = safePath;
     this.currentOptions = options;
+    this.activeUseDop = useNativeDop;
     this.seekOffsetSec = Math.max(0, Number(options.seekSec) || 0);
 
     const probe = options.probe || (await probeAudioStreamInfo(safePath));
@@ -665,11 +709,13 @@ class NativeWasapiPlayer {
       // Decode 1-bit DSD streams (>768 kHz raw clock) at studio DXD 352.8 kHz; cap PCM at 768 kHz
       const targetRate = rawRate > 768000 ? 352800 : Math.max(8000, Math.min(768000, rawRate));
       const targetChannels = Math.max(1, Math.min(8, Number(probe.channels) || 2));
+      const resampleArgs = buildHighPrecisionResampleArgs(rawRate, targetRate);
 
       ffArgs.push(
         '-i',
         safePath,
         '-vn',
+        ...resampleArgs,
         '-f',
         's32le',
         '-acodec',
@@ -692,6 +738,9 @@ class NativeWasapiPlayer {
         '--ctrl-pipe',
         pipeName
       ];
+      if (safeDspSpec) {
+        engArgs.push('--dsp', safeDspSpec);
+      }
       if (safeDeviceId) {
         engArgs.push('--device', safeDeviceId);
       }
@@ -730,12 +779,36 @@ class NativeWasapiPlayer {
           const evt = JSON.parse(line);
           if (evt.event === 'spectrum') {
             evt.positionSec = this.seekOffsetSec + (evt.positionMs || 0) / 1000;
-            evt.durationSec = probe.durationSec || 0;
+            evt.durationSec = (this.currentProbe?.durationSec) || probe.durationSec || 0;
           } else if (evt.event === 'ready') {
             receivedReady = true;
+            this.activeSampleRate = Number(evt.sampleRate) || 0;
+            this.activeChannels = Number(evt.channels) || 0;
             evt.codec = probe.codec;
             evt.bitrateKbps = probe.bitrateKbps;
             evt.durationSec = probe.durationSec;
+          } else if (evt.event === 'track_advanced') {
+            if (this.nextQueued && this.nextQueued.seq === Number(evt.seq)) {
+              const promoted = this.nextQueued;
+              this.nextQueued = null;
+              const prevFfmpeg = this.ffmpegProc;
+              this.ffmpegProc = promoted.ffmpegProc;
+              this.currentFilePath = promoted.filePath;
+              this.currentProbe = promoted.probe;
+              this.seekOffsetSec = 0;
+              evt.filePath = promoted.filePath;
+              evt.probe = promoted.probe;
+              evt.codec = promoted.probe?.codec;
+              evt.bitrateKbps = promoted.probe?.bitrateKbps;
+              evt.durationSec = promoted.probe?.durationSec;
+              if (prevFfmpeg && prevFfmpeg !== this.ffmpegProc) {
+                try {
+                  prevFfmpeg.kill();
+                } catch {
+                  // Ignore cleanup
+                }
+              }
+            }
           } else if (evt.event === 'dop_unsupported') {
             dopUnsupported = true;
             logger.info('WasapiEngine', 'DoP v1.1 unsupported by endpoint; falling back to DXD PCM', {
@@ -764,6 +837,126 @@ class NativeWasapiPlayer {
       }
       this.onEvent({ event: 'closed' });
     });
+  }
+
+  /**
+   * Queues a matching-rate next PCM track over an auxiliary named pipe so the open
+   * C++ WASAPI Exclusive session transitions seamlessly with 0 ms gap.
+   * @param {string} filePath - Next audio file path.
+   * @param {object} [options={}] - Playback queue options ({ seq, probe, dop }).
+   * @returns {Promise<{ ok: boolean, queued: boolean, reason?: string, seq?: number, probe?: object }>}
+   */
+  async queueNext(filePath, options = {}) {
+    const safePath = validateSafeFilePath(filePath, { allowedExtensions: BRIDGE_MEDIA_EXTENSIONS });
+    if (!safePath) {
+      return { ok: false, queued: false, reason: 'invalid_path' };
+    }
+    if (
+      !this.engineProc ||
+      this.engineProc.exitCode !== null ||
+      this.engineProc.killed ||
+      !this.ctrlSocket ||
+      this.ctrlSocket.destroyed ||
+      this.activeUseDop ||
+      Boolean(options.dop) ||
+      isNativeDsdFile(safePath)
+    ) {
+      return { ok: false, queued: false, reason: 'ineligible' };
+    }
+    const ffmpegBin = resolveFfmpegBinary();
+    if (!ffmpegBin) {
+      return { ok: false, queued: false, reason: 'no_ffmpeg' };
+    }
+
+    const mySession = this.sessionId;
+    const probe = options.probe || (await probeAudioStreamInfo(safePath));
+    if (mySession !== this.sessionId) {
+      return { ok: false, queued: false, reason: 'session_changed' };
+    }
+
+    const rawRate = Number(probe.sampleRate) || 48000;
+    const targetRate = rawRate > 768000 ? 352800 : Math.max(8000, Math.min(768000, rawRate));
+    const targetChannels = Math.max(1, Math.min(8, Number(probe.channels) || 2));
+
+    if (
+      this.activeSampleRate <= 0 ||
+      targetRate !== this.activeSampleRate ||
+      targetChannels !== this.activeChannels
+    ) {
+      return { ok: false, queued: false, reason: 'format_mismatch', probe };
+    }
+
+    this.clearQueuedNext();
+    this.sendCommand('CLEAR_QUEUE');
+
+    const seq = Math.max(1, Number(options.seq) || Date.now());
+    const pcmPipeName = `\\\\.\\pipe\\vanta_pcm_${process.pid}_${++pipeSeq}`;
+    const resampleArgs = buildHighPrecisionResampleArgs(rawRate, targetRate);
+    const ffArgs = [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-i',
+      safePath,
+      '-vn',
+      ...resampleArgs,
+      '-f',
+      's32le',
+      '-acodec',
+      'pcm_s32le',
+      '-ac',
+      String(targetChannels),
+      '-ar',
+      String(targetRate),
+      '-'
+    ];
+
+    const nextFfmpeg = spawn(ffmpegBin, ffArgs, { windowsHide: true });
+    const staged = {
+      seq,
+      filePath: safePath,
+      probe,
+      ffmpegProc: nextFfmpeg,
+      pcmServer: null,
+      pcmSocket: null
+    };
+
+    const pcmServer = net.createServer((socket) => {
+      staged.pcmSocket = socket;
+      socket.on('error', () => {
+        // Ignore early EPIPE if user skips track
+      });
+      nextFfmpeg.stdout.pipe(socket);
+      try {
+        pcmServer.close();
+      } catch {
+        // Ignore close after single client handoff
+      }
+    });
+    staged.pcmServer = pcmServer;
+    this.nextQueued = staged;
+
+    await new Promise((resolve) => {
+      pcmServer.listen(pcmPipeName, resolve);
+    });
+    if (mySession !== this.sessionId || this.nextQueued !== staged) {
+      try {
+        nextFfmpeg.kill();
+        pcmServer.close();
+      } catch {
+        // Ignore
+      }
+      return { ok: false, queued: false, reason: 'cancelled' };
+    }
+
+    this.sendCommand(`QUEUE_PCM ${pcmPipeName} ${seq}`);
+    logger.info('WasapiEngine', 'Queued 0 ms gapless next PCM stream', {
+      filePath: safePath,
+      seq,
+      sampleRate: targetRate,
+      channels: targetChannels
+    });
+    return { ok: true, queued: true, seq, probe };
   }
 }
 
@@ -941,6 +1134,75 @@ async function writeFfmpegMetadataOnDisk(filePath, patch = {}) {
   }
 }
 
+/**
+ * Builds high-precision FFmpeg `aresample` filter arguments (64-bit `dblp` internal precision,
+ * 128-tap Kaiser-windowed sinc with beta=14, 4096 phases) only when sample-rate conversion or
+ * explicit dithered downsampling is required. Returns an empty array for native-rate PCM passthrough.
+ * @param {number} sourceRate - Input stream sample rate in Hz.
+ * @param {number} targetRate - Target output sample rate in Hz.
+ * @param {{ force?: boolean, ditherMethod?: string }} [options={}] - Optional filter overrides.
+ * @returns {string[]} FFmpeg CLI argument array.
+ */
+function buildHighPrecisionResampleArgs(sourceRate, targetRate, options = {}) {
+  const src = Number(sourceRate) || 0;
+  const dst = Number(targetRate) || 0;
+  const needsRateChange = dst > 0 && (src <= 0 || Math.round(src) !== Math.round(dst));
+  if (!needsRateChange && options.force !== true) {
+    return [];
+  }
+
+  const params = [
+    'resampler=swr',
+    'tsf=dblp',
+    'filter_type=kaiser',
+    'filter_size=128',
+    'phase_shift=12',
+    'kaiser_beta=14',
+    'cutoff=0.95'
+  ];
+  if (dst > 0) params.push(`osr=${Math.round(dst)}`);
+  if (typeof options.ditherMethod === 'string' && /^[a-z_]+$/.test(options.ditherMethod)) {
+    params.push(`dither_method=${options.ditherMethod}`);
+  }
+  return ['-af', `aresample=${params.join(':')}`];
+}
+
+/**
+ * Sanitizes a PurePath 64 native DSP wire string (`b0,...,b9|bass|bassDb|xf|xfPct|limiter`).
+ * @param {string} [rawSpec=''] - Untrusted wire string.
+ * @returns {string} Validated DSP spec or empty string.
+ */
+function sanitizeNativeDspSpec(rawSpec = '') {
+  if (typeof rawSpec !== 'string') return '';
+  const trimmed = rawSpec.trim();
+  if (!trimmed || trimmed.length > 160) return '';
+  return /^[0-9.,\-+|]+$/.test(trimmed) ? trimmed : '';
+}
+
+/**
+ * Serializes renderer DSP state into the PurePath 64 native WASAPI engine wire format:
+ * `b0,b1,...,b9|bassFlag|bassDb|crossfeedFlag|crossfeedPct|limiterFlag`.
+ * @param {object} [state={}] - DSP state or precomputed `bandGains` array.
+ * @returns {string} Compact PurePath 64 specification string.
+ */
+function serializeNativeDspConfig(state = {}) {
+  const clamp = (val, lo, hi, fallback) => {
+    const n = Number(val);
+    return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : fallback;
+  };
+  const fmt = (n) => Number(n.toFixed(2)).toString();
+  const rawBands = Array.isArray(state.bandGains)
+    ? state.bandGains
+    : (state.eqEnabled && Array.isArray(state.gains) ? state.gains : []);
+  const bands = Array.from({ length: 10 }, (_, idx) => fmt(clamp(rawBands[idx], -12, 12, 0)));
+  const bass = state.bassBoost || state.bass ? 1 : 0;
+  const bassDb = fmt(clamp(state.bassBoostDb ?? state.bassDb, 0, 9, 5.5));
+  const crossfeed = state.crossfeed ? 1 : 0;
+  const xfPct = fmt(clamp(state.crossfeedLevelPct ?? state.crossfeedPct, 0, 100, 55));
+  const limiter = state.limiter ? 1 : 0;
+  return `${bands.join(',')}|${bass}|${bassDb}|${crossfeed}|${xfPct}|${limiter}`;
+}
+
 module.exports = {
   resolveFfmpegBinary,
   resolveWasapiEngineBinary,
@@ -956,6 +1218,9 @@ module.exports = {
   listWasapiDevices,
   isNativeDsdFile,
   needsLosslessPcmTranscode,
+  buildHighPrecisionResampleArgs,
+  sanitizeNativeDspSpec,
+  serializeNativeDspConfig,
   NativeWasapiPlayer,
   WindowsVolumeBridge
 };

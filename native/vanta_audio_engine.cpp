@@ -379,6 +379,410 @@ void ComputeLogFft24(
     }
 }
 
+constexpr size_t MAX_AUDIO_CHANNELS = 8;
+
+inline double ClampDouble(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+constexpr double PUREPATH_EQ_FREQS[10] = {
+    31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0
+};
+
+enum class BiquadType {
+    LowPass,
+    LowShelf,
+    HighShelf,
+    PeakingEq
+};
+
+struct Biquad64 {
+    bool bypass = true;
+    double b0 = 1.0, b1 = 0.0, b2 = 0.0;
+    double a1 = 0.0, a2 = 0.0;
+    double z1[MAX_AUDIO_CHANNELS] = {};
+    double z2[MAX_AUDIO_CHANNELS] = {};
+
+    void ResetState() {
+        for (size_t ch = 0; ch < MAX_AUDIO_CHANNELS; ++ch) {
+            z1[ch] = 0.0;
+            z2[ch] = 0.0;
+        }
+    }
+
+    void Configure(BiquadType type, uint32_t sampleRate, double freqHz, double qVal, double gainDb) {
+        if ((type == BiquadType::LowShelf || type == BiquadType::HighShelf || type == BiquadType::PeakingEq) &&
+            std::fabs(gainDb) < 0.01) {
+            bypass = true;
+            b0 = 1.0; b1 = 0.0; b2 = 0.0; a1 = 0.0; a2 = 0.0;
+            return;
+        }
+        const double sr = static_cast<double>(sampleRate >= 8000 ? sampleRate : 48000);
+        const double fc = ClampDouble(freqHz, 10.0, sr * 0.45);
+        const double q = ClampDouble(qVal, 0.1, 20.0);
+        const double w0 = 2.0 * VANTA_PI * fc / sr;
+        const double cosW0 = std::cos(w0);
+        const double sinW0 = std::sin(w0);
+        const double A = std::pow(10.0, gainDb / 40.0);
+
+        double a0 = 1.0;
+        double nb0 = 1.0, nb1 = 0.0, nb2 = 0.0, na1 = 0.0, na2 = 0.0;
+
+        switch (type) {
+            case BiquadType::LowPass: {
+                const double alpha = sinW0 / (2.0 * q);
+                nb0 = (1.0 - cosW0) * 0.5;
+                nb1 = 1.0 - cosW0;
+                nb2 = (1.0 - cosW0) * 0.5;
+                a0 = 1.0 + alpha;
+                na1 = -2.0 * cosW0;
+                na2 = 1.0 - alpha;
+                break;
+            }
+            case BiquadType::PeakingEq: {
+                const double alpha = sinW0 / (2.0 * q);
+                nb0 = 1.0 + alpha * A;
+                nb1 = -2.0 * cosW0;
+                nb2 = 1.0 - alpha * A;
+                a0 = 1.0 + alpha / A;
+                na1 = -2.0 * cosW0;
+                na2 = 1.0 - alpha / A;
+                break;
+            }
+            case BiquadType::LowShelf: {
+                const double sqrtA = std::sqrt(A);
+                const double alpha = (sinW0 * 0.5) * std::sqrt(std::max(0.0, (A + 1.0 / A) * (1.0 / q - 1.0) + 2.0));
+                const double twoSqrtAAlpha = 2.0 * sqrtA * alpha;
+                nb0 = A * ((A + 1.0) - (A - 1.0) * cosW0 + twoSqrtAAlpha);
+                nb1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cosW0);
+                nb2 = A * ((A + 1.0) - (A - 1.0) * cosW0 - twoSqrtAAlpha);
+                a0 = (A + 1.0) + (A - 1.0) * cosW0 + twoSqrtAAlpha;
+                na1 = -2.0 * ((A - 1.0) + (A + 1.0) * cosW0);
+                na2 = (A + 1.0) + (A - 1.0) * cosW0 - twoSqrtAAlpha;
+                break;
+            }
+            case BiquadType::HighShelf: {
+                const double sqrtA = std::sqrt(A);
+                const double alpha = (sinW0 * 0.5) * std::sqrt(std::max(0.0, (A + 1.0 / A) * (1.0 / q - 1.0) + 2.0));
+                const double twoSqrtAAlpha = 2.0 * sqrtA * alpha;
+                nb0 = A * ((A + 1.0) + (A - 1.0) * cosW0 + twoSqrtAAlpha);
+                nb1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cosW0);
+                nb2 = A * ((A + 1.0) + (A - 1.0) * cosW0 - twoSqrtAAlpha);
+                a0 = (A + 1.0) - (A - 1.0) * cosW0 + twoSqrtAAlpha;
+                na1 = 2.0 * ((A - 1.0) - (A + 1.0) * cosW0);
+                na2 = (A + 1.0) - (A - 1.0) * cosW0 - twoSqrtAAlpha;
+                break;
+            }
+        }
+
+        if (std::fabs(a0) < 1e-18) a0 = 1.0;
+        b0 = nb0 / a0;
+        b1 = nb1 / a0;
+        b2 = nb2 / a0;
+        a1 = na1 / a0;
+        a2 = na2 / a0;
+        bypass = false;
+    }
+
+    inline double ProcessSample(double x, uint32_t ch) {
+        if (bypass || ch >= MAX_AUDIO_CHANNELS) return x;
+        const double y = b0 * x + z1[ch];
+        z1[ch] = b1 * x - a1 * y + z2[ch];
+        z2[ch] = b2 * x - a2 * y;
+        return y;
+    }
+};
+
+struct DspConfigSnapshot {
+    double bandGains[10] = {};
+    bool bass = false;
+    double bassDb = 5.5;
+    bool crossfeed = false;
+    double crossfeedPct = 55.0;
+    bool limiter = false;
+
+    bool HasEqActive() const {
+        for (int i = 0; i < 10; ++i) {
+            if (std::fabs(bandGains[i]) >= 0.01) return true;
+        }
+        return false;
+    }
+
+    bool HasEqOrTone() const {
+        return HasEqActive() || bass || crossfeed;
+    }
+
+    bool NeedsHeadroomProtection() const {
+        if (bass && bassDb > 0.25) return true;
+        for (int i = 0; i < 10; ++i) {
+            if (bandGains[i] > 0.25) return true;
+        }
+        return false;
+    }
+};
+
+DspConfigSnapshot ParseDspSpec(const std::string& spec) {
+    DspConfigSnapshot cfg;
+    if (spec.empty()) return cfg;
+
+    // Expected wire format: "b0,b1,...,b9|bassFlag|bassDb|crossfeedFlag|crossfeedPct|limiterFlag"
+    std::vector<std::string> fields;
+    size_t start = 0;
+    while (start <= spec.size()) {
+        size_t sep = spec.find('|', start);
+        if (sep == std::string::npos) {
+            fields.push_back(spec.substr(start));
+            break;
+        }
+        fields.push_back(spec.substr(start, sep - start));
+        start = sep + 1;
+    }
+
+    if (!fields.empty() && !fields[0].empty()) {
+        size_t bStart = 0;
+        int idx = 0;
+        while (bStart <= fields[0].size() && idx < 10) {
+            size_t comma = fields[0].find(',', bStart);
+            std::string tok = (comma == std::string::npos)
+                ? fields[0].substr(bStart)
+                : fields[0].substr(bStart, comma - bStart);
+            cfg.bandGains[idx++] = ClampDouble(std::strtod(tok.c_str(), nullptr), -12.0, 12.0);
+            if (comma == std::string::npos) break;
+            bStart = comma + 1;
+        }
+    }
+    if (fields.size() > 1) cfg.bass = std::strtol(fields[1].c_str(), nullptr, 10) != 0;
+    if (fields.size() > 2) cfg.bassDb = ClampDouble(std::strtod(fields[2].c_str(), nullptr), 0.0, 9.0);
+    if (fields.size() > 3) cfg.crossfeed = std::strtol(fields[3].c_str(), nullptr, 10) != 0;
+    if (fields.size() > 4) cfg.crossfeedPct = ClampDouble(std::strtod(fields[4].c_str(), nullptr), 0.0, 100.0);
+    if (fields.size() > 5) cfg.limiter = std::strtol(fields[5].c_str(), nullptr, 10) != 0;
+    return cfg;
+}
+
+struct PurePathDspRack64 {
+    DspConfigSnapshot cfg;
+    Biquad64 eq[10];
+    Biquad64 subBassLowShelf;
+    Biquad64 subBassPunch;
+    Biquad64 xfLowPassL;
+    Biquad64 xfLowPassR;
+
+    static constexpr size_t XF_MAX_DELAY = 512;
+    double xfDelayL[XF_MAX_DELAY] = {};
+    double xfDelayR[XF_MAX_DELAY] = {};
+    size_t xfWritePos = 0;
+    size_t xfDelaySamples = 12;
+    double xfDirectGain = 1.0;
+    double xfCrossGain = 0.0;
+    double preampGain = 1.0;
+
+    void ResetStates() {
+        for (int i = 0; i < 10; ++i) eq[i].ResetState();
+        subBassLowShelf.ResetState();
+        subBassPunch.ResetState();
+        xfLowPassL.ResetState();
+        xfLowPassR.ResetState();
+        std::memset(xfDelayL, 0, sizeof(xfDelayL));
+        std::memset(xfDelayR, 0, sizeof(xfDelayR));
+        xfWritePos = 0;
+    }
+
+    void ApplyConfig(uint32_t sampleRate, const DspConfigSnapshot& nextCfg) {
+        cfg = nextCfg;
+        double maxPosBoost = 0.0;
+        for (int i = 0; i < 10; ++i) {
+            const double gainDb = cfg.bandGains[i];
+            if (gainDb > maxPosBoost) maxPosBoost = gainDb;
+            const BiquadType t = (i == 0)
+                ? BiquadType::LowShelf
+                : (i == 9 ? BiquadType::HighShelf : BiquadType::PeakingEq);
+            const double q = (i == 0 || i == 9) ? 0.70710678 : 1.15;
+            eq[i].Configure(t, sampleRate, PUREPATH_EQ_FREQS[i], q, gainDb);
+        }
+
+        const double eqHeadroom = (maxPosBoost > 0.5)
+            ? std::pow(10.0, -std::min(5.0, maxPosBoost * 0.4) / 20.0)
+            : 1.0;
+
+        const double subShelfDb = cfg.bass ? cfg.bassDb : 0.0;
+        const double punchDb = subShelfDb * 0.45;
+        const double bassHeadroom = cfg.bass
+            ? std::pow(10.0, -std::min(3.5, subShelfDb * 0.25) / 20.0)
+            : 1.0;
+
+        subBassLowShelf.Configure(BiquadType::LowShelf, sampleRate, 70.0, 0.70710678, subShelfDb);
+        subBassPunch.Configure(BiquadType::PeakingEq, sampleRate, 120.0, 1.05, punchDb);
+        preampGain = eqHeadroom * bassHeadroom;
+
+        if (cfg.crossfeed) {
+            const double norm = cfg.crossfeedPct / 100.0;
+            xfCrossGain = 0.12 + norm * 0.34;
+            xfDirectGain = std::sqrt(std::max(0.25, 1.0 - xfCrossGain * xfCrossGain));
+            xfLowPassL.Configure(BiquadType::LowPass, sampleRate, 700.0, 0.70710678, 0.0);
+            xfLowPassR.Configure(BiquadType::LowPass, sampleRate, 700.0, 0.70710678, 0.0);
+            const double sr = static_cast<double>(sampleRate >= 8000 ? sampleRate : 48000);
+            const size_t d = static_cast<size_t>(std::llround(0.00026 * sr));
+            xfDelaySamples = (d < 1) ? 1 : (d >= XF_MAX_DELAY ? XF_MAX_DELAY - 1 : d);
+        } else {
+            xfDirectGain = 1.0;
+            xfCrossGain = 0.0;
+            xfLowPassL.bypass = true;
+            xfLowPassR.bypass = true;
+        }
+    }
+
+    inline void ProcessFrame(double* samples, uint32_t chCount) {
+        for (uint32_t ch = 0; ch < chCount; ++ch) {
+            double s = samples[ch] * preampGain;
+            for (int b = 0; b < 10; ++b) {
+                if (!eq[b].bypass) s = eq[b].ProcessSample(s, ch);
+            }
+            if (!subBassLowShelf.bypass) s = subBassLowShelf.ProcessSample(s, ch);
+            if (!subBassPunch.bypass) s = subBassPunch.ProcessSample(s, ch);
+            samples[ch] = s;
+        }
+
+        if (cfg.crossfeed && chCount >= 2) {
+            const double inL = samples[0];
+            const double inR = samples[1];
+            const double lpL = xfLowPassL.ProcessSample(inL, 0);
+            const double lpR = xfLowPassR.ProcessSample(inR, 0);
+
+            xfDelayL[xfWritePos] = lpL;
+            xfDelayR[xfWritePos] = lpR;
+            const size_t readPos = (xfWritePos + XF_MAX_DELAY - xfDelaySamples) % XF_MAX_DELAY;
+            const double bleedFromL = xfDelayL[readPos];
+            const double bleedFromR = xfDelayR[readPos];
+            xfWritePos = (xfWritePos + 1) % XF_MAX_DELAY;
+
+            samples[0] = inL * xfDirectGain + bleedFromR * xfCrossGain;
+            samples[1] = inR * xfDirectGain + bleedFromL * xfCrossGain;
+        }
+    }
+};
+
+struct TruePeakLimiter64 {
+    bool enabled = false;
+    double ceiling = 0.9660508789; // -0.3 dBFS
+    double envelopeGain = 1.0;
+    double attackCoeff = 0.25;
+    double releaseCoeff = 0.9998;
+    double hist[MAX_AUDIO_CHANNELS][4] = {};
+
+    void Configure(uint32_t sampleRate, double ceilingDbfs = -0.3) {
+        const double sr = static_cast<double>(sampleRate > 0 ? sampleRate : 48000);
+        ceiling = std::pow(10.0, ceilingDbfs / 20.0);
+        // Fast ~0.15ms attack catches inter-sample peaks cleanly; 120ms transparent release avoids pumping
+        attackCoeff = std::exp(-1.0 / (0.00015 * sr));
+        releaseCoeff = std::exp(-1.0 / (0.120 * sr));
+    }
+
+    void Reset() {
+        envelopeGain = 1.0;
+        for (size_t ch = 0; ch < MAX_AUDIO_CHANNELS; ++ch) {
+            for (size_t k = 0; k < 4; ++k) hist[ch][k] = 0.0;
+        }
+    }
+
+    static double HermiteAt(double ym1, double y0, double y1, double y2, double frac) {
+        const double c0 = y0;
+        const double c1 = 0.5 * (y1 - ym1);
+        const double c2 = ym1 - 2.5 * y0 + 2.0 * y1 - 0.5 * y2;
+        const double c3 = 0.5 * (y2 - ym1) + 1.5 * (y0 - y1);
+        return ((c3 * frac + c2) * frac + c1) * frac + c0;
+    }
+
+    // 4x oversampled stereo/multichannel-linked true-peak limiter with smooth lookahead-style envelope
+    void ProcessFrame(double* samples, uint32_t channels) {
+        const uint32_t chCount = channels < MAX_AUDIO_CHANNELS ? channels : static_cast<uint32_t>(MAX_AUDIO_CHANNELS);
+        double maxPeak = 0.0;
+
+        for (uint32_t ch = 0; ch < chCount; ++ch) {
+            hist[ch][0] = hist[ch][1];
+            hist[ch][1] = hist[ch][2];
+            hist[ch][2] = hist[ch][3];
+            hist[ch][3] = samples[ch];
+
+            const double absCur = std::fabs(samples[ch]);
+            if (absCur > maxPeak) maxPeak = absCur;
+
+            // Evaluate 4x inter-sample peaks between hist[1] and hist[2] using cubic Hermite polynomial
+            const double p1 = std::fabs(HermiteAt(hist[ch][0], hist[ch][1], hist[ch][2], hist[ch][3], 0.25));
+            const double p2 = std::fabs(HermiteAt(hist[ch][0], hist[ch][1], hist[ch][2], hist[ch][3], 0.50));
+            const double p3 = std::fabs(HermiteAt(hist[ch][0], hist[ch][1], hist[ch][2], hist[ch][3], 0.75));
+            if (p1 > maxPeak) maxPeak = p1;
+            if (p2 > maxPeak) maxPeak = p2;
+            if (p3 > maxPeak) maxPeak = p3;
+        }
+
+        const double targetGain = (maxPeak > ceiling && maxPeak > 1e-12) ? (ceiling / maxPeak) : 1.0;
+        const double coeff = (targetGain < envelopeGain) ? attackCoeff : releaseCoeff;
+        envelopeGain = coeff * envelopeGain + (1.0 - coeff) * targetGain;
+        const double effectiveGain = envelopeGain < targetGain ? envelopeGain : targetGain;
+
+        for (uint32_t ch = 0; ch < chCount; ++ch) {
+            double out = samples[ch] * effectiveGain;
+            // Final brickwall guard against transient overshoot beyond +/-ceiling
+            if (out > ceiling) out = ceiling;
+            if (out < -ceiling) out = -ceiling;
+            samples[ch] = out;
+        }
+    }
+};
+
+struct TpdfDitherShaper64 {
+    uint64_t rngState[MAX_AUDIO_CHANNELS] = {};
+    double errState[MAX_AUDIO_CHANNELS] = {};
+
+    TpdfDitherShaper64() {
+        Reset();
+    }
+
+    void Reset() {
+        for (size_t ch = 0; ch < MAX_AUDIO_CHANNELS; ++ch) {
+            rngState[ch] = 0x243F6A8885A308D3ULL + static_cast<uint64_t>(ch + 1) * 0x9E3779B97F4A7C15ULL;
+            errState[ch] = 0.0;
+        }
+    }
+
+    inline double NextUniform01(uint32_t ch) {
+        const size_t idx = ch < MAX_AUDIO_CHANNELS ? static_cast<size_t>(ch) : 0;
+        uint64_t x = rngState[idx];
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        rngState[idx] = x;
+        const uint64_t r = x * 0x2545F4914F6CDD1DULL;
+        // Convert upper 53 bits directly into IEEE-754 double in [0, 1)
+        return static_cast<double>(r >> 11) * (1.0 / 9007199254740992.0);
+    }
+
+    inline int32_t Quantize24(double sample, uint32_t ch) {
+        const size_t idx = ch < MAX_AUDIO_CHANNELS ? static_cast<size_t>(ch) : 0;
+        const double lsb = 1.0 / 8388608.0;
+        // 1st-order noise shaping (0.5 error feedback) + TPDF dither ([-1, +1] LSB triangular PDF)
+        const double shaped = sample + 0.5 * errState[idx];
+        const double tpdf = (NextUniform01(ch) - NextUniform01(ch)) * lsb;
+        const double q = std::floor((shaped + tpdf) * 8388608.0 + 0.5);
+        const double clamped = ClampDouble(q, -8388608.0, 8388607.0);
+        const double reconstructed = clamped / 8388608.0;
+        errState[idx] = ClampDouble(shaped - reconstructed, -lsb, lsb);
+        return static_cast<int32_t>(clamped);
+    }
+
+    inline int16_t Quantize16(double sample, uint32_t ch) {
+        const size_t idx = ch < MAX_AUDIO_CHANNELS ? static_cast<size_t>(ch) : 0;
+        const double lsb = 1.0 / 32768.0;
+        const double shaped = sample + 0.5 * errState[idx];
+        const double tpdf = (NextUniform01(ch) - NextUniform01(ch)) * lsb;
+        const double q = std::floor((shaped + tpdf) * 32768.0 + 0.5);
+        const double clamped = ClampDouble(q, -32768.0, 32767.0);
+        const double reconstructed = clamped / 32768.0;
+        errState[idx] = ClampDouble(shaped - reconstructed, -lsb, lsb);
+        return static_cast<int16_t>(clamped);
+    }
+};
+
 void ConvertAndWriteFrames(
     BYTE* pOut,
     const int32_t* pIn,
@@ -386,19 +790,101 @@ void ConvertAndWriteFrames(
     uint32_t channels,
     WireSampleFormat wireFmt,
     float gain,
+    PurePathDspRack64& dspRack,
+    TruePeakLimiter64& limiter,
+    TpdfDitherShaper64& dither,
     float* fftRing,
     size_t& fftWritePos,
     TelemetryFrameStats& stats) {
-    const size_t totalSamples = static_cast<size_t>(frames) * channels;
     const double g = static_cast<double>(gain);
+    const bool hasToneOrEq = dspRack.cfg.HasEqOrTone();
+    const bool isBitExactPath = !hasToneOrEq &&
+        !dspRack.cfg.limiter &&
+        std::fabs(g - 1.0) < 1e-6 &&
+        wireFmt != WireSampleFormat::Float32;
+
+    if (isBitExactPath) {
+        for (uint32_t f = 0; f < frames; ++f) {
+            double mono = 0.0;
+            for (uint32_t ch = 0; ch < channels; ++ch) {
+                const size_t i = static_cast<size_t>(f) * channels + ch;
+                const int32_t raw = pIn[i];
+                const double normalized = ClampDouble(static_cast<double>(raw) / 2147483648.0, -1.0, 1.0);
+                const float absVal = static_cast<float>(std::fabs(normalized));
+                mono += normalized;
+
+                if (ch == 0) {
+                    if (absVal > stats.lPeak) stats.lPeak = absVal;
+                    stats.lSumSq += normalized * normalized;
+                    if (channels == 1) {
+                        if (absVal > stats.rPeak) stats.rPeak = absVal;
+                        stats.rSumSq += normalized * normalized;
+                    }
+                } else if (ch == 1) {
+                    if (absVal > stats.rPeak) stats.rPeak = absVal;
+                    stats.rSumSq += normalized * normalized;
+                }
+
+                const uint32_t u = static_cast<uint32_t>(raw);
+                switch (wireFmt) {
+                    case WireSampleFormat::Pcm32: {
+                        int32_t* iOut = reinterpret_cast<int32_t*>(pOut);
+                        iOut[i] = raw;
+                        break;
+                    }
+                    case WireSampleFormat::Pcm24In32: {
+                        int32_t* iOut = reinterpret_cast<int32_t*>(pOut);
+                        iOut[i] = static_cast<int32_t>(u & 0xFFFFFF00u);
+                        break;
+                    }
+                    case WireSampleFormat::Pcm24Packed: {
+                        BYTE* b = pOut + i * 3;
+                        b[0] = static_cast<BYTE>((u >> 8) & 0xFFu);
+                        b[1] = static_cast<BYTE>((u >> 16) & 0xFFu);
+                        b[2] = static_cast<BYTE>((u >> 24) & 0xFFu);
+                        break;
+                    }
+                    case WireSampleFormat::Pcm16: {
+                        int16_t* sOut = reinterpret_cast<int16_t*>(pOut);
+                        sOut[i] = static_cast<int16_t>((u >> 16) & 0xFFFFu);
+                        break;
+                    }
+                    case WireSampleFormat::Float32:
+                        break;
+                }
+            }
+            fftRing[fftWritePos] = static_cast<float>(mono / static_cast<double>(channels > 0 ? channels : 1));
+            fftWritePos = (fftWritePos + 1) % FFT_N;
+        }
+        stats.frameCount += frames;
+        return;
+    }
+
+    const uint32_t activeCh = channels < MAX_AUDIO_CHANNELS ? channels : static_cast<uint32_t>(MAX_AUDIO_CHANNELS);
+    const bool useTruePeakLimiter = dspRack.cfg.limiter || g > 1.0001 || dspRack.cfg.NeedsHeadroomProtection();
+    double frameWork[MAX_AUDIO_CHANNELS] = {};
 
     for (uint32_t f = 0; f < frames; ++f) {
+        for (uint32_t ch = 0; ch < activeCh; ++ch) {
+            const size_t i = static_cast<size_t>(f) * channels + ch;
+            frameWork[ch] = (static_cast<double>(pIn[i]) / 2147483648.0) * g;
+        }
+
+        if (hasToneOrEq) {
+            dspRack.ProcessFrame(frameWork, activeCh);
+        }
+
+        if (useTruePeakLimiter) {
+            limiter.ProcessFrame(frameWork, activeCh);
+        }
+
         double mono = 0.0;
         for (uint32_t ch = 0; ch < channels; ++ch) {
             const size_t i = static_cast<size_t>(f) * channels + ch;
-            double normalized = (static_cast<double>(pIn[i]) / 2147483648.0) * g;
-            if (normalized > 1.0) normalized = 1.0;
-            if (normalized < -1.0) normalized = -1.0;
+            double normalized = ch < activeCh
+                ? frameWork[ch]
+                : (static_cast<double>(pIn[i]) / 2147483648.0) * g;
+            normalized = ClampDouble(normalized, -1.0, 1.0);
 
             const float fn = static_cast<float>(normalized);
             const float absVal = std::fabs(fn);
@@ -424,26 +910,27 @@ void ConvertAndWriteFrames(
                 }
                 case WireSampleFormat::Pcm32: {
                     int32_t* iOut = reinterpret_cast<int32_t*>(pOut);
-                    iOut[i] = static_cast<int32_t>(normalized * 2147483647.0);
+                    const double q32 = ClampDouble(std::floor(normalized * 2147483648.0 + 0.5), -2147483648.0, 2147483647.0);
+                    iOut[i] = static_cast<int32_t>(static_cast<int64_t>(q32));
                     break;
                 }
                 case WireSampleFormat::Pcm24In32: {
                     int32_t* iOut = reinterpret_cast<int32_t*>(pOut);
-                    int32_t s24 = static_cast<int32_t>(normalized * 8388607.0);
-                    iOut[i] = (s24 << 8);
+                    const int32_t s24 = dither.Quantize24(normalized, ch);
+                    iOut[i] = static_cast<int32_t>(static_cast<uint32_t>(s24) << 8);
                     break;
                 }
                 case WireSampleFormat::Pcm24Packed: {
-                    int32_t s24 = static_cast<int32_t>(normalized * 8388607.0);
+                    const uint32_t u24 = static_cast<uint32_t>(dither.Quantize24(normalized, ch));
                     BYTE* b = pOut + i * 3;
-                    b[0] = static_cast<BYTE>(s24 & 0xFF);
-                    b[1] = static_cast<BYTE>((s24 >> 8) & 0xFF);
-                    b[2] = static_cast<BYTE>((s24 >> 16) & 0xFF);
+                    b[0] = static_cast<BYTE>(u24 & 0xFFu);
+                    b[1] = static_cast<BYTE>((u24 >> 8) & 0xFFu);
+                    b[2] = static_cast<BYTE>((u24 >> 16) & 0xFFu);
                     break;
                 }
                 case WireSampleFormat::Pcm16: {
                     int16_t* sOut = reinterpret_cast<int16_t*>(pOut);
-                    sOut[i] = static_cast<int16_t>(normalized * 32767.0);
+                    sOut[i] = dither.Quantize16(normalized, ch);
                     break;
                 }
             }
@@ -452,7 +939,6 @@ void ConvertAndWriteFrames(
         fftWritePos = (fftWritePos + 1) % FFT_N;
     }
     stats.frameCount += frames;
-    (void)totalSamples;
 }
 
 constexpr std::array<uint8_t, 256> BuildBitReverseLut() {
@@ -953,6 +1439,7 @@ struct EngineOptions {
     bool listDevices = false;
     bool volumeMonitor = false;
     bool exclusive = true;
+    bool limiterEnabled = false;
     uint32_t sampleRate = 48000;
     uint16_t channels = DEFAULT_CHANNELS;
     float initialGain = 1.0f;
@@ -961,6 +1448,7 @@ struct EngineOptions {
     std::string ctrlPipeName;
     std::string dopFile;
     std::string testDopFile;
+    std::string dspSpec;
 };
 
 EngineOptions ParseArgs(int argc, char** argv) {
@@ -975,6 +1463,10 @@ EngineOptions ParseArgs(int argc, char** argv) {
             opts.exclusive = false;
         } else if (arg == "--exclusive") {
             opts.exclusive = true;
+        } else if (arg == "--limiter") {
+            opts.limiterEnabled = true;
+        } else if (arg == "--dsp" && i + 1 < argc) {
+            opts.dspSpec = argv[++i];
         } else if (arg == "--rate" && i + 1 < argc) {
             opts.sampleRate = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--channels" && i + 1 < argc) {
@@ -1491,6 +1983,19 @@ int main(int argc, char** argv) {
         return 8;
     }
 
+    DspConfigSnapshot initialDsp = ParseDspSpec(opts.dspSpec);
+    if (opts.limiterEnabled) initialDsp.limiter = true;
+
+    auto computeSignalState = [&](const DspConfigSnapshot& cfg, float gainVal) {
+        return !isDop &&
+            !cfg.HasEqOrTone() &&
+            !cfg.limiter &&
+            std::fabs(static_cast<double>(gainVal) - 1.0) < 1e-6 &&
+            wireFmt != WireSampleFormat::Float32;
+    };
+
+    const bool initialBitExact = computeSignalState(initialDsp, opts.initialGain);
+
     std::string readyJson = "{\"event\":\"ready\",\"mode\":\"";
     readyJson += isDop ? "dop_exclusive" : (activeExclusive ? "exclusive" : "shared");
     if (isDop) {
@@ -1501,6 +2006,12 @@ int main(int argc, char** argv) {
         ",\"validBits\":" + std::to_string(chosenWfx.Samples.wValidBitsPerSample) +
         ",\"channels\":" + std::to_string(chosenWfx.Format.nChannels) +
         ",\"bufferFrames\":" + std::to_string(bufferFrameCount) +
+        ",\"bitExact\":" + std::string(initialBitExact ? "true" : "false") +
+        ",\"eqActive\":" + std::string(initialDsp.HasEqActive() ? "true" : "false") +
+        ",\"bass\":" + std::string(initialDsp.bass ? "true" : "false") +
+        ",\"crossfeed\":" + std::string(initialDsp.crossfeed ? "true" : "false") +
+        ",\"limiter\":" + std::string(initialDsp.limiter ? "true" : "false") +
+        ",\"signalMode\":\"" + std::string(isDop ? "dop_exclusive" : (initialBitExact ? "bit_exact" : "purepath_64")) + "\"" +
         ",\"deviceName\":\"" + EscapeJson(deviceName) + "\"}";
     EmitJsonLine(readyJson);
 
@@ -1510,10 +2021,94 @@ int main(int argc, char** argv) {
     std::atomic<float> linearGain{opts.initialGain};
     std::atomic<uint64_t> framesPlayed{0};
 
+    std::mutex dspConfigMutex;
+    DspConfigSnapshot stagedDspConfig = initialDsp;
+    std::atomic<uint64_t> dspConfigSeq{1};
+
+    auto emitDspStateEvent = [&](const DspConfigSnapshot& cfg, float gainVal) {
+        const bool bitExactNow = computeSignalState(cfg, gainVal);
+        const std::string msg = std::string("{\"event\":\"dsp_state\",\"bitExact\":") +
+            (bitExactNow ? "true" : "false") +
+            ",\"eqActive\":" + (cfg.HasEqActive() ? "true" : "false") +
+            ",\"bass\":" + (cfg.bass ? "true" : "false") +
+            ",\"crossfeed\":" + (cfg.crossfeed ? "true" : "false") +
+            ",\"limiter\":" + (cfg.limiter ? "true" : "false") +
+            ",\"signalMode\":\"" + (isDop ? "dop_exclusive" : (bitExactNow ? "bit_exact" : "purepath_64")) + "\"}";
+        EmitJsonLine(msg);
+    };
+
+    // Gapless next-track pipe queue (0 ms transition across matching-rate PCM streams)
+    struct TrackBoundary {
+        uint64_t totalRingFramePos = 0;
+        uint64_t seq = 0;
+    };
+    struct QueuedPcmStream {
+        bool active = false;
+        uint64_t seq = 0;
+        uint64_t gen = 0;
+        std::string pipeName;
+        HANDLE hPipe = INVALID_HANDLE_VALUE;
+        bool pipeEof = false;
+        std::vector<int32_t> preloaded;
+        size_t preloadedFrames = 0;
+        std::vector<uint8_t> carryBytes;
+    };
+    std::mutex queueMutex;
+    QueuedPcmStream queuedPcm;
+    std::atomic<uint64_t> preloadGen{0};
+    std::atomic<bool> preloadStopHint{false};
+    std::thread preloadThread;
+    std::mutex boundaryMutex;
+    std::vector<TrackBoundary> trackBoundaries;
+
+    auto readAlignedFramesFromPipe = [](HANDLE hPipe, std::vector<uint8_t>& carry, int32_t* outFrames, size_t maxFrames, size_t frameBytes) -> size_t {
+        if (hPipe == INVALID_HANDLE_VALUE || maxFrames == 0 || frameBytes == 0) return 0;
+        const size_t wantedBytes = maxFrames * frameBytes;
+        const size_t carryCount = carry.size();
+        const size_t maxReadBytes = wantedBytes > carryCount ? (wantedBytes - carryCount) : frameBytes;
+        std::vector<uint8_t> raw(carryCount + maxReadBytes);
+        if (carryCount > 0) {
+            std::memcpy(raw.data(), carry.data(), carryCount);
+        }
+        DWORD bytesRead = 0;
+        const BOOL ok = ReadFile(hPipe, raw.data() + carryCount, static_cast<DWORD>(maxReadBytes), &bytesRead, nullptr);
+        const size_t totalBytes = carryCount + static_cast<size_t>(bytesRead);
+        const size_t wholeFrames = totalBytes / frameBytes;
+        const size_t usedBytes = wholeFrames * frameBytes;
+        if (wholeFrames > 0) {
+            std::memcpy(outFrames, raw.data(), usedBytes);
+        }
+        const size_t rem = totalBytes - usedBytes;
+        carry.resize(rem);
+        if (rem > 0) {
+            std::memcpy(carry.data(), raw.data() + usedBytes, rem);
+        }
+        if (!ok && bytesRead == 0) {
+            return wholeFrames;
+        }
+        return wholeFrames;
+    };
+
+    auto cancelQueuedStream = [&]() {
+        preloadGen.fetch_add(1);
+        preloadStopHint.store(true);
+        if (preloadThread.joinable()) preloadThread.join();
+        preloadStopHint.store(false);
+        std::lock_guard<std::mutex> qlk(queueMutex);
+        if (queuedPcm.hPipe != INVALID_HANDLE_VALUE) {
+            CloseHandle(queuedPcm.hPipe);
+            queuedPcm.hPipe = INVALID_HANDLE_VALUE;
+        }
+        queuedPcm.active = false;
+        queuedPcm.preloaded.clear();
+        queuedPcm.preloadedFrames = 0;
+        queuedPcm.carryBytes.clear();
+    };
+
     const size_t ringFrames = (activeRate > 384000u) ? 262144u : RING_FRAMES;
     PcmRingBuffer ring(ringFrames, activeChannels);
 
-    // Control named-pipe thread (zero firewall prompts, <0.1ms Pause/Resume/Gain/Stop)
+    // Control named-pipe thread (zero firewall prompts, <0.1ms Pause/Resume/Gain/DSP/Gapless/Stop)
     std::thread ctrlThread;
     if (!opts.ctrlPipeName.empty()) {
         ctrlThread = std::thread([&]() {
@@ -1526,7 +2121,7 @@ int main(int argc, char** argv) {
             if (hPipe == INVALID_HANDLE_VALUE) return;
 
             std::string pending;
-            char buf[256];
+            char buf[512];
             DWORD bytesRead = 0;
             while (!stopRequested.load() && ReadFile(hPipe, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
                 pending.append(buf, bytesRead);
@@ -1541,9 +2136,99 @@ int main(int argc, char** argv) {
                         paused.store(false);
                     } else if (cmd == "STOP") {
                         stopRequested.store(true);
+                    } else if (cmd == "CLEAR_QUEUE") {
+                        cancelQueuedStream();
+                    } else if (cmd == "LIMITER ON") {
+                        DspConfigSnapshot snap;
+                        {
+                            std::lock_guard<std::mutex> lk(dspConfigMutex);
+                            stagedDspConfig.limiter = true;
+                            snap = stagedDspConfig;
+                        }
+                        dspConfigSeq.fetch_add(1, std::memory_order_release);
+                        emitDspStateEvent(snap, linearGain.load());
+                    } else if (cmd == "LIMITER OFF") {
+                        DspConfigSnapshot snap;
+                        {
+                            std::lock_guard<std::mutex> lk(dspConfigMutex);
+                            stagedDspConfig.limiter = false;
+                            snap = stagedDspConfig;
+                        }
+                        dspConfigSeq.fetch_add(1, std::memory_order_release);
+                        emitDspStateEvent(snap, linearGain.load());
+                    } else if (cmd.rfind("DSP ", 0) == 0) {
+                        DspConfigSnapshot nextCfg = ParseDspSpec(cmd.substr(4));
+                        {
+                            std::lock_guard<std::mutex> lk(dspConfigMutex);
+                            stagedDspConfig = nextCfg;
+                        }
+                        dspConfigSeq.fetch_add(1, std::memory_order_release);
+                        emitDspStateEvent(nextCfg, linearGain.load());
                     } else if (cmd.rfind("GAIN ", 0) == 0) {
                         float g = std::strtof(cmd.c_str() + 5, nullptr);
-                        if (g >= 0.0f && g <= 2.5f) linearGain.store(g);
+                        if (g >= 0.0f && g <= 2.5f) {
+                            linearGain.store(g);
+                            DspConfigSnapshot snap;
+                            {
+                                std::lock_guard<std::mutex> lk(dspConfigMutex);
+                                snap = stagedDspConfig;
+                            }
+                            emitDspStateEvent(snap, g);
+                        }
+                    } else if (!isDop && cmd.rfind("QUEUE_PCM ", 0) == 0) {
+                        const std::string rest = cmd.substr(10);
+                        const size_t sp = rest.find(' ');
+                        if (sp != std::string::npos) {
+                            const std::string qPipe = rest.substr(0, sp);
+                            const uint64_t qSeq = std::strtoull(rest.c_str() + sp + 1, nullptr, 10);
+                            cancelQueuedStream();
+                            const uint64_t myGen = preloadGen.fetch_add(1) + 1;
+                            {
+                                std::lock_guard<std::mutex> qlk(queueMutex);
+                                queuedPcm = QueuedPcmStream{};
+                                queuedPcm.active = true;
+                                queuedPcm.seq = qSeq;
+                                queuedPcm.gen = myGen;
+                                queuedPcm.pipeName = qPipe;
+                            }
+                            preloadThread = std::thread([&, qPipe, myGen]() {
+                                HANDLE hQPipe = INVALID_HANDLE_VALUE;
+                                for (int attempt = 0; attempt < 40 && !stopRequested.load() && !preloadStopHint.load() && preloadGen.load() == myGen; ++attempt) {
+                                    hQPipe = CreateFileA(qPipe.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+                                    if (hQPipe != INVALID_HANDLE_VALUE) break;
+                                    Sleep(15);
+                                }
+                                if (hQPipe == INVALID_HANDLE_VALUE) return;
+
+                                const size_t maxPreloadFrames = static_cast<size_t>(activeRate) * 2;
+                                const size_t frameBytesLocal = sizeof(int32_t) * activeChannels;
+                                std::vector<int32_t> buf;
+                                std::vector<uint8_t> carry;
+                                std::vector<int32_t> chunk(4096 * activeChannels);
+                                size_t totalPreFrames = 0;
+
+                                while (totalPreFrames < maxPreloadFrames && !stopRequested.load() && !preloadStopHint.load() && preloadGen.load() == myGen) {
+                                    const size_t got = readAlignedFramesFromPipe(hQPipe, carry, chunk.data(), 4096, frameBytesLocal);
+                                    if (got == 0) {
+                                        std::lock_guard<std::mutex> qlk(queueMutex);
+                                        if (queuedPcm.gen == myGen) queuedPcm.pipeEof = true;
+                                        break;
+                                    }
+                                    buf.insert(buf.end(), chunk.begin(), chunk.begin() + got * activeChannels);
+                                    totalPreFrames += got;
+                                }
+
+                                std::lock_guard<std::mutex> qlk(queueMutex);
+                                if (queuedPcm.gen == myGen && queuedPcm.active) {
+                                    queuedPcm.hPipe = hQPipe;
+                                    queuedPcm.preloaded = std::move(buf);
+                                    queuedPcm.preloadedFrames = totalPreFrames;
+                                    queuedPcm.carryBytes = std::move(carry);
+                                } else {
+                                    CloseHandle(hQPipe);
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -1551,11 +2236,25 @@ int main(int argc, char** argv) {
         });
     }
 
-    // Stream producer thread (direct DSF/DFF DoP packetizer or stdin PCM reader)
+    // Stream producer thread (direct DSF/DFF DoP packetizer or stdin + gapless queued PCM pipes)
+    HANDLE hActivePipe = INVALID_HANDLE_VALUE;
+    std::vector<uint8_t> activePipeCarry;
+    uint64_t totalFramesWrittenToRing = 0;
+
     std::thread readerThread([&]() {
         const size_t chunkFrames = 4096;
         std::vector<int32_t> temp(chunkFrames * activeChannels);
         const size_t frameBytes = sizeof(int32_t) * activeChannels;
+
+        auto pushFramesToRing = [&](const int32_t* ptr, size_t count) {
+            size_t written = 0;
+            while (written < count && !stopRequested.load()) {
+                size_t n = ring.Write(ptr + written * activeChannels, count - written);
+                written += n;
+                totalFramesWrittenToRing += n;
+                if (written < count) Sleep(2);
+            }
+        };
 
         while (!stopRequested.load()) {
             const size_t space = ring.AvailableToWrite();
@@ -1563,19 +2262,87 @@ int main(int argc, char** argv) {
                 Sleep(4);
                 continue;
             }
-            const size_t framesRead = isDop
-                ? dopReader.ReadCarrierFrames(temp.data(), chunkFrames)
-                : std::fread(temp.data(), frameBytes, chunkFrames, stdin);
+            size_t framesRead = 0;
+            if (isDop) {
+                framesRead = dopReader.ReadCarrierFrames(temp.data(), chunkFrames);
+            } else if (hActivePipe != INVALID_HANDLE_VALUE) {
+                framesRead = readAlignedFramesFromPipe(hActivePipe, activePipeCarry, temp.data(), chunkFrames, frameBytes);
+            } else {
+                framesRead = std::fread(temp.data(), frameBytes, chunkFrames, stdin);
+            }
+
             if (framesRead == 0) {
+                if (hActivePipe != INVALID_HANDLE_VALUE) {
+                    CloseHandle(hActivePipe);
+                    hActivePipe = INVALID_HANDLE_VALUE;
+                    activePipeCarry.clear();
+                }
+
+                // Check for 0 ms gapless preloaded PCM track before closing WASAPI session
+                bool hasNext = false;
+                uint64_t nextSeq = 0;
+                HANDLE nextPipe = INVALID_HANDLE_VALUE;
+                bool nextPipeEof = false;
+                std::vector<int32_t> preloadedCopy;
+                size_t preloadedCount = 0;
+                std::vector<uint8_t> nextCarry;
+
+                {
+                    bool shouldJoinPreloader = false;
+                    {
+                        std::lock_guard<std::mutex> qlk(queueMutex);
+                        if (queuedPcm.active) {
+                            shouldJoinPreloader = true;
+                            preloadStopHint.store(true);
+                        }
+                    }
+                    if (shouldJoinPreloader && preloadThread.joinable()) {
+                        preloadThread.join();
+                    }
+                    preloadStopHint.store(false);
+
+                    std::lock_guard<std::mutex> qlk(queueMutex);
+                    if (queuedPcm.active && (queuedPcm.preloadedFrames > 0 || queuedPcm.hPipe != INVALID_HANDLE_VALUE)) {
+                        hasNext = true;
+                        nextSeq = queuedPcm.seq;
+                        nextPipe = queuedPcm.hPipe;
+                        nextPipeEof = queuedPcm.pipeEof;
+                        preloadedCopy = std::move(queuedPcm.preloaded);
+                        preloadedCount = queuedPcm.preloadedFrames;
+                        nextCarry = std::move(queuedPcm.carryBytes);
+                        queuedPcm = QueuedPcmStream{};
+                    }
+                }
+
+                if (hasNext) {
+                    {
+                        std::lock_guard<std::mutex> blk(boundaryMutex);
+                        trackBoundaries.push_back(TrackBoundary{ totalFramesWrittenToRing, nextSeq });
+                    }
+                    if (preloadedCount > 0) {
+                        pushFramesToRing(preloadedCopy.data(), preloadedCount);
+                    }
+                    if (!nextPipeEof && nextPipe != INVALID_HANDLE_VALUE) {
+                        hActivePipe = nextPipe;
+                        activePipeCarry = std::move(nextCarry);
+                        continue;
+                    }
+                    if (nextPipe != INVALID_HANDLE_VALUE) {
+                        CloseHandle(nextPipe);
+                    }
+                    // Track B was tiny and fully contained in preloadedCopy; check again on next iteration
+                    continue;
+                }
+
                 stdinEof.store(true);
                 break;
             }
-            size_t written = 0;
-            while (written < framesRead && !stopRequested.load()) {
-                size_t n = ring.Write(temp.data() + written * activeChannels, framesRead - written);
-                written += n;
-                if (written < framesRead) Sleep(2);
-            }
+            pushFramesToRing(temp.data(), framesRead);
+        }
+
+        if (hActivePipe != INVALID_HANDLE_VALUE) {
+            CloseHandle(hActivePipe);
+            hActivePipe = INVALID_HANDLE_VALUE;
         }
     });
 
@@ -1601,6 +2368,17 @@ int main(int argc, char** argv) {
         stopRequested.store(true);
     }
 
+    PurePathDspRack64 dspRack;
+    dspRack.ApplyConfig(chosenWfx.Format.nSamplesPerSec, initialDsp);
+    uint64_t seenDspSeq = dspConfigSeq.load(std::memory_order_acquire);
+
+    TruePeakLimiter64 truePeakLimiter;
+    truePeakLimiter.Configure(chosenWfx.Format.nSamplesPerSec, -0.3);
+    TpdfDitherShaper64 tpdfDither;
+
+    uint64_t totalFramesRendered = 0;
+    uint64_t currentTrackStartFrame = 0;
+
     std::vector<int32_t> frameScratch(static_cast<size_t>(bufferFrameCount) * activeChannels);
     float fftRing[FFT_N] = {};
     size_t fftWritePos = 0;
@@ -1608,6 +2386,16 @@ int main(int argc, char** argv) {
     ULONGLONG lastTelemetryTick = GetTickCount64();
 
     while (!stopRequested.load()) {
+        const uint64_t latestSeq = dspConfigSeq.load(std::memory_order_acquire);
+        if (latestSeq != seenDspSeq) {
+            DspConfigSnapshot nextSnap;
+            {
+                std::lock_guard<std::mutex> lk(dspConfigMutex);
+                nextSnap = stagedDspConfig;
+            }
+            dspRack.ApplyConfig(chosenWfx.Format.nSamplesPerSec, nextSnap);
+            seenDspSeq = latestSeq;
+        }
         const DWORD waitRes = WaitForSingleObject(hAudioEvent, 500);
         if (waitRes != WAIT_OBJECT_0) {
             if (stdinEof.load() && ring.AvailableToRead() == 0) break;
@@ -1699,6 +2487,9 @@ int main(int argc, char** argv) {
                 activeChannels,
                 wireFmt,
                 linearGain.load(),
+                dspRack,
+                truePeakLimiter,
+                tpdfDither,
                 fftRing,
                 fftWritePos,
                 frameStats
@@ -1706,7 +2497,23 @@ int main(int argc, char** argv) {
         }
 
         pRenderClient->ReleaseBuffer(framesToWrite, 0);
-        framesPlayed.fetch_add(gotFrames);
+        totalFramesRendered += gotFrames;
+        {
+            std::lock_guard<std::mutex> blk(boundaryMutex);
+            while (!trackBoundaries.empty() && totalFramesRendered >= trackBoundaries.front().totalRingFramePos) {
+                const TrackBoundary tb = trackBoundaries.front();
+                trackBoundaries.erase(trackBoundaries.begin());
+                currentTrackStartFrame = tb.totalRingFramePos;
+                const bool bitExactNow = computeSignalState(dspRack.cfg, linearGain.load());
+                const std::string advMsg = std::string("{\"event\":\"track_advanced\",\"seq\":") +
+                    std::to_string(tb.seq) +
+                    ",\"sampleRate\":" + std::to_string(chosenWfx.Format.nSamplesPerSec) +
+                    ",\"bitExact\":" + (bitExactNow ? "true" : "false") +
+                    ",\"signalMode\":\"" + (bitExactNow ? "bit_exact" : "purepath_64") + "\"}";
+                EmitJsonLine(advMsg);
+            }
+        }
+        framesPlayed.store(totalFramesRendered >= currentTrackStartFrame ? (totalFramesRendered - currentTrackStartFrame) : 0);
 
         const ULONGLONG nowTick = GetTickCount64();
         if (nowTick - lastTelemetryTick >= 33) {
@@ -1759,6 +2566,7 @@ int main(int argc, char** argv) {
     if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
 
     stopRequested.store(true);
+    cancelQueuedStream();
     if (readerThread.joinable()) readerThread.join();
     if (ctrlThread.joinable()) ctrlThread.join();
 

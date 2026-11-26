@@ -78,6 +78,7 @@ export function computeStageSpectralMetrics(bars = [], prev = {}, isPlaying = tr
   const prevHigh = Number(prev.high) || 0;
   const prevOnset = Number(prev.onset) || 0;
   const prevAvgBass = Number(prev.avgBass) || 0;
+  const prevRawBass = Number(prev.rawBass) || 0;
   const prevRolling = Number(prev.rollingEnergy) || 0;
   const cooldown = Math.max(0, (Number(prev.onsetCooldown) || 0) - 1);
 
@@ -86,12 +87,18 @@ export function computeStageSpectralMetrics(bars = [], prev = {}, isPlaying = tr
   const mid = midSum > prevMid ? prevMid + (midSum - prevMid) * 0.55 : prevMid * 0.92;
   const high = highSum > prevHigh ? prevHigh + (highSum - prevHigh) * 0.62 : prevHigh * 0.88;
 
-  const avgBass = prevAvgBass * 0.92 + bassSum * 0.08;
+  const avgBass = prevAvgBass * 0.91 + bassSum * 0.09;
   const flux = bassSum - prevAvgBass;
-  const kickDetected = Boolean(isPlaying && cooldown === 0 && bassSum > 0.22 && flux > 0.065);
+  const stepJump = bassSum - prevRawBass;
+  const kickDetected = Boolean(
+    isPlaying &&
+    cooldown === 0 &&
+    bassSum > 0.14 &&
+    (flux > 0.036 || (stepJump > 0.042 && bassSum > 0.22))
+  );
 
   const onset = kickDetected ? 1.0 : prevOnset * 0.84;
-  const onsetCooldown = kickDetected ? 8 : cooldown;
+  const onsetCooldown = kickDetected ? 7 : cooldown;
 
   const instantEnergy = bass * 0.5 + mid * 0.3 + high * 0.2;
   const rollingEnergy = prevRolling * 0.96 + instantEnergy * 0.04;
@@ -108,6 +115,7 @@ export function computeStageSpectralMetrics(bars = [], prev = {}, isPlaying = tr
     high: Math.min(1, Math.max(0, high)),
     onset: Math.min(1, Math.max(0, onset)),
     avgBass,
+    rawBass: bassSum,
     onsetCooldown,
     rollingEnergy,
     hyperStage,
@@ -136,6 +144,7 @@ export class StageLightEngine {
       high: 0,
       onset: 0,
       avgBass: 0,
+      rawBass: 0,
       onsetCooldown: 0,
       rollingEnergy: 0,
       hyperStage: 'VERSE',
@@ -264,6 +273,7 @@ export class StageLightEngine {
     const isActive = this.mode !== 'off';
     document.body.classList.toggle('fx-stage-active', isActive);
     document.body.classList.toggle('fx-pulse-mode', this.mode === 'pulse' || this.mode === 'hyper');
+    document.body.classList.toggle('fx-shockwave-mode', this.mode === 'shockwave');
     document.body.classList.toggle('fx-video-mode', this.mode === 'video');
     document.body.classList.toggle('fx-cinema-mode', Boolean(this.cinemaMode && isActive));
     document.documentElement.style.setProperty('--fx-glass-alpha', this.videoGlassAlpha.toFixed(2));
@@ -315,7 +325,7 @@ export class StageLightEngine {
       y,
       r: 18,
       maxR: Math.max(w, h) * 0.88,
-      alpha: Math.min(0.85, 0.45 + intensity * 0.4),
+      alpha: Math.min(0.92, 0.55 + intensity * 0.38),
       speed: 7 + intensity * 6,
       rgb: this.shockwaves.length % 2 === 0 ? palette.rgb2 : palette.rgb3
     });
@@ -372,7 +382,7 @@ export class StageLightEngine {
     ctx.clearRect(0, 0, w, h);
 
     const isIce = typeof document !== 'undefined' && document.body.classList.contains('theme-ice');
-    const alphaScale = isIce ? 0.6 : 1.0;
+    const alphaScale = isIce ? (this.mode === 'shockwave' ? 0.72 : 0.6) : 1.0;
 
     // Live Beat-Synced Video FX Renderer (supports both portrait 9:16 ambilight wings and 16:9 widescreen)
     if (this.mode === 'video' && this.videoEl) {
@@ -565,13 +575,13 @@ export class StageLightEngine {
           continue;
         }
         ctx.strokeStyle = `rgba(${sw.rgb}, ${alpha.toFixed(3)})`;
-        ctx.lineWidth = 3.2 * (1 - progress * 0.6);
+        ctx.lineWidth = 3.6 * (1 - progress * 0.55);
         ctx.beginPath();
         ctx.arc(sw.x, sw.y, sw.r, 0, Math.PI * 2);
         ctx.stroke();
 
-        ctx.strokeStyle = `rgba(255, 255, 255, ${(alpha * 0.45).toFixed(3)})`;
-        ctx.lineWidth = 1.1;
+        ctx.strokeStyle = `rgba(255, 255, 255, ${(alpha * 0.52).toFixed(3)})`;
+        ctx.lineWidth = 1.25;
         ctx.beginPath();
         ctx.arc(sw.x, sw.y, Math.max(4, sw.r - 4), 0, Math.PI * 2);
         ctx.stroke();

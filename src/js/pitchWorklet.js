@@ -1,10 +1,27 @@
 /**
  * @fileoverview VANTA Offline Real-Time Pitch Shifter AudioWorkletProcessor.
- * Uses dual crossfaded fractional delay taps over a circular buffer to transpose pitch
- * in semitones (-6 to +6) without altering playback tempo. Passes bit-exact audio when 0 st.
+ * Uses dual crossfaded fractional delay taps over a circular buffer with 4-point Hermite
+ * cubic interpolation and complementary Hann windows to transpose pitch in semitones
+ * (-12 to +12) without altering playback tempo. Passes bit-exact audio when 0 st.
  */
 
-class VantaPitchShifterProcessor extends AudioWorkletProcessor {
+export function hermiteInterpolate4(ym1, y0, y1, y2, frac) {
+  const c0 = y0;
+  const c1 = 0.5 * (y1 - ym1);
+  const c2 = ym1 - 2.5 * y0 + 2.0 * y1 - 0.5 * y2;
+  const c3 = 0.5 * (y2 - ym1) + 1.5 * (y0 - y1);
+  return ((c3 * frac + c2) * frac + c1) * frac + c0;
+}
+
+export function hannWindowFromPhase(phase) {
+  return 0.5 * (1.0 - Math.cos(2.0 * Math.PI * phase));
+}
+
+const BaseAudioWorkletProcessor = typeof AudioWorkletProcessor !== 'undefined'
+  ? AudioWorkletProcessor
+  : class {};
+
+class VantaPitchShifterProcessor extends BaseAudioWorkletProcessor {
   static get parameterDescriptors() {
     return [
       {
@@ -19,9 +36,9 @@ class VantaPitchShifterProcessor extends AudioWorkletProcessor {
 
   constructor() {
     super();
-    this.bufSize = 4096;
+    this.bufSize = 8192;
     this.mask = this.bufSize - 1;
-    this.windowSamples = 1536;
+    this.windowSamples = 2048;
     this.buffers = [];
     this.writeIndex = 0;
     this.phase = 0;
@@ -33,13 +50,18 @@ class VantaPitchShifterProcessor extends AudioWorkletProcessor {
     }
   }
 
-  _readLinear(buf, delaySamples) {
+  _readHermite(buf, delaySamples) {
     const pos = this.writeIndex - delaySamples;
     const i0 = Math.floor(pos);
     const frac = pos - i0;
-    const idx0 = ((i0 % this.bufSize) + this.bufSize) % this.bufSize;
-    const idx1 = (idx0 + 1) & this.mask;
-    return buf[idx0] + (buf[idx1] - buf[idx0]) * frac;
+    const size = this.bufSize;
+    const mask = this.mask;
+    const base = ((i0 % size) + size) % size;
+    const im1 = (base - 1 + size) & mask;
+    const idx0 = base;
+    const idx1 = (base + 1) & mask;
+    const idx2 = (base + 2) & mask;
+    return hermiteInterpolate4(buf[im1], buf[idx0], buf[idx1], buf[idx2], frac);
   }
 
   process(inputs, outputs, parameters) {
@@ -88,13 +110,13 @@ class VantaPitchShifterProcessor extends AudioWorkletProcessor {
 
       const delayA = 64 + phA * this.windowSamples;
       const delayB = 64 + phB * this.windowSamples;
-      const wA = 1 - Math.abs(2 * phA - 1);
-      const wB = 1 - wA;
+      const wA = hannWindowFromPhase(phA);
+      const wB = hannWindowFromPhase(phB);
 
       for (let ch = 0; ch < chCount; ch++) {
         const buf = this.buffers[ch];
-        const a = this._readLinear(buf, delayA);
-        const b = this._readLinear(buf, delayB);
+        const a = this._readHermite(buf, delayA);
+        const b = this._readHermite(buf, delayB);
         output[ch][i] = a * wA + b * wB;
       }
 
@@ -107,4 +129,6 @@ class VantaPitchShifterProcessor extends AudioWorkletProcessor {
   }
 }
 
-registerProcessor('vanta-pitch-shifter', VantaPitchShifterProcessor);
+if (typeof registerProcessor === 'function') {
+  registerProcessor('vanta-pitch-shifter', VantaPitchShifterProcessor);
+}

@@ -38,6 +38,7 @@ contextBridge.exposeInMainWorld('vantaAPI', {
   getSubtitleVtt: (payload) => ipcRenderer.invoke('vanta:get-subtitle-vtt', payload),
   pickSubtitleFile: () => ipcRenderer.invoke('vanta:pick-subtitle-file'),
   wasapiPlay: (payload) => ipcRenderer.invoke('vanta:wasapi-play', payload),
+  wasapiQueueNext: (payload) => ipcRenderer.invoke('vanta:wasapi-queue-next', payload),
   wasapiCmd: (cmd) => ipcRenderer.invoke('vanta:wasapi-cmd', cmd),
   getSystemVolume: () => ipcRenderer.invoke('vanta:get-system-volume'),
   setSystemVolume: (level01) => ipcRenderer.invoke('vanta:set-system-volume', level01),

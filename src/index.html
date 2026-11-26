@@ -156,6 +156,7 @@
             <circle cx="12" cy="12" r="2.5" />
           </svg>
           <span>Albums</span>
+          <span id="badgeAlbumCount" class="nav-badge">0</span>
         </button>
 
         <button class="nav-item" data-nav="artists">
@@ -164,6 +165,7 @@
             <path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4M8 22h8" />
           </svg>
           <span>Artists</span>
+          <span id="badgeArtistCount" class="nav-badge">0</span>
         </button>
 
         <button class="nav-item" data-nav="playlists">
@@ -585,6 +587,118 @@
             <div id="smartPlaylistGrid" class="smart-playlist-grid" data-testid="smart-playlist-grid"></div>
           </div>
 
+          <!-- Albums Gallery & Release Detail Workspace (opens in Albums module) -->
+          <div id="albumsWorkspace" class="albums-workspace hidden" data-testid="albums-workspace">
+            <div id="albumsToolbar" class="albums-toolbar">
+              <div class="segmented-group albums-mode-group" id="albumsModeGroup" role="tablist" aria-label="Album Grouping Mode">
+                <button type="button" class="seg-btn active" data-album-mode="all">All Releases</button>
+                <button type="button" class="seg-btn" data-album-mode="tagged">Album Tags</button>
+                <button type="button" class="seg-btn" data-album-mode="folder">Folders</button>
+              </div>
+              <div class="albums-toolbar-right">
+                <select id="albumsSortSelect" class="filter-select" aria-label="Sort Albums" title="Sort Albums">
+                  <option value="smart">Sort: Curated</option>
+                  <option value="tracks-desc">Most Tracks</option>
+                  <option value="title-asc">Title A–Z</option>
+                  <option value="artist-asc">Artist A–Z</option>
+                  <option value="rating-desc">Top Rated ★</option>
+                  <option value="recent-desc">Recently Added</option>
+                  <option value="year-desc">Release Year ↓</option>
+                </select>
+                <div class="segmented-group albums-view-group" id="albumsViewGroup" aria-label="Albums View Mode">
+                  <button type="button" class="seg-btn active" data-album-view="grid" title="Cover Art Grid">⊞ Grid</button>
+                  <button type="button" class="seg-btn" data-album-view="table" title="Flat Track Table">☰ Table</button>
+                </div>
+              </div>
+            </div>
+
+            <div id="albumsDetailHero" class="albums-detail-hero hidden" data-testid="albums-detail-hero">
+              <div class="albums-detail-top">
+                <button id="btnAlbumsBack" type="button" class="btn btn-ghost albums-back-btn" title="Back to Albums Grid (Esc)">
+                  ← All Albums
+                </button>
+                <span id="albumDetailReleaseKind" class="album-kind-pill">ALBUM RELEASE</span>
+              </div>
+              <div class="albums-detail-main">
+                <div id="albumDetailArt" class="album-detail-art"></div>
+                <div class="albums-detail-meta">
+                  <h2 id="albumDetailTitle" class="album-detail-title">Album Title</h2>
+                  <div id="albumDetailSubtitle" class="album-detail-subtitle">Artist · Year · Genre</div>
+                  <div id="albumDetailStats" class="album-detail-stats"></div>
+                  <div class="albums-detail-actions">
+                    <button id="btnAlbumPlayAll" type="button" class="btn btn-primary albums-action-btn">
+                      ▶ Play Album
+                    </button>
+                    <button id="btnAlbumShuffle" type="button" class="btn btn-ghost albums-action-btn">
+                      🔀 Shuffle
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div id="albumsGridScroll" class="albums-grid-scroll">
+              <div id="albumsGrid" class="albums-grid" data-testid="albums-grid"></div>
+            </div>
+          </div>
+
+          <!-- Artists Gallery & Discography Detail Workspace (opens in Artists module) -->
+          <div id="artistsWorkspace" class="albums-workspace hidden" data-testid="artists-workspace">
+            <div id="artistsToolbar" class="albums-toolbar">
+              <div class="segmented-group albums-mode-group" id="artistsModeGroup" role="tablist" aria-label="Artist Filter Mode">
+                <button type="button" class="seg-btn active" data-artist-mode="all">All Artists</button>
+                <button type="button" class="seg-btn" data-artist-mode="multi">2+ Tracks</button>
+                <button type="button" class="seg-btn" data-artist-mode="rated">Top Rated ★</button>
+              </div>
+              <div class="albums-toolbar-right">
+                <select id="artistsSortSelect" class="filter-select" aria-label="Sort Artists" title="Sort Artists">
+                  <option value="curated">Sort: Curated</option>
+                  <option value="tracks-desc">Most Tracks</option>
+                  <option value="name-asc">Name A–Z</option>
+                  <option value="rating-desc">Top Rated ★</option>
+                  <option value="recent-desc">Recently Added</option>
+                </select>
+                <div class="segmented-group albums-view-group" id="artistsViewGroup" aria-label="Artists View Mode">
+                  <button type="button" class="seg-btn active" data-artist-view="grid" title="Artist Portraits Grid">⊞ Grid</button>
+                  <button type="button" class="seg-btn" data-artist-view="table" title="Flat Track Table">☰ Table</button>
+                </div>
+              </div>
+            </div>
+
+            <div id="artistsDetailHero" class="albums-detail-hero artists-detail-hero hidden" data-testid="artists-detail-hero">
+              <div class="albums-detail-top">
+                <button id="btnArtistsBack" type="button" class="btn btn-ghost albums-back-btn" title="Back to Artists Grid (Esc)">
+                  ← All Artists
+                </button>
+                <span id="artistDetailKind" class="album-kind-pill artist-kind-pill">STUDIO ARTIST</span>
+              </div>
+              <div class="albums-detail-main">
+                <div id="artistDetailArt" class="album-detail-art"></div>
+                <div class="albums-detail-meta">
+                  <h2 id="artistDetailName" class="album-detail-title">Artist Name</h2>
+                  <div id="artistDetailSubtitle" class="album-detail-subtitle">Genres</div>
+                  <div id="artistDetailStats" class="album-detail-stats"></div>
+                  <div class="albums-detail-actions">
+                    <button id="btnArtistPlayAll" type="button" class="btn btn-primary albums-action-btn">
+                      ▶ Play All
+                    </button>
+                    <button id="btnArtistShuffle" type="button" class="btn btn-ghost albums-action-btn">
+                      🔀 Shuffle
+                    </button>
+                    <button id="btnArtistVibeRadio" type="button" class="btn btn-ghost albums-action-btn" title="Launch harmonic Vibe Radio from this artist">
+                      📻 Vibe Radio
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div id="artistDiscographyStrip" class="artist-discog-strip hidden" aria-label="Artist Releases"></div>
+            </div>
+
+            <div id="artistsGridScroll" class="albums-grid-scroll">
+              <div id="artistsGrid" class="artists-grid" data-testid="artists-grid"></div>
+            </div>
+          </div>
+
           <!-- Inline Tag & Group Editor Bar (opens when clicking +Tag on any track) -->
           <div id="inlineTagEditor" class="inline-tag-editor hidden">
             <span id="tagEditorTrackName" class="tag-editor-title">Editing Track</span>
@@ -636,7 +750,14 @@
           <div id="dockArtworkBox" class="art-showcase">🎧</div>
           <h3 id="dockTrackTitle" class="dock-track-title">No Track Loaded</h3>
           <p id="dockTrackSubtitle" class="dock-track-subtitle">Select a folder or download from YouTube</p>
-          <div id="dockStreamTelemetry" class="stream-telemetry-pill">🎛️ Studio DSP · Shared Audio Ready</div>
+          <button
+            id="dockStreamTelemetry"
+            type="button"
+            class="stream-telemetry-pill stream-telemetry-btn"
+            title="Inspect Live Audio Signal Path (PurePath 64 / Bit-Exact)"
+          >
+            🎛️ Studio DSP · Shared Audio Ready ▾
+          </button>
           <div class="stage-box dock-wave-stage-box">
             <div id="vizModeSwitcher" class="viz-mode-bar" data-testid="viz-mode-switcher" title="Select Pro Audio Visualization Mode">
               <button type="button" class="viz-pill active" data-viz="prism">Aurora</button>
@@ -1001,8 +1122,8 @@
         <div class="dsp-rack-title-wrap">
           <div class="vanta-modal-icon dsp-modal-icon-accent">🎛️</div>
           <div>
-            <h3 id="dspRackModalTitle" class="vanta-modal-title">Studio Pro DSP Rack (32-Bit Float)</h3>
-            <div class="dsp-rack-subtitle">Active on Studio DSP audio tracks &amp; Direct GPU videos · Zero-clipping limiter protected</div>
+            <h3 id="dspRackModalTitle" class="vanta-modal-title">Studio &amp; PurePath 64 DSP Rack</h3>
+            <div class="dsp-rack-subtitle">10-Band EQ, Sub-Bass, Bauer Crossfeed &amp; True-Peak Limiter run in 64-Bit PurePath inside WASAPI Exclusive; Spatial/Pitch/FX run on Studio DSP</div>
           </div>
         </div>
         <div class="dsp-rack-header-actions">
@@ -1090,6 +1211,25 @@
           </div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Live Audio Signal Path Inspector Modal (Roon-Style Audiophile Signal Chain) -->
+  <div id="signalPathModal" class="vanta-modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="signalPathModalTitle">
+    <div class="vanta-modal-card signal-path-card">
+      <div class="vanta-modal-header signal-path-header">
+        <div class="signal-path-title-wrap">
+          <span id="signalPathLed" class="signal-path-led tone-dsp" aria-hidden="true"></span>
+          <div>
+            <h3 id="signalPathModalTitle" class="vanta-modal-title">Live Signal Path Inspector</h3>
+            <div id="signalPathQualityBadge" class="signal-path-quality-badge tone-dsp">STUDIO DSP (32-BIT FLOAT)</div>
+          </div>
+        </div>
+        <button id="btnCloseSignalPath" type="button" class="btn btn-ghost btn-dsp-close" aria-label="Close Signal Path">
+          ✕
+        </button>
+      </div>
+      <div id="signalPathStagesList" class="signal-path-stages"></div>
     </div>
   </div>
 

@@ -64,6 +64,247 @@ export function computeBauerCrossfeedParams(levelPct = 55) {
 }
 
 /**
+ * Resolves the combined 10-band EQ gain array (manual EQ + acoustic device profile offsets).
+ * @param {object} [state={}] - Audio engine DSP state.
+ * @returns {number[]} 10 band gains in [-12, 12] dB.
+ */
+export function computeEffectiveEqGains(state = {}) {
+  const profileOffsets = DEVICE_EQ_PROFILES[state.deviceProfile] || DEVICE_EQ_PROFILES['Bit-Perfect (Flat)'];
+  const useProfile =
+    Boolean(state.deviceProfile) &&
+    state.deviceProfile !== 'Bit-Perfect (Flat)' &&
+    state.deviceProfile !== 'Studio Monitors';
+  const gains = Array.isArray(state.gains) ? state.gains : [];
+  return EQ_FREQUENCIES.map((_, idx) => {
+    const bandGain = state.eqEnabled ? (Number(gains[idx]) || 0) : 0;
+    const profileGain = useProfile ? (Number(profileOffsets[idx]) || 0) : 0;
+    return Math.max(-12, Math.min(12, bandGain + profileGain));
+  });
+}
+
+/**
+ * Returns true only when active DSP features require Chromium Web Audio Studio DSP
+ * (Spatial 3D, Exciter, Reverb, Karaoke, Vinyl/Tube, Night Compressor, Pitch, Speed, Crossfade).
+ * PurePath 64 features (10-Band EQ, Profiles, Sub-Bass, Bauer Crossfeed, Limiter, EBU R128)
+ * execute natively in 64-bit float inside the C++ WASAPI engine.
+ * @param {object} [state={}] - Audio engine DSP state.
+ * @returns {boolean}
+ */
+export function requiresStudioDsp(state = {}) {
+  return Boolean(
+    state.spatial ||
+      state.exciter ||
+      state.reverb ||
+      state.karaoke ||
+      state.vinyl ||
+      state.saturation ||
+      state.nightMode ||
+      Math.abs(Number(state.pitchSemitones) || 0) >= 0.05 ||
+      Math.abs((Number(state.playbackRate) || 1) - 1) >= 0.001 ||
+      (Number(state.crossfadeSeconds) || 0) > 0
+  );
+}
+
+/**
+ * Serializes AudioEngine DSP state into the PurePath 64 native C++ wire format.
+ * @param {object} [state={}] - Audio engine DSP state.
+ * @returns {string} Compact wire string (`b0,...,b9|bass|bassDb|xf|xfPct|limiter`).
+ */
+export function serializeNativeDspSpecFromState(state = {}) {
+  const fmt = (n) => Number(Number(n).toFixed(2)).toString();
+  const effectiveBands = computeEffectiveEqGains(state).map((g) => fmt(g));
+  const bass = state.bassBoost ? 1 : 0;
+  const bassDb = fmt(Math.max(0, Math.min(9, Number(state.bassBoostDb ?? 5.5) || 0)));
+  const crossfeed = state.crossfeed ? 1 : 0;
+  const xfPct = fmt(Math.max(0, Math.min(100, Number(state.crossfeedLevelPct ?? 55) || 0)));
+  const limiter = state.limiter ? 1 : 0;
+  return `${effectiveBands.join(',')}|${bass}|${bassDb}|${crossfeed}|${xfPct}|${limiter}`;
+}
+
+/**
+ * Builds structured Live Signal Path stages for audiophile telemetry and popover inspection.
+ * @param {object} [ctx={}] - Active playback telemetry context.
+ * @returns {{ qualityBadge: string, qualityTone: string, summaryLabel: string, stages: Array<object> }}
+ */
+export function buildSignalPathDescriptor(ctx = {}) {
+  const engineMode = ctx.engineMode === 'wasapi' && !ctx.isVideo ? 'wasapi' : 'dsp';
+  const probe = ctx.probe || null;
+  const r128 = ctx.r128 || null;
+  const wasapiEvt = ctx.wasapiEvent || null;
+  const dsp = ctx.dspState || {};
+  const gain = Number(ctx.linearGain);
+  const effectiveGain = Number.isFinite(gain) ? gain : 1.0;
+
+  const srcRate = Number(probe?.sampleRate) || 48000;
+  const srcRateKhz = `${(srcRate / 1000).toFixed(1).replace(/\.0$/, '')} kHz`;
+  const srcBits = probe?.bitDepth ? `${probe.bitDepth}-bit` : '16-bit';
+  const srcCh = Number(probe?.channels) || 2;
+  const srcChText = srcCh > 2 ? (srcCh === 6 ? '5.1' : srcCh === 8 ? '7.1' : `${srcCh}ch`) : '2.0 Stereo';
+  const isDsdSource = Boolean(
+    (probe?.codec && /DSD/i.test(probe.codec)) ||
+      (ctx.filePath && /\.(?:dsf|dff)$/i.test(ctx.filePath))
+  );
+
+  const stages = [];
+  stages.push({
+    key: 'source',
+    title: 'Source Media Stream',
+    detail: probe
+      ? `${probe.codec || 'PCM'} · ${isDsdSource ? '1-bit DSD' : srcBits} · ${srcRateKhz} · ${srcChText}`
+      : (ctx.trackTitle || 'Idle / No Media Loaded'),
+    spec: r128?.integratedLufs !== undefined ? `EBU R128 ${r128.integratedLufs.toFixed(1)} LUFS` : 'Direct Storage Read',
+    status: isDsdSource || (probe?.bitDepth >= 24) || srcRate > 48000 ? 'bit_exact' : 'enhanced'
+  });
+
+  const eqGains = computeEffectiveEqGains(dsp);
+  const eqActive = eqGains.some((v) => Math.abs(v) >= 0.01);
+  const anyPurePathDsp = Boolean(eqActive || dsp.bassBoost || dsp.crossfeed || dsp.limiter || Math.abs(effectiveGain - 1.0) >= 1e-4);
+
+  if (engineMode === 'wasapi') {
+    const outRate = Number(wasapiEvt?.sampleRate) || (isDsdSource ? 352800 : Math.min(768000, srcRate));
+    const outRateKhz = `${(outRate / 1000).toFixed(1).replace(/\.0$/, '')} kHz`;
+    const isDop = wasapiEvt?.mode === 'dop_exclusive';
+    const isBitExact = wasapiEvt?.bitExact !== undefined
+      ? Boolean(wasapiEvt.bitExact)
+      : (!isDop && !anyPurePathDsp);
+
+    if (isDop) {
+      stages.push({
+        key: 'decoder',
+        title: 'DoP v1.1 Bitstream Packer',
+        detail: `Raw DSD frames packed directly into 24-bit PCM DoP markers (${wasapiEvt?.dsdRate || 'DSD'})`,
+        spec: 'Zero PCM Conversion · Zero Resampling',
+        status: 'dop'
+      });
+      stages.push({
+        key: 'processing',
+        title: 'Direct Bitstream Transport',
+        detail: 'Pure 0 dBFS Unity Bypass · DSP disabled to protect DSD integrity',
+        spec: 'Integer Marker-Exact',
+        status: 'dop'
+      });
+    } else {
+      const rateConverted = isDsdSource || (probe && outRate !== srcRate);
+      stages.push({
+        key: 'decoder',
+        title: rateConverted ? '64-Bit Kaiser-Sinc Resampler' : 'Lossless PCM Decoder',
+        detail: isDsdSource
+          ? `FFmpeg 64-bit dblp Kaiser-Sinc (128-tap, beta=14) DSD -> DXD ${outRateKhz}`
+          : (rateConverted
+            ? `FFmpeg 64-bit dblp Kaiser-Sinc (128-tap) ${srcRateKhz} -> ${outRateKhz}`
+            : `FFmpeg native PCM pass-through at ${outRateKhz} (32-bit MSB aligned)`),
+        spec: rateConverted ? 'tsf=dblp · cutoff=0.95 · phase=12' : 'Zero Resampling · Native Clock',
+        status: rateConverted ? 'purepath' : 'bit_exact'
+      });
+
+      const activeModules = [];
+      if (eqActive) {
+        activeModules.push(
+          dsp.deviceProfile && dsp.deviceProfile !== 'Bit-Perfect (Flat)' && dsp.deviceProfile !== 'Studio Monitors'
+            ? `10-Band EQ + ${dsp.deviceProfile}`
+            : '10-Band Parametric EQ'
+        );
+      }
+      if (dsp.bassBoost) activeModules.push(`Sub-Bass +${Number(dsp.bassBoostDb ?? 5.5).toFixed(1)} dB`);
+      if (dsp.crossfeed) activeModules.push(`Bauer Crossfeed ${Math.round(dsp.crossfeedLevelPct ?? 55)}%`);
+      if (dsp.lufs && r128?.integratedLufs !== undefined) activeModules.push(`R128 ${(20 * Math.log10(Math.max(0.05, r128.linearGain || 1))).toFixed(1)} dB`);
+      if (Math.abs(effectiveGain - 1.0) >= 1e-4) activeModules.push(`Gain ${effectiveGain.toFixed(3)}x`);
+
+      stages.push({
+        key: 'processing',
+        title: isBitExact ? 'Bit-Exact Integer Passthrough' : 'PurePath 64 Audio Engine',
+        detail: isBitExact
+          ? 'All EQ, gain scaling, and DSP bypassed — untouched source integer bits'
+          : `64-bit IEEE-754 double TDF-II chain: ${activeModules.join(' · ') || 'Unity Gain Trim'}`,
+        spec: isBitExact ? 'Zero Math · Bit-For-Bit' : '64-Bit Float Precision',
+        status: isBitExact ? 'bit_exact' : 'purepath'
+      });
+
+      stages.push({
+        key: 'quantizer',
+        title: isBitExact ? 'Bit-Exact Frame Aligner' : 'True-Peak Limiter & TPDF Dither',
+        detail: isBitExact
+          ? `Raw ${wasapiEvt?.bitsPerSample || 24}-bit container copy (zero truncation, zero dither)`
+          : `${dsp.limiter ? '4x Oversampled True-Peak Limiter (-0.3 dBFS)' : 'Auto Inter-Sample Guard'} + TPDF Dither & Noise Shaping`,
+        spec: isBitExact ? '100% Original LSBs' : 'Zero-Harmonic Quantization',
+        status: isBitExact ? 'bit_exact' : 'purepath'
+      });
+    }
+
+    const modeLabel = wasapiEvt?.mode === 'shared' ? 'WASAPI Shared' : 'WASAPI Exclusive (MMCSS Pro Audio)';
+    const devLabel = wasapiEvt?.deviceName || ctx.deviceName || 'Default Windows Audio Endpoint';
+    const wireBits = wasapiEvt?.validBits || wasapiEvt?.bitsPerSample || 24;
+    stages.push({
+      key: 'output',
+      title: devLabel,
+      detail: `${modeLabel} · ${outRateKhz} / ${wireBits}-bit${ctx.gaplessQueued ? ' · 0 ms Gapless Primed' : ''}`,
+      spec: wasapiEvt?.bufferFrames ? `Hardware Buffer ${wasapiEvt.bufferFrames} frames` : 'Direct DAC Lock',
+      status: isDop ? 'dop' : (isBitExact ? 'bit_exact' : 'purepath')
+    });
+
+    const qualityTone = isDop ? 'dop' : (isBitExact ? 'bit_exact' : 'purepath');
+    const qualityBadge = isDop
+      ? 'NATIVE DoP v1.1 BITSTREAM'
+      : (isBitExact ? 'BIT-EXACT LOSSLESS PATH' : 'PUREPATH 64 (64-BIT FLOAT)');
+    const shortRate = `${(outRate / 1000).toFixed(1).replace(/\.0$/, '')}kHz`;
+    const summaryLabel = isDop
+      ? `DoP v1.1 (${wasapiEvt?.dsdRate || 'DSD'})`
+      : (isBitExact
+        ? `BIT-EXACT · WASAPI (${shortRate}/${wireBits}bit)`
+        : `PUREPATH 64 · WASAPI (${shortRate}/${wireBits}bit)`);
+
+    return { qualityBadge, qualityTone, summaryLabel, stages };
+  }
+
+  // Studio DSP (Web Audio 32-bit Float) path
+  stages.push({
+    key: 'decoder',
+    title: isDsdSource ? '64-Bit Kaiser-Sinc + Shibata PCM' : 'Studio Media Decoder',
+    detail: isDsdSource
+      ? 'FFmpeg 64-bit dblp Kaiser-Sinc -> 176.4 kHz / 24-bit WAV (Shibata dither)'
+      : `Direct Chromium / FFmpeg ${ctx.isVideo ? 'A/V Sync' : '24-bit PCM'} feed`,
+    spec: isDsdSource ? '128-Tap Sinc · Shibata Dither' : 'Lossless Input Bus',
+    status: isDsdSource ? 'purepath' : 'enhanced'
+  });
+
+  const studioFx = [];
+  if (Math.abs(Number(dsp.pitchSemitones) || 0) >= 0.05) studioFx.push(`Hermite/Hann Pitch (${dsp.pitchSemitones} st)`);
+  if (eqActive) studioFx.push('10-Band EQ');
+  if (dsp.bassBoost) studioFx.push(`Sub-Bass +${Number(dsp.bassBoostDb ?? 5.5).toFixed(1)} dB`);
+  if (dsp.spatial) studioFx.push(`LR4 3D Spatial (${Math.round(dsp.spatialWidthPct ?? 135)}%)`);
+  if (dsp.crossfeed) studioFx.push(`Bauer Crossfeed`);
+  if (dsp.exciter) studioFx.push('Harmonic Exciter');
+  if (dsp.reverb) studioFx.push('Hall Reverb');
+  if (dsp.vinyl || dsp.saturation) studioFx.push(dsp.vinyl ? 'Vinyl Soul' : 'Tube Warmth');
+  if (dsp.karaoke) studioFx.push('Vocal Cancel');
+  if (dsp.nightMode) studioFx.push('Night Dynamics');
+  if ((Number(dsp.crossfadeSeconds) || 0) > 0) studioFx.push(`Crossfade ${dsp.crossfadeSeconds}s`);
+
+  stages.push({
+    key: 'processing',
+    title: 'Studio DSP Graph (32-Bit Float)',
+    detail: studioFx.length ? studioFx.join(' · ') : 'Transparent Unity Web Audio Graph',
+    spec: dsp.limiter !== false ? 'Limiter (-1.5 dBFS) Engaged' : 'Uncompressed Bus',
+    status: 'dsp'
+  });
+
+  stages.push({
+    key: 'output',
+    title: ctx.deviceName || 'Windows Audio Mixer',
+    detail: 'Shared Audio Output (32-bit Float)',
+    spec: ctx.isVideo ? 'Direct GPU Video Synced' : 'Low-Latency Deck',
+    status: 'dsp'
+  });
+
+  return {
+    qualityBadge: 'STUDIO DSP (32-BIT FLOAT)',
+    qualityTone: 'dsp',
+    summaryLabel: 'STUDIO DSP (32-BIT FLOAT)',
+    stages
+  };
+}
+
+/**
  * Computes clean Sub-Bass Shelf & Punch gains with gentle headroom protection.
  * @param {number} [boostDb=5.5] - Target sub-bass boost in dB [0, 9].
  * @returns {{ subShelfDb: number, punchDb: number, headroomLinear: number }}
@@ -157,6 +398,7 @@ export class VantaAudioEngine {
     this.compressorNode = null;
     this.compDryGain = null;
     this.compWetGain = null;
+    this.preMasterBus = null;
     this.masterGain = null;
     this.analyserNode = null;
     this.leftAnalyser = null;
@@ -266,6 +508,7 @@ export class VantaAudioEngine {
       this.compressorNode = null;
       this.compDryGain = null;
       this.compWetGain = null;
+      this.preMasterBus = null;
       this.masterGain = null;
 
       const needsClone = hadConnectedNodes || Boolean(this.deckAEl?.error) || Boolean(this.deckBEl?.error);
@@ -472,13 +715,14 @@ export class VantaAudioEngine {
     this.compDryGain.gain.value = 0.0;
     this.compWetGain.gain.value = 1.0;
 
-    // 9. Master Gain & 60 FPS FFT AnalyserNode
+    // 9. Master Gain & Pre-Volume 60 FPS FFT AnalyserNode
+    this.preMasterBus = this.ctx.createGain();
     this.masterGain = this.ctx.createGain();
     this.masterGain.gain.value = this.state.volume;
 
     this.analyserNode = this.ctx.createAnalyser();
     this.analyserNode.fftSize = 1024;
-    this.analyserNode.smoothingTimeConstant = 0.78;
+    this.analyserNode.smoothingTimeConstant = 0.62;
 
     const meterSplitter = this.ctx.createChannelSplitter(2);
     this.leftAnalyser = this.ctx.createAnalyser();
@@ -540,11 +784,13 @@ export class VantaAudioEngine {
     reverbSum.connect(this.compDryGain);
     reverbSum.connect(this.compressorNode);
     this.compressorNode.connect(this.compWetGain);
-    this.compDryGain.connect(this.masterGain);
-    this.compWetGain.connect(this.masterGain);
+    this.compDryGain.connect(this.preMasterBus);
+    this.compWetGain.connect(this.preMasterBus);
 
-    this.masterGain.connect(this.analyserNode);
-    this.analyserNode.connect(this.ctx.destination);
+    // Side-tap FFT analyser BEFORE masterGain so low volume does not starve visualizers or Stage FX
+    this.preMasterBus.connect(this.analyserNode);
+    this.preMasterBus.connect(this.masterGain);
+    this.masterGain.connect(this.ctx.destination);
 
     this._attachPitchWorklet(this.crossfeedInput);
     this.syncDspState();
@@ -656,14 +902,31 @@ export class VantaAudioEngine {
     lSide.gain.value = 0.5;
     rSideNeg.gain.value = -0.5;
 
-    // Keep <160 Hz bass anchored in center; widen 160 Hz+ stereo stage
-    const sideHighPass = this.ctx.createBiquadFilter();
-    sideHighPass.type = 'highpass';
-    sideHighPass.frequency.value = 160;
-    sideHighPass.Q.value = 0.7;
-    const sideLowPass = this.ctx.createBiquadFilter();
-    sideLowPass.type = 'lowpass';
-    sideLowPass.frequency.value = 160;
+    // 4th-Order Linkwitz-Riley (LR4) crossover at 160 Hz keeps sub-bass anchored in center
+    // while matching Mid/Side phase via a 2nd-order allpass compensation filter on the Mid bus.
+    const lrQ = Math.SQRT1_2;
+    const midPhaseAlign = this.ctx.createBiquadFilter();
+    midPhaseAlign.type = 'allpass';
+    midPhaseAlign.frequency.value = 160;
+    midPhaseAlign.Q.value = lrQ;
+
+    const sideHighPass1 = this.ctx.createBiquadFilter();
+    sideHighPass1.type = 'highpass';
+    sideHighPass1.frequency.value = 160;
+    sideHighPass1.Q.value = lrQ;
+    const sideHighPass2 = this.ctx.createBiquadFilter();
+    sideHighPass2.type = 'highpass';
+    sideHighPass2.frequency.value = 160;
+    sideHighPass2.Q.value = lrQ;
+
+    const sideLowPass1 = this.ctx.createBiquadFilter();
+    sideLowPass1.type = 'lowpass';
+    sideLowPass1.frequency.value = 160;
+    sideLowPass1.Q.value = lrQ;
+    const sideLowPass2 = this.ctx.createBiquadFilter();
+    sideLowPass2.type = 'lowpass';
+    sideLowPass2.frequency.value = 160;
+    sideLowPass2.Q.value = lrQ;
 
     this.spatialSideGain = this.ctx.createGain();
     this.spatialSideGain.gain.value = 1.45;
@@ -686,20 +949,23 @@ export class VantaAudioEngine {
     inputNode.connect(spSplit);
     spSplit.connect(lMid, 0);
     spSplit.connect(rMid, 1);
-    lMid.connect(this.spatialMidGain);
-    rMid.connect(this.spatialMidGain);
+    lMid.connect(midPhaseAlign);
+    rMid.connect(midPhaseAlign);
+    midPhaseAlign.connect(this.spatialMidGain);
 
     spSplit.connect(lSide, 0);
     spSplit.connect(rSideNeg, 1);
-    lSide.connect(sideHighPass);
-    rSideNeg.connect(sideHighPass);
-    lSide.connect(sideLowPass);
-    rSideNeg.connect(sideLowPass);
+    lSide.connect(sideHighPass1);
+    rSideNeg.connect(sideHighPass1);
+    sideHighPass1.connect(sideHighPass2);
+    lSide.connect(sideLowPass1);
+    rSideNeg.connect(sideLowPass1);
+    sideLowPass1.connect(sideLowPass2);
 
-    sideHighPass.connect(this.spatialSideGain);
+    sideHighPass2.connect(this.spatialSideGain);
     this.spatialSideGain.connect(this.spatialHaasDelay);
     this.spatialHaasDelay.connect(sideBus);
-    sideLowPass.connect(sideLowUnity);
+    sideLowPass2.connect(sideLowUnity);
     sideLowUnity.connect(sideBus);
 
     // Reconstruct L = Mid + Side, R = Mid - Side
@@ -919,14 +1185,10 @@ export class VantaAudioEngine {
     }
     const now = this.ctx.currentTime;
 
-    const profileOffsets = DEVICE_EQ_PROFILES[this.state.deviceProfile] || DEVICE_EQ_PROFILES['Bit-Perfect (Flat)'];
-    const useProfile = this.state.deviceProfile !== 'Bit-Perfect (Flat)' && this.state.deviceProfile !== 'Studio Monitors';
-
     let maxPositiveBoost = 0;
+    const effectiveEqGains = computeEffectiveEqGains(this.state);
     this.eqNodes.forEach((node, idx) => {
-      const bandGain = this.state.eqEnabled ? (this.state.gains[idx] || 0) : 0;
-      const profileGain = useProfile ? (profileOffsets[idx] || 0) : 0;
-      const targetGain = Math.max(-12, Math.min(12, bandGain + profileGain));
+      const targetGain = effectiveEqGains[idx] ?? 0;
       if (targetGain > maxPositiveBoost) maxPositiveBoost = targetGain;
       node.gain.setTargetAtTime(targetGain, now, 0.02);
     });
