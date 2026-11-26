@@ -834,7 +834,7 @@ export class VantaAudioEngine {
           const outputs = (await navigator.mediaDevices.enumerateDevices()).filter(
             (d) => d.kind === 'audiooutput' && d.deviceId !== 'default' && d.deviceId !== 'communications'
           );
-          const cleanName = String(deviceName || '').replace(/^[★🎧🔊]\s*/, '').trim().toLowerCase();
+          const cleanName = String(deviceName || '').replace(/^[★🎧🔊]\s*/u, '').trim().toLowerCase();
           const exact = outputs.find((d) => d.deviceId === sinkId);
           const byLabel = cleanName
             ? outputs.find((d) => {

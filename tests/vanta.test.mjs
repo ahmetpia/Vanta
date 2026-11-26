@@ -92,6 +92,14 @@ const {
   listWasapiDevices
 } = require('../electron/services/audioBridgeService.cjs');
 
+const {
+  resolveSafeVaultSubfolder,
+  validateSafeFilePath,
+  validateSafeDirectoryPath,
+  isPathAuthorizedInScope,
+  SUBTITLE_EXTENSIONS
+} = require('../electron/services/pathSecurityService.cjs');
+
 describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
   it('1. YouTube Multi-URL / Video ID Parser extracts & deduplicates watch, short, and raw IDs', async () => {
     const raw = `
@@ -996,6 +1004,79 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
       assert.equal(loadTrackLyricsText(mp3Path), '[Verse 1]\nFast virtual scrolling');
     } finally {
       fs.rmSync(tmpScaleDir, { recursive: true, force: true });
+    }
+  });
+
+  it('14. Enterprise Red Team Security: Path Traversal, ADS/UNC/Arg Tampering, Scope Isolation & CSP/Regex Hardening', () => {
+    const tmpSecDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-sec-test-'));
+    try {
+      const vaultRoot = path.join(tmpSecDir, 'VantaVault');
+      const outsideDir = path.join(tmpSecDir, 'Outside');
+      fs.mkdirSync(path.join(vaultRoot, 'YouTube'), { recursive: true });
+      fs.mkdirSync(outsideDir, { recursive: true });
+
+      const secretFile = path.join(outsideDir, 'secret.env');
+      const outsideMp3 = path.join(outsideDir, 'external.mp3');
+      const vaultMp3 = path.join(vaultRoot, 'YouTube', 'safe.mp3');
+      const outsideSrt = path.join(outsideDir, 'external.srt');
+      fs.writeFileSync(secretFile, 'API_KEY=do_not_read', 'utf8');
+      fs.writeFileSync(outsideMp3, writeId3v2Tags(Buffer.alloc(512, 0x22), { title: 'External' }));
+      fs.writeFileSync(vaultMp3, writeId3v2Tags(Buffer.alloc(512, 0x33), { title: 'Vault' }));
+      fs.writeFileSync(outsideSrt, '1\n00:00:01,000 --> 00:00:02,000\nHello\n', 'utf8');
+
+      // 1. Vault subfolder allowlist blocks traversal, arbitrary subfolders, and CLI-flag payloads
+      assert.equal(resolveSafeVaultSubfolder(vaultRoot, ''), fs.realpathSync(vaultRoot));
+      assert.equal(resolveSafeVaultSubfolder(vaultRoot, 'YouTube'), path.join(fs.realpathSync(vaultRoot), 'YouTube'));
+      assert.equal(resolveSafeVaultSubfolder(vaultRoot, '..\\Outside'), null);
+      assert.equal(resolveSafeVaultSubfolder(vaultRoot, '../../Windows/System32'), null);
+      assert.equal(resolveSafeVaultSubfolder(vaultRoot, '--help'), null);
+      assert.equal(resolveSafeVaultSubfolder(vaultRoot, 'YouTube\0evil'), null);
+
+      // 2. validateSafeFilePath blocks non-media extensions, UNC shares, ADS, null bytes, and leading dashes
+      assert.equal(validateSafeFilePath(secretFile, { allowedExtensions: new Set(['.mp3']) }), null);
+      assert.equal(validateSafeFilePath('\\\\evil-server\\share\\track.mp3', { mustExist: false }), null);
+      assert.equal(validateSafeFilePath(`${vaultMp3}:hiddenstream`, { mustExist: false }), null);
+      assert.equal(validateSafeFilePath('-i', { mustExist: false }), null);
+      assert.equal(validateSafeFilePath(`${vaultMp3}\0.txt`, { mustExist: false }), null);
+      assert.equal(validateSafeFilePath('CON', { mustExist: false }), null);
+      assert.ok(validateSafeFilePath(vaultMp3, { allowedExtensions: new Set(['.mp3']) }));
+
+      // 3. Scope isolation blocks out-of-scope media/subtitle files while permitting vault + watched + sibling subtitles
+      const scope = {
+        vaultRoot,
+        watchedFolders: [],
+        watchedFiles: [],
+        allowSiblingInWatchedFileDirs: true
+      };
+      assert.equal(isPathAuthorizedInScope(vaultMp3, scope), true);
+      assert.equal(isPathAuthorizedInScope(outsideMp3, scope), false);
+      assert.equal(isPathAuthorizedInScope(outsideSrt, scope), false);
+
+      // Adding outsideMp3 to watchedFiles authorizes it and sibling .srt in the same folder
+      scope.watchedFiles.push(outsideMp3);
+      assert.equal(isPathAuthorizedInScope(outsideMp3, scope), true);
+      assert.equal(isPathAuthorizedInScope(outsideSrt, scope), true);
+      assert.ok(validateSafeFilePath(outsideSrt, { allowedExtensions: SUBTITLE_EXTENSIONS }));
+
+      // 4. ID3 service rejects non-MP3 / traversal / ADS targets cleanly
+      const id3Reject = updateMp3MetadataOnDisk(secretFile, { title: 'Pwned' });
+      assert.equal(id3Reject.ok, false);
+      assert.equal(validateSafeDirectoryPath('\\\\attacker\\c$'), null);
+      assert.equal(listDirectoryEntries('\\\\attacker\\c$').entries.length, 0);
+
+      // 5. ReDoS-safe semantic search parser handles adversarial repeated digit strings in <15ms
+      const t0 = performance.now();
+      const adv = parseSemanticSearchQuery(`${'123'.repeat(400)} bpm melancholic`);
+      const elapsed = performance.now() - t0;
+      assert.ok(elapsed < 50, `Semantic parser took too long on adversarial input: ${elapsed}ms`);
+      assert.ok(adv.moodTags.includes('melancholic'));
+
+      // 6. Strict CSP in index.html has no 'unsafe-inline'
+      const htmlSrc = fs.readFileSync(path.join(process.cwd(), 'src', 'index.html'), 'utf8');
+      assert.equal(htmlSrc.includes("'unsafe-inline'"), false);
+      assert.ok(htmlSrc.includes("object-src 'none'"));
+    } finally {
+      fs.rmSync(tmpSecDir, { recursive: true, force: true });
     }
   });
 });

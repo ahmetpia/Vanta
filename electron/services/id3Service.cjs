@@ -1,7 +1,11 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { validateSafeFilePath } = require('./pathSecurityService.cjs');
+
+const MP3_EXTENSIONS = new Set(['.mp3']);
 
 const ID3V1_GENRES = [
   'Blues', 'Classic Rock', 'Country', 'Dance', 'Disco', 'Funk', 'Grunge', 'Hip-Hop', 'Jazz', 'Metal',
@@ -366,8 +370,10 @@ function readId3v2Tags(mp3Buffer) {
  * @returns {object} Extracted ID3v2 metadata.
  */
 function readId3v2FromFile(filePath) {
+  const safePath = validateSafeFilePath(filePath, { allowedExtensions: MP3_EXTENSIONS });
+  if (!safePath) return readId3v2Tags(Buffer.alloc(0));
   try {
-    const fd = fs.openSync(filePath, 'r');
+    const fd = fs.openSync(safePath, 'r');
     try {
       const headerBuf = Buffer.alloc(10);
       const bytesRead = fs.readSync(fd, headerBuf, 0, 10, 0);
@@ -395,11 +401,12 @@ function readId3v2FromFile(filePath) {
  * @returns {{ ok: boolean, error?: string }} Write status.
  */
 function updateMp3MetadataOnDisk(filePath, patch = {}) {
-  if (!filePath || !fs.existsSync(filePath)) {
-    return { ok: false, error: 'MP3 file not found' };
+  const safePath = validateSafeFilePath(filePath, { allowedExtensions: MP3_EXTENSIONS });
+  if (!safePath) {
+    return { ok: false, error: 'MP3 file not found or rejected by path policy' };
   }
   try {
-    const rawBuf = fs.readFileSync(filePath);
+    const rawBuf = fs.readFileSync(safePath);
     const current = readId3v2Tags(rawBuf);
     const merged = {
       title: patch.title !== undefined ? patch.title : current.title,
@@ -415,12 +422,14 @@ function updateMp3MetadataOnDisk(filePath, patch = {}) {
       coverBuffer: current.coverBuffer
     };
     const updatedBuf = writeId3v2Tags(rawBuf, merged);
-    const tmpPath = `${filePath}.vanta-tmp-${process.pid}-${Date.now()}`;
+    const dir = path.dirname(safePath);
+    const base = path.basename(safePath);
+    const tmpPath = path.join(dir, `.${base}.vanta-tmp-${crypto.randomUUID()}`);
     fs.writeFileSync(tmpPath, updatedBuf);
     try {
-      fs.renameSync(tmpPath, filePath);
+      fs.renameSync(tmpPath, safePath);
     } catch {
-      fs.writeFileSync(filePath, updatedBuf);
+      fs.writeFileSync(safePath, updatedBuf);
       try {
         if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
       } catch {

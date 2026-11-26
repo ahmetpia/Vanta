@@ -1466,7 +1466,10 @@ int main(int argc, char** argv) {
     }
 
     HANDLE hAudioEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!hAudioEvent || FAILED(hr = pAudioClient->SetEventHandle(hAudioEvent))) {
+    if (hAudioEvent) {
+        hr = pAudioClient->SetEventHandle(hAudioEvent);
+    }
+    if (!hAudioEvent || FAILED(hr)) {
         EmitJsonLine("{\"event\":\"error\",\"hresult\":\"" + FormatHResult(hr) + "\",\"message\":\"SetEventHandle failed\"}");
         if (hAudioEvent) CloseHandle(hAudioEvent);
         pAudioClient->Release();

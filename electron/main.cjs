@@ -10,6 +10,7 @@ const {
   dialog,
   shell,
   protocol,
+  session,
   net,
   nativeImage,
   globalShortcut
@@ -18,6 +19,14 @@ const {
 const { spawn, execFile } = require('node:child_process');
 const { Readable } = require('node:stream');
 const logger = require('./services/loggerService.cjs');
+const {
+  SUBTITLE_EXTENSIONS,
+  IMAGE_EXTENSIONS,
+  resolveSafeVaultSubfolder,
+  validateSafeFilePath,
+  validateSafeDirectoryPath,
+  isPathAuthorizedInScope
+} = require('./services/pathSecurityService.cjs');
 const {
   resolveFfmpegBinary,
   probeAudioStreamInfo,
@@ -213,6 +222,84 @@ function sendScanProgress(progressData) {
   }
 }
 
+const ALL_MEDIA_EXTENSIONS = new Set([...AUDIO_EXTENSIONS, ...VIDEO_EXTENSIONS]);
+const ALL_MEDIA_AND_IMAGE_EXTENSIONS = new Set([...AUDIO_EXTENSIONS, ...VIDEO_EXTENSIONS, ...IMAGE_EXTENSIONS]);
+const INDEX_HTML_PATH = path.join(__dirname, '..', 'src', 'index.html');
+const INDEX_FILE_URL = pathToFileURL(INDEX_HTML_PATH).href;
+
+const BLOCKED_INGEST_DIR_NAMES = new Set([
+  '.ssh',
+  '.gnupg',
+  '.aws',
+  '.azure',
+  '.kube',
+  'windows',
+  'system32',
+  'syswow64',
+  '$recycle.bin',
+  'system volume information'
+]);
+
+/**
+ * Verifies that an incoming IPC invocation originates strictly from the trusted local Studio renderer frame.
+ * @param {Electron.IpcMainInvokeEvent} event - IPC event.
+ */
+function assertAuthorizedIpcSender(event) {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+    throw new Error('Unauthorized IPC sender');
+  }
+  const frameUrl = event.senderFrame?.url || '';
+  if (frameUrl && !frameUrl.startsWith(INDEX_FILE_URL)) {
+    throw new Error('Unauthorized IPC sender frame');
+  }
+}
+
+/**
+ * Wraps `ipcMain.handle` with strict sender frame authentication.
+ * @param {string} channel - IPC channel name.
+ * @param {Function} handler - IPC handler function.
+ */
+function registerSecureIpcHandler(channel, handler) {
+  ipcMain.handle(channel, (event, ...args) => {
+    assertAuthorizedIpcSender(event);
+    return handler(event, ...args);
+  });
+}
+
+/**
+ * Returns the active authorized file-access scope (Vault + watched folders/files + approved cover/FX assets).
+ */
+function getAuthorizedMediaScope() {
+  const extraFiles = [];
+  if (libraryStore.stageFxVideoPath) extraFiles.push(libraryStore.stageFxVideoPath);
+  for (const sp of libraryStore.smartPlaylists || []) {
+    if (sp?.visual?.imagePath) extraFiles.push(sp.visual.imagePath);
+  }
+  return {
+    vaultRoot: VAULT_ROOT,
+    watchedFolders,
+    watchedFiles,
+    extraFiles,
+    allowSiblingInWatchedFileDirs: true
+  };
+}
+
+/**
+ * Validates syntax, regular-file status, extension allowlist, and application scope for a media/image path.
+ * @param {string} rawPath - Untrusted path.
+ * @param {Set<string>} allowedExtensions - Allowed lowercase extensions.
+ * @returns {string|null} Canonical safe path or null if rejected.
+ */
+function resolveAuthorizedFile(rawPath, allowedExtensions) {
+  const safePath = validateSafeFilePath(rawPath, { allowedExtensions, mustExist: true });
+  if (!safePath) return null;
+  if (!isPathAuthorizedInScope(safePath, getAuthorizedMediaScope())) {
+    logger.warn('SecurityBoundary', 'Blocked out-of-scope file access attempt', { path: safePath });
+    return null;
+  }
+  return safePath;
+}
+
 /**
  * Creates the primary VANTA Studio frameless desktop window.
  */
@@ -237,11 +324,20 @@ function createMainWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      webSecurity: true
+      webSecurity: true,
+      allowRunningInsecureContent: false
     }
   });
 
-  mainWindow.loadFile(path.join(__dirname, '..', 'src', 'index.html'));
+  mainWindow.loadFile(INDEX_HTML_PATH);
+
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
+    if (!targetUrl.startsWith(INDEX_FILE_URL)) {
+      event.preventDefault();
+      logger.warn('SecurityBoundary', 'Blocked unauthorized navigation attempt', { targetUrl });
+    }
+  });
 
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     logger.error('RendererProcess', 'Renderer process terminated unexpectedly', details);
@@ -287,7 +383,7 @@ function createMainWindow() {
  * Registers IPC handlers bridging the sandboxed Renderer UI to Node.js media services.
  */
 function registerIpcHandlers() {
-  ipcMain.handle('vanta:window-control', (_event, action) => {
+  registerSecureIpcHandler('vanta:window-control', (_event, action) => {
     if (!mainWindow) return { ok: false };
     if (action === 'minimize') mainWindow.minimize();
     else if (action === 'maximize') {
@@ -299,28 +395,32 @@ function registerIpcHandlers() {
     return { ok: true, isMaximized: mainWindow ? mainWindow.isMaximized() : false };
   });
 
-  ipcMain.handle('vanta:open-vault', async (_event, subfolder = '') => {
-    const target = subfolder ? path.join(VAULT_ROOT, subfolder) : VAULT_ROOT;
+  registerSecureIpcHandler('vanta:open-vault', async (_event, subfolder = '') => {
+    const target = resolveSafeVaultSubfolder(VAULT_ROOT, subfolder);
+    if (!target) {
+      logger.warn('SecurityBoundary', 'Blocked unsafe vault subfolder request', { subfolder });
+      return { ok: false, error: 'Invalid vault subfolder' };
+    }
     fs.mkdirSync(target, { recursive: true });
     logger.info('IPC', 'Opening vault folder in Explorer', { target });
     await shell.openPath(target);
     return { ok: true, path: target };
   });
 
-  ipcMain.handle('vanta:get-logs', () => {
+  registerSecureIpcHandler('vanta:get-logs', () => {
     return {
       logFilePath: logger.logFilePath,
       entries: logger.getRecentLogs()
     };
   });
 
-  ipcMain.handle('vanta:open-logs', async () => {
+  registerSecureIpcHandler('vanta:open-logs', async () => {
     logger.info('IPC', 'User requested to open vanta.log in external viewer');
     await shell.openPath(logger.logFilePath);
     return { ok: true, logFilePath: logger.logFilePath };
   });
 
-  ipcMain.handle('vanta:client-log', (_event, payload = {}) => {
+  registerSecureIpcHandler('vanta:client-log', (_event, payload = {}) => {
     const level = payload.level || 'INFO';
     const msg = payload.message || '';
     const meta = payload.meta || null;
@@ -330,11 +430,11 @@ function registerIpcHandlers() {
     return { ok: true };
   });
 
-  ipcMain.handle('vanta:parse-inputs', (_event, rawText) => {
+  registerSecureIpcHandler('vanta:parse-inputs', (_event, rawText) => {
     return parseYouTubeInputs(rawText);
   });
 
-  ipcMain.handle('vanta:resolve-preview', async (_event, rawText) => {
+  registerSecureIpcHandler('vanta:resolve-preview', async (_event, rawText) => {
     const parsed = parseYouTubeInputs(rawText);
     const tracks = [];
 
@@ -345,7 +445,7 @@ function registerIpcHandlers() {
     return { parsed, tracks };
   });
 
-  ipcMain.handle('vanta:download-batch', async (_event, payload = {}) => {
+  registerSecureIpcHandler('vanta:download-batch', async (_event, payload = {}) => {
     const rawText = payload.rawText || '';
     const format = payload.format || 'MP3+ID3';
     const parsed = parseYouTubeInputs(rawText);
@@ -460,28 +560,29 @@ function registerIpcHandlers() {
 
     for (const raw of Array.isArray(rawPaths) ? rawPaths : []) {
       if (!raw) continue;
-      const normalized = path.normalize(String(raw).trim());
-      let stat;
-      try {
-        stat = fs.statSync(normalized);
-      } catch {
-        continue;
-      }
-
-      const normLower = normalized.toLowerCase();
-      if (stat.isDirectory()) {
-        watchedFolders.add(normalized);
-        addedFolders.push(normalized);
+      const safeDir = validateSafeDirectoryPath(String(raw), { mustExist: true });
+      if (safeDir) {
+        const segments = safeDir.toLowerCase().split(path.sep).filter(Boolean);
+        if (segments.some((seg) => BLOCKED_INGEST_DIR_NAMES.has(seg))) {
+          logger.warn('SecurityBoundary', 'Blocked ingesting protected system/credential directory', { dir: safeDir });
+          continue;
+        }
+        watchedFolders.add(safeDir);
+        addedFolders.push(safeDir);
+        const normLower = safeDir.toLowerCase();
         const prefix = normLower.endsWith(path.sep) ? normLower : `${normLower}${path.sep}`;
         hiddenList = hiddenList.filter((hp) => {
           const normHp = path.normalize(String(hp || '')).toLowerCase();
           return normHp !== normLower && !normHp.startsWith(prefix);
         });
-      } else if (stat.isFile()) {
-        const ext = path.extname(normalized).toLowerCase();
-        if (!AUDIO_EXTENSIONS.has(ext) && !VIDEO_EXTENSIONS.has(ext)) continue;
-        watchedFiles.add(normalized);
-        addedFiles.push(normalized);
+        continue;
+      }
+
+      const safeFile = validateSafeFilePath(String(raw), { allowedExtensions: ALL_MEDIA_EXTENSIONS, mustExist: true });
+      if (safeFile) {
+        watchedFiles.add(safeFile);
+        addedFiles.push(safeFile);
+        const normLower = safeFile.toLowerCase();
         hiddenList = hiddenList.filter(
           (hp) => path.normalize(String(hp || '')).toLowerCase() !== normLower
         );
@@ -495,7 +596,7 @@ function registerIpcHandlers() {
     return { addedFolders, addedFiles };
   }
 
-  ipcMain.handle('vanta:scan-vault', async () => {
+  registerSecureIpcHandler('vanta:scan-vault', async () => {
     logger.info('IPC', 'Scanning watched vault folders and explicit files', {
       folders: Array.from(watchedFolders),
       filesCount: watchedFiles.size
@@ -512,19 +613,19 @@ function registerIpcHandlers() {
     };
   });
 
-  ipcMain.handle('vanta:get-computer-roots', () => {
+  registerSecureIpcHandler('vanta:get-computer-roots', () => {
     return getComputerRoots();
   });
 
-  ipcMain.handle('vanta:list-dir', (_event, dirPath) => {
+  registerSecureIpcHandler('vanta:list-dir', (_event, dirPath) => {
     return listDirectoryEntries(dirPath, libraryStore.hiddenExplorerDirs || []);
   });
 
-  ipcMain.handle('vanta:get-hidden-explorer-dirs', () => {
+  registerSecureIpcHandler('vanta:get-hidden-explorer-dirs', () => {
     return Array.isArray(libraryStore.hiddenExplorerDirs) ? libraryStore.hiddenExplorerDirs : [];
   });
 
-  ipcMain.handle('vanta:hide-explorer-dirs', (_event, payload = {}) => {
+  registerSecureIpcHandler('vanta:hide-explorer-dirs', (_event, payload = {}) => {
     const incoming = Array.isArray(payload.paths) ? payload.paths : [];
     const existing = Array.isArray(libraryStore.hiddenExplorerDirs) ? libraryStore.hiddenExplorerDirs : [];
     const seen = new Map();
@@ -559,7 +660,7 @@ function registerIpcHandlers() {
     };
   });
 
-  ipcMain.handle('vanta:unhide-explorer-dirs', (_event, payload = {}) => {
+  registerSecureIpcHandler('vanta:unhide-explorer-dirs', (_event, payload = {}) => {
     const existing = Array.isArray(libraryStore.hiddenExplorerDirs) ? libraryStore.hiddenExplorerDirs : [];
     if (payload.all) {
       libraryStore.hiddenExplorerDirs = [];
@@ -583,7 +684,7 @@ function registerIpcHandlers() {
     };
   });
 
-  ipcMain.handle('vanta:add-paths', async (_event, payload = {}) => {
+  registerSecureIpcHandler('vanta:add-paths', async (_event, payload = {}) => {
     const requested = Array.isArray(payload.paths) ? payload.paths : [];
     const { addedFolders, addedFiles } = ingestPathsToLibrary(requested);
     const catalog = await buildFullCatalogAsync({ onProgress: sendScanProgress });
@@ -607,7 +708,7 @@ function registerIpcHandlers() {
     };
   });
 
-  ipcMain.handle('vanta:pick-folder', async () => {
+  registerSecureIpcHandler('vanta:pick-folder', async () => {
     if (!mainWindow) return { canceled: true };
     logger.info('IPC', 'Opening folder picker dialog');
 
@@ -641,7 +742,7 @@ function registerIpcHandlers() {
     };
   });
 
-  ipcMain.handle('vanta:clear-playlist', async (_event, payload = {}) => {
+  registerSecureIpcHandler('vanta:clear-playlist', async (_event, payload = {}) => {
     await wasapiPlayer.stopAsync();
 
     // Non-destructive clear: drop external watched folders/files and hide vault tracks from queue without deleting any disk files
@@ -683,7 +784,7 @@ function registerIpcHandlers() {
     };
   });
 
-  ipcMain.handle('vanta:update-track-meta', async (_event, payload = {}) => {
+  registerSecureIpcHandler('vanta:update-track-meta', async (_event, payload = {}) => {
     const updated = upsertHashAnnotation(libraryStore.annotations, payload);
     if (!updated) return { ok: false };
     saveLibraryStore(libraryStore, STORE_PATH);
@@ -698,16 +799,21 @@ function registerIpcHandlers() {
       }
     }
 
-    if (payload.writeTagsToFile && payload.filePath && Object.keys(tagPatch).length > 0 && fs.existsSync(payload.filePath)) {
-      const ext = path.extname(payload.filePath).toLowerCase();
-      if (ext === '.mp3') {
-        const res = updateMp3MetadataOnDisk(payload.filePath, tagPatch);
-        fileUpdated = Boolean(res?.ok);
-        if (!res?.ok) fileWriteWarning = res?.error || 'Could not write ID3v2 tags to MP3';
-      } else if (['.flac', '.m4a', '.wav', '.aiff', '.aif', '.ogg', '.opus'].includes(ext)) {
-        const res = await writeFfmpegMetadataOnDisk(payload.filePath, tagPatch);
-        fileUpdated = Boolean(res?.ok);
-        if (!res?.ok) fileWriteWarning = res?.error || 'Could not write metadata tags to file';
+    if (payload.writeTagsToFile && payload.filePath && Object.keys(tagPatch).length > 0) {
+      const safeTarget = resolveAuthorizedFile(payload.filePath, ALL_MEDIA_EXTENSIONS);
+      if (!safeTarget) {
+        fileWriteWarning = 'Target file rejected by security path policy';
+      } else {
+        const ext = path.extname(safeTarget).toLowerCase();
+        if (ext === '.mp3') {
+          const res = updateMp3MetadataOnDisk(safeTarget, tagPatch);
+          fileUpdated = Boolean(res?.ok);
+          if (!res?.ok) fileWriteWarning = res?.error || 'Could not write ID3v2 tags to MP3';
+        } else if (['.flac', '.m4a', '.wav', '.aiff', '.aif', '.ogg', '.opus'].includes(ext)) {
+          const res = await writeFfmpegMetadataOnDisk(safeTarget, tagPatch);
+          fileUpdated = Boolean(res?.ok);
+          if (!res?.ok) fileWriteWarning = res?.error || 'Could not write metadata tags to file';
+        }
       }
     }
 
@@ -720,7 +826,7 @@ function registerIpcHandlers() {
     };
   });
 
-  ipcMain.handle('vanta:save-smart-playlist', (_event, playlist) => {
+  registerSecureIpcHandler('vanta:save-smart-playlist', (_event, playlist) => {
     const cleanName = String(playlist?.name || '').trim().replace(/\s+/g, ' ');
     if (!playlist || !cleanName) return { ok: false, error: 'Playlist name is required' };
     const normalizedId = String(playlist.id || `sp-${Date.now()}`);
@@ -777,7 +883,7 @@ function registerIpcHandlers() {
     }
   }
 
-  ipcMain.handle('vanta:pick-playlist-cover', async (_event, payload = {}) => {
+  registerSecureIpcHandler('vanta:pick-playlist-cover', async (_event, payload = {}) => {
     if (!mainWindow) return { canceled: true };
     const result = await dialog.showOpenDialog(mainWindow, {
       title: 'Choose Playlist Cover Artwork',
@@ -820,7 +926,7 @@ function registerIpcHandlers() {
     }
   });
 
-  ipcMain.handle('vanta:delete-smart-playlist', (_event, payload = {}) => {
+  registerSecureIpcHandler('vanta:delete-smart-playlist', (_event, payload = {}) => {
     const targetId = String(payload.id || '').trim();
     if (!targetId) return { ok: false, smartPlaylists: libraryStore.smartPlaylists };
     const existing = libraryStore.smartPlaylists.find((p) => p.id === targetId);
@@ -836,7 +942,7 @@ function registerIpcHandlers() {
     return { ok: true, smartPlaylists: libraryStore.smartPlaylists };
   });
 
-  ipcMain.handle('vanta:get-fx-video', () => {
+  registerSecureIpcHandler('vanta:get-fx-video', () => {
     const saved = libraryStore.stageFxVideoPath;
     if (saved && fs.existsSync(saved)) {
       return { videoPath: saved, fileName: path.basename(saved) };
@@ -850,7 +956,7 @@ function registerIpcHandlers() {
     return { videoPath: found, fileName: found ? path.basename(found) : '' };
   });
 
-  ipcMain.handle('vanta:pick-fx-video', async () => {
+  registerSecureIpcHandler('vanta:pick-fx-video', async () => {
     if (!mainWindow) return { canceled: true };
     const result = await dialog.showOpenDialog(mainWindow, {
       title: 'Choose Stage Background Loop Video',
@@ -868,7 +974,7 @@ function registerIpcHandlers() {
     return { canceled: false, videoPath: chosen, fileName: path.basename(chosen) };
   });
 
-  ipcMain.handle('vanta:repair-doctor', async () => {
+  registerSecureIpcHandler('vanta:repair-doctor', async () => {
     logger.info('IPC', 'Running Quality Doctor auto-repair');
     const currentCatalog = await buildFullCatalogAsync();
     const currentDoctor = runQualityDoctor(currentCatalog);
@@ -882,18 +988,19 @@ function registerIpcHandlers() {
     };
   });
 
-  ipcMain.handle('vanta:export-wallet', (_event, walletPayload) => {
+  registerSecureIpcHandler('vanta:export-wallet', (_event, walletPayload) => {
     logger.info('IPC', 'Exporting Portable Music Wallet');
     return exportPortableWallet(walletPayload, path.join(VAULT_ROOT, 'Exports'));
   });
 
-  ipcMain.handle('vanta:list-audio-devices', async () => {
+  registerSecureIpcHandler('vanta:list-audio-devices', async () => {
     return listWasapiDevices();
   });
 
-  ipcMain.handle('vanta:probe-tech', async (_event, payload = {}) => {
-    const filePath = typeof payload === 'string' ? payload : payload?.filePath;
-    if (!filePath || !fs.existsSync(filePath)) return null;
+  registerSecureIpcHandler('vanta:probe-tech', async (_event, payload = {}) => {
+    const rawPath = typeof payload === 'string' ? payload : payload?.filePath;
+    const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
+    if (!filePath) return null;
     const audioHash = payload?.audioHash || computeAudioPayloadFingerprint(filePath);
     const cache = libraryStore.loudnessCache || {};
     const { entry: existing } = resolveHashStoreEntry(cache, { audioHash, filePath });
@@ -912,8 +1019,9 @@ function registerIpcHandlers() {
     return probe;
   });
 
-  ipcMain.handle('vanta:probe-audio', async (_event, filePath) => {
-    if (!filePath || !fs.existsSync(filePath)) return null;
+  registerSecureIpcHandler('vanta:probe-audio', async (_event, rawPath) => {
+    const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
+    if (!filePath) return null;
     const audioHash = computeAudioPayloadFingerprint(filePath);
     const cache = libraryStore.loudnessCache || {};
     const { entry: cached } = resolveHashStoreEntry(cache, { audioHash, filePath });
@@ -930,10 +1038,11 @@ function registerIpcHandlers() {
     return info;
   });
 
-  ipcMain.handle('vanta:wasapi-play', async (_event, payload = {}) => {
-    const { filePath, exclusive = true, dop = false, deviceId = '', linearGain = 1.0, seekSec = 0 } = payload;
-    if (!filePath || !fs.existsSync(filePath)) {
-      return { ok: false, error: 'Audio file not found' };
+  registerSecureIpcHandler('vanta:wasapi-play', async (_event, payload = {}) => {
+    const { filePath: rawPath, exclusive = true, dop = false, deviceId = '', linearGain = 1.0, seekSec = 0 } = payload;
+    const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
+    if (!filePath) {
+      return { ok: false, error: 'Audio file not found or rejected by path policy' };
     }
     try {
       const cache = libraryStore.loudnessCache || {};
@@ -954,7 +1063,7 @@ function registerIpcHandlers() {
     }
   });
 
-  ipcMain.handle('vanta:wasapi-cmd', async (_event, cmd) => {
+  registerSecureIpcHandler('vanta:wasapi-cmd', async (_event, cmd) => {
     if (cmd === 'STOP') {
       await wasapiPlayer.stopAsync();
     } else {
@@ -963,67 +1072,79 @@ function registerIpcHandlers() {
     return { ok: true };
   });
 
-  ipcMain.handle('vanta:get-system-volume', () => {
+  registerSecureIpcHandler('vanta:get-system-volume', () => {
     return volumeBridge.lastState;
   });
 
-  ipcMain.handle('vanta:set-system-volume', (_event, level01) => {
+  registerSecureIpcHandler('vanta:set-system-volume', (_event, level01) => {
     volumeBridge.setVolume(level01);
     return { ok: true };
   });
 
-  ipcMain.handle('vanta:set-system-mute', (_event, muted) => {
+  registerSecureIpcHandler('vanta:set-system-mute', (_event, muted) => {
     volumeBridge.setMute(muted);
     return { ok: true };
   });
 
-  ipcMain.handle('vanta:set-volume-device', (_event, deviceId) => {
+  registerSecureIpcHandler('vanta:set-volume-device', (_event, deviceId) => {
     volumeBridge.setDevice(deviceId || '');
     return { ok: true };
   });
 
-  ipcMain.handle('vanta:probe-video-streams', async (_event, filePath) => {
-    const cleanPath = String(filePath || '').trim();
+  registerSecureIpcHandler('vanta:probe-video-streams', async (_event, rawPath) => {
+    const cleanPath = resolveAuthorizedFile(rawPath, VIDEO_EXTENSIONS);
+    if (!cleanPath) {
+      return {
+        probe: { durationSec: 0, video: null, audioStreams: [], subtitleStreams: [] },
+        strategy: 'direct',
+        siblingSubtitles: []
+      };
+    }
     const probe = await probeMediaStreams(cleanPath);
     const strategy = decideVideoPlaybackStrategy(cleanPath, probe, 0);
 
     const siblingSubtitles = [];
-    if (cleanPath && fs.existsSync(cleanPath)) {
-      const dir = path.dirname(cleanPath);
-      const base = path.basename(cleanPath, path.extname(cleanPath)).toLowerCase();
-      try {
-        for (const entry of fs.readdirSync(dir)) {
-          const ext = path.extname(entry).toLowerCase();
-          if (ext !== '.srt' && ext !== '.vtt') continue;
-          const entryBase = path.basename(entry, ext).toLowerCase();
-          if (entryBase === base || entryBase.startsWith(`${base}.`)) {
+    const dir = path.dirname(cleanPath);
+    const base = path.basename(cleanPath, path.extname(cleanPath)).toLowerCase();
+    try {
+      for (const entry of fs.readdirSync(dir)) {
+        const ext = path.extname(entry).toLowerCase();
+        if (ext !== '.srt' && ext !== '.vtt') continue;
+        const entryBase = path.basename(entry, ext).toLowerCase();
+        if (entryBase === base || entryBase.startsWith(`${base}.`)) {
+          const subPath = resolveAuthorizedFile(path.join(dir, entry), SUBTITLE_EXTENSIONS);
+          if (subPath) {
             siblingSubtitles.push({
               label: entry,
-              path: path.join(dir, entry)
+              path: subPath
             });
           }
         }
-      } catch {
-        // Ignore directory read error
       }
+    } catch {
+      // Ignore directory read error
     }
 
     return { probe, strategy, siblingSubtitles };
   });
 
-  ipcMain.handle('vanta:get-subtitle-vtt', async (_event, payload = {}) => {
+  registerSecureIpcHandler('vanta:get-subtitle-vtt', async (_event, payload = {}) => {
     try {
-      if (payload.subtitleFilePath && fs.existsSync(payload.subtitleFilePath)) {
-        const raw = fs.readFileSync(payload.subtitleFilePath, 'utf8');
+      if (payload.subtitleFilePath) {
+        const safeSubPath = resolveAuthorizedFile(payload.subtitleFilePath, SUBTITLE_EXTENSIONS);
+        if (!safeSubPath) return { ok: false, error: 'Subtitle path rejected by security policy' };
+        const raw = fs.readFileSync(safeSubPath, 'utf8');
         return { ok: true, vtt: convertSrtToVtt(raw) };
       }
-      if (payload.videoPath && fs.existsSync(payload.videoPath) && Number.isInteger(payload.relSubIdx)) {
+      if (payload.videoPath && Number.isInteger(payload.relSubIdx) && payload.relSubIdx >= 0 && payload.relSubIdx < 64) {
+        const safeVideoPath = resolveAuthorizedFile(payload.videoPath, VIDEO_EXTENSIONS);
+        if (!safeVideoPath) return { ok: false, error: 'Video path rejected by security policy' };
         const ffmpegBin = resolveFfmpegBinary();
         if (!ffmpegBin) return { ok: false, error: 'FFmpeg unavailable' };
         return await new Promise((resolve) => {
           execFile(
             ffmpegBin,
-            ['-hide_banner', '-loglevel', 'error', '-i', payload.videoPath, '-map', `0:s:${payload.relSubIdx}`, '-f', 'webvtt', '-'],
+            ['-hide_banner', '-loglevel', 'error', '-i', safeVideoPath, '-map', `0:s:${payload.relSubIdx}`, '-f', 'webvtt', '-'],
             { timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
             (err, stdout) => {
               if (err || !stdout) resolve({ ok: false, error: err?.message || 'Subtitle extraction failed' });
@@ -1038,13 +1159,15 @@ function registerIpcHandlers() {
     }
   });
 
-  ipcMain.handle('vanta:get-track-details', (_event, filePath) => {
+  registerSecureIpcHandler('vanta:get-track-details', (_event, rawPath) => {
+    const safePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
+    if (!safePath) return { lyrics: '' };
     return {
-      lyrics: loadTrackLyricsText(filePath)
+      lyrics: loadTrackLyricsText(safePath)
     };
   });
 
-  ipcMain.handle('vanta:pick-subtitle-file', async () => {
+  registerSecureIpcHandler('vanta:pick-subtitle-file', async () => {
     if (!mainWindow) return { canceled: true };
     const result = await dialog.showOpenDialog(mainWindow, {
       title: 'Load External Subtitle (.SRT / .VTT)',
@@ -1065,13 +1188,19 @@ function registerIpcHandlers() {
 const coverBinaryCache = new Map();
 
 app.whenReady().then(() => {
+  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+    const allowedPermissions = new Set(['media', 'speaker-selection']);
+    callback(allowedPermissions.has(permission));
+  });
+
   volumeBridge.start();
 
   protocol.handle('vanta-cover', (request) => {
     try {
       const parsedUrl = new URL(request.url);
-      const filePath = parsedUrl.searchParams.get('path') || decodeURIComponent(parsedUrl.pathname.replace(/^\//, ''));
-      if (!filePath || !fs.existsSync(filePath)) {
+      const rawPath = parsedUrl.searchParams.get('path') || decodeURIComponent(parsedUrl.pathname.replace(/^\//, ''));
+      const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_AND_IMAGE_EXTENSIONS);
+      if (!filePath) {
         return new Response('Cover not found', { status: 404 });
       }
       const st = fs.statSync(filePath);
@@ -1092,8 +1221,7 @@ app.whenReady().then(() => {
         status: 200,
         headers: {
           'Content-Type': hit.mime || 'image/jpeg',
-          'Cache-Control': 'public, max-age=3600',
-          'Access-Control-Allow-Origin': '*'
+          'Cache-Control': 'public, max-age=3600'
         }
       });
     } catch {
@@ -1104,17 +1232,18 @@ app.whenReady().then(() => {
   protocol.handle('vanta-media', (request) => {
     try {
       const parsedUrl = new URL(request.url);
-      const filePath = parsedUrl.searchParams.get('path') || decodeURIComponent(parsedUrl.pathname.replace(/^\//, ''));
+      const rawPath = parsedUrl.searchParams.get('path') || decodeURIComponent(parsedUrl.pathname.replace(/^\//, ''));
       const seekSec = Math.max(0, Number(parsedUrl.searchParams.get('ss')) || 0);
-      if (!filePath || !fs.existsSync(filePath)) {
-        logger.warn('MediaProtocol', `Requested media file not found: ${filePath}`);
+      const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_AND_IMAGE_EXTENSIONS);
+      if (!filePath) {
+        logger.warn('MediaProtocol', `Requested media file not found or rejected: ${rawPath}`);
         return new Response('File not found', { status: 404 });
       }
       // Transparently handle 4K Video remux/transcode OR audiophile lossless PCM decoding
       const ext = path.extname(filePath).toLowerCase();
       const mediaMode = parsedUrl.searchParams.get('mode') || '';
       const strategy = parsedUrl.searchParams.get('strategy') || 'direct';
-      const audioIdx = Math.max(0, Number(parsedUrl.searchParams.get('a')) || 0);
+      const audioIdx = Math.max(0, Math.min(31, Number.parseInt(parsedUrl.searchParams.get('a') || '0', 10) || 0));
 
       if (mediaMode === 'video' && (strategy === 'remux-copy' || strategy === 'transcode-h264')) {
         const ffmpegBin = resolveFfmpegBinary();
@@ -1140,14 +1269,13 @@ app.whenReady().then(() => {
           return new Response(webStream, {
             status: 200,
             headers: {
-              'Content-Type': 'video/mp4',
-              'Access-Control-Allow-Origin': '*'
+              'Content-Type': 'video/mp4'
             }
           });
         }
       }
 
-      if (mediaMode !== 'video' && (needsLosslessPcmTranscode(filePath) || seekSec > 0)) {
+      if (mediaMode !== 'video' && ALL_MEDIA_EXTENSIONS.has(ext) && (needsLosslessPcmTranscode(filePath) || seekSec > 0)) {
         const ffmpegBin = resolveFfmpegBinary();
         if (ffmpegBin) {
           const ffArgs = ['-hide_banner', '-loglevel', 'error'];
@@ -1166,8 +1294,7 @@ app.whenReady().then(() => {
           return new Response(webStream, {
             status: 200,
             headers: {
-              'Content-Type': 'audio/wav',
-              'Access-Control-Allow-Origin': '*'
+              'Content-Type': 'audio/wav'
             }
           });
         }
@@ -1202,16 +1329,15 @@ app.whenReady().then(() => {
       if (rangeHeader) {
         const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
         if (match) {
-          let start = match[1] ? parseInt(match[1], 10) : 0;
-          let end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+          let start = match[1] ? Number.parseInt(match[1], 10) : 0;
+          let end = match[2] ? Number.parseInt(match[2], 10) : fileSize - 1;
           if (Number.isNaN(start)) start = 0;
           if (Number.isNaN(end) || end >= fileSize) end = fileSize - 1;
           if (start >= fileSize || start > end) {
             return new Response('', {
               status: 416,
               headers: {
-                'Content-Range': `bytes */${fileSize}`,
-                'Access-Control-Allow-Origin': '*'
+                'Content-Range': `bytes */${fileSize}`
               }
             });
           }
@@ -1223,8 +1349,7 @@ app.whenReady().then(() => {
               'Content-Type': contentType,
               'Content-Length': String(chunkSize),
               'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-              'Accept-Ranges': 'bytes',
-              'Access-Control-Allow-Origin': '*'
+              'Accept-Ranges': 'bytes'
             }
           });
         }
@@ -1236,13 +1361,12 @@ app.whenReady().then(() => {
         headers: {
           'Content-Type': contentType,
           'Content-Length': String(fileSize),
-          'Accept-Ranges': 'bytes',
-          'Access-Control-Allow-Origin': '*'
+          'Accept-Ranges': 'bytes'
         }
       });
     } catch (err) {
       logger.error('MediaProtocol', `Error streaming media URL: ${request.url}`, { error: err.message });
-      return new Response(err.message, { status: 500 });
+      return new Response('Media stream error', { status: 500 });
     }
   });
 

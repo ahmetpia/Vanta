@@ -1,13 +1,21 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const { spawn, execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const logger = require('./loggerService.cjs');
+const { validateSafeFilePath } = require('./pathSecurityService.cjs');
 
 const execFileAsync = promisify(execFile);
+
+const BRIDGE_MEDIA_EXTENSIONS = new Set([
+  '.mp3', '.flac', '.wav', '.w64', '.aiff', '.aif', '.alac', '.m4a', '.aac',
+  '.ogg', '.opus', '.dsf', '.dff', '.ape', '.wv',
+  '.mp4', '.webm', '.mkv', '.mov', '.m4v', '.avi', '.ts', '.mpg', '.mpeg', '.wmv', '.flv', '.3gp', '.ogv'
+]);
 
 let pipeSeq = 0;
 
@@ -67,13 +75,15 @@ function parseFfmpegProbeOutput(stderrText) {
   let channels = 2;
   let bitrateKbps = 0;
 
-  const audioLine = /Stream\s+#\d+:\d+[^:]*:\s*Audio:\s*([^\r\n]+)/i.exec(text);
-  if (audioLine) {
-    const info = audioLine[1];
-    const codecMatch = /^([a-zA-Z0-9_.-]+)/.exec(info.trim());
+  const lines = text.split(/\r?\n/);
+  const audioRawLine = lines.find((ln) => /^\s*Stream\s+#\d+:\d+[^\r\n]*?:\s*Audio:/i.test(ln));
+  if (audioRawLine) {
+    const audioMarkerIdx = audioRawLine.toLowerCase().indexOf('audio:');
+    const info = audioMarkerIdx >= 0 ? audioRawLine.slice(audioMarkerIdx + 6).trim() : '';
+    const codecMatch = /^([a-zA-Z0-9_.-]+)/.exec(info);
     if (codecMatch) codec = codecMatch[1].toUpperCase();
 
-    const srMatch = /(\d{4,7})\s*Hz/i.exec(info);
+    const srMatch = /\b(\d{4,7}) ?Hz\b/i.exec(info);
     if (srMatch) sampleRate = Number(srMatch[1]);
 
     if (/\b7\.1\b/i.test(info)) channels = 8;
@@ -98,20 +108,25 @@ function parseFfmpegProbeOutput(stderrText) {
       bitDepth = 24;
     }
 
-    const brMatch = /(\d+)\s*kb\/s/i.exec(info);
+    const brMatch = /\b(\d{1,6}) ?kb\/s\b/i.exec(info);
     if (brMatch) bitrateKbps = Number(brMatch[1]);
   }
 
   let videoCodec = '';
   let videoWidth = 0;
   let videoHeight = 0;
-  const videoLine = /Stream #\d+:\d+(?:\[0x[0-9a-f]+\])?(?:\([^)]*\))?:\s*Video:\s*([^,\r\n]+),\s*([^\r\n]+)/i.exec(text);
-  if (videoLine) {
-    let rawVc = videoLine[1].split(/[(\s]+/)[0].trim().toUpperCase();
+  const videoRawLine = lines.find((ln) => /^\s*Stream\s+#\d+:\d+[^\r\n]*?:\s*Video:/i.test(ln));
+  if (videoRawLine) {
+    const videoMarkerIdx = videoRawLine.toLowerCase().indexOf('video:');
+    const rest = videoMarkerIdx >= 0 ? videoRawLine.slice(videoMarkerIdx + 6).trim() : '';
+    const commaIdx = rest.indexOf(',');
+    const vHead = commaIdx >= 0 ? rest.slice(0, commaIdx) : rest;
+    const vBody = commaIdx >= 0 ? rest.slice(commaIdx + 1) : '';
+    let rawVc = vHead.split(/[(\s]+/)[0].trim().toUpperCase();
     if (rawVc === 'AV01') rawVc = 'AV1';
     else if (rawVc === 'H265') rawVc = 'HEVC';
     videoCodec = rawVc;
-    const dim = /\b(\d{3,5})x(\d{3,5})\b/.exec(videoLine[2]);
+    const dim = /\b(\d{3,5})x(\d{3,5})\b/.exec(vBody);
     if (dim) {
       videoWidth = Number(dim[1]);
       videoHeight = Number(dim[2]);
@@ -138,15 +153,33 @@ function parseFfmpegProbeOutput(stderrText) {
  */
 async function probeAudioStreamInfo(filePath) {
   const ffmpegBin = resolveFfmpegBinary();
-  if (!ffmpegBin || !filePath || !fs.existsSync(filePath)) {
+  const safePath = validateSafeFilePath(filePath, { allowedExtensions: BRIDGE_MEDIA_EXTENSIONS });
+  if (!ffmpegBin || !safePath) {
     return { codec: 'MP3', sampleRate: 44100, bitDepth: 16, channels: 2, bitrateKbps: 320, durationSec: 0 };
   }
 
   return new Promise((resolve) => {
-    execFile(ffmpegBin, ['-hide_banner', '-i', filePath], { timeout: 8000 }, (_err, _stdout, stderr) => {
+    execFile(ffmpegBin, ['-hide_banner', '-i', safePath], { timeout: 8000 }, (_err, _stdout, stderr) => {
       resolve(parseFfmpegProbeOutput(stderr || ''));
     });
   });
+}
+
+/**
+ * Extracts stream index and optional language tag from an ffmpeg `Stream #0:1[0x...](lang):` line.
+ * @param {string} line - Single ffmpeg stderr line.
+ * @returns {{ streamIndex: number, lang: string }|null}
+ */
+function parseStreamHeaderMeta(line) {
+  const idxMatch = /^\s*Stream #\d+:(\d+)/i.exec(line);
+  if (!idxMatch) return null;
+  const colonIdx = line.indexOf(':', idxMatch[0].length - idxMatch[1].length);
+  const headerSlice = colonIdx >= 0 ? line.slice(idxMatch[0].length, colonIdx) : '';
+  const langMatch = /\(([^()\r\n]{1,32})\)/.exec(headerSlice);
+  return {
+    streamIndex: Number(idxMatch[1]),
+    lang: (langMatch?.[1] || 'und').trim()
+  };
 }
 
 /**
@@ -163,61 +196,75 @@ function parseMediaContainerProbe(stderrText) {
   }
 
   let video = null;
-  const videoMatch = /Stream #\d+:(\d+)(?:\[0x[0-9a-f]+\])?(?:\(([^)]+)\))?:\s*Video:\s*([^,\r\n]+),\s*([^\r\n]+)/i.exec(text);
-  if (videoMatch) {
-    const codec = videoMatch[3].split(/\s+/)[0].trim().toLowerCase();
-    const info = videoMatch[4];
-    const dimMatch = /\b(\d{3,5})x(\d{3,5})\b/.exec(info);
-    const width = dimMatch ? Number(dimMatch[1]) : 0;
-    const height = dimMatch ? Number(dimMatch[2]) : 0;
-    const fpsMatch = /(\d+(?:\.\d+)?)\s*fps\b/i.exec(info) || /(\d+(?:\.\d+)?)\s*tbr\b/i.exec(info);
-    const fps = fpsMatch ? Number(fpsMatch[1]) : 30;
-    const brMatch = /(\d+)\s*kb\/s/i.exec(info);
-    const bitrateKbps = brMatch ? Number(brMatch[1]) : 0;
-    const pixMatch = /^([^,(]+)/.exec(info);
-    const pixFmt = pixMatch ? pixMatch[1].trim() : '';
-    video = {
-      streamIndex: Number(videoMatch[1]),
-      codec,
-      pixFmt,
-      width,
-      height,
-      fps,
-      bitrateKbps,
-      is4K: width >= 3500 || height >= 2000,
-      isHdr: /10le|12le|p010|bt2020/i.test(info)
-    };
-  }
-
   const audioStreams = [];
-  const audioRegex = /Stream #\d+:(\d+)(?:\[0x[0-9a-f]+\])?(?:\(([^)]+)\))?:\s*Audio:\s*([^,\r\n]+),\s*([^\r\n]+)/gi;
-  let aMatch;
-  while ((aMatch = audioRegex.exec(text)) !== null) {
-    const info = aMatch[4];
-    const srMatch = /(\d+)\s*Hz/i.exec(info);
-    const channels = /\b7\.1\b/i.test(info) ? 8 : /\b5\.1\b/i.test(info) ? 6 : /\bmono\b/i.test(info) ? 1 : 2;
-    audioStreams.push({
-      streamIndex: Number(aMatch[1]),
-      relIndex: audioStreams.length,
-      lang: (aMatch[2] || 'und').trim(),
-      codec: aMatch[3].split(/\s+/)[0].trim().toLowerCase(),
-      sampleRate: srMatch ? Number(srMatch[1]) : 48000,
-      channels
-    });
-  }
-
   const subtitleStreams = [];
-  const subRegex = /Stream #\d+:(\d+)(?:\[0x[0-9a-f]+\])?(?:\(([^)]+)\))?:\s*Subtitle:\s*([^\r\n]+)/gi;
-  let sMatch;
-  while ((sMatch = subRegex.exec(text)) !== null) {
-    const codec = sMatch[3].split(/[,\s(]+/)[0].trim().toLowerCase();
-    subtitleStreams.push({
-      streamIndex: Number(sMatch[1]),
-      relIndex: subtitleStreams.length,
-      lang: (sMatch[2] || 'und').trim(),
-      codec,
-      isBitmap: /pgs|dvd_subtitle|dvb_subtitle|xsub/i.test(codec)
-    });
+  const lines = text.split(/\r?\n/);
+
+  for (const line of lines) {
+    const hdr = parseStreamHeaderMeta(line);
+    if (!hdr) continue;
+
+    const videoIdx = line.search(/:\s*Video:/i);
+    if (!video && videoIdx >= 0) {
+      const rest = line.slice(line.indexOf('Video:', videoIdx) + 6).trim();
+      const commaIdx = rest.indexOf(',');
+      const codecPart = commaIdx >= 0 ? rest.slice(0, commaIdx) : rest;
+      const info = commaIdx >= 0 ? rest.slice(commaIdx + 1).trim() : '';
+      const codec = codecPart.split(/\s+/)[0].trim().toLowerCase();
+      const dimMatch = /\b(\d{3,5})x(\d{3,5})\b/.exec(info);
+      const width = dimMatch ? Number(dimMatch[1]) : 0;
+      const height = dimMatch ? Number(dimMatch[2]) : 0;
+      const fpsMatch = /\b(\d{1,4}(?:\.\d{1,4})?) ?fps\b/i.exec(info) || /\b(\d{1,4}(?:\.\d{1,4})?) ?tbr\b/i.exec(info);
+      const fps = fpsMatch ? Number(fpsMatch[1]) : 30;
+      const brMatch = /\b(\d{1,6}) ?kb\/s\b/i.exec(info);
+      const bitrateKbps = brMatch ? Number(brMatch[1]) : 0;
+      const pixMatch = /^([^,(]+)/.exec(info);
+      const pixFmt = pixMatch ? pixMatch[1].trim() : '';
+      video = {
+        streamIndex: hdr.streamIndex,
+        codec,
+        pixFmt,
+        width,
+        height,
+        fps,
+        bitrateKbps,
+        is4K: width >= 3500 || height >= 2000,
+        isHdr: /10le|12le|p010|bt2020/i.test(info)
+      };
+      continue;
+    }
+
+    const audioIdx = line.search(/:\s*Audio:/i);
+    if (audioIdx >= 0) {
+      const rest = line.slice(line.indexOf('Audio:', audioIdx) + 6).trim();
+      const commaIdx = rest.indexOf(',');
+      const codecPart = commaIdx >= 0 ? rest.slice(0, commaIdx) : rest;
+      const info = commaIdx >= 0 ? rest.slice(commaIdx + 1).trim() : '';
+      const srMatch = /\b(\d{4,7}) ?Hz\b/i.exec(info);
+      const channels = /\b7\.1\b/i.test(info) ? 8 : /\b5\.1\b/i.test(info) ? 6 : /\bmono\b/i.test(info) ? 1 : 2;
+      audioStreams.push({
+        streamIndex: hdr.streamIndex,
+        relIndex: audioStreams.length,
+        lang: hdr.lang,
+        codec: codecPart.split(/\s+/)[0].trim().toLowerCase(),
+        sampleRate: srMatch ? Number(srMatch[1]) : 48000,
+        channels
+      });
+      continue;
+    }
+
+    const subIdx = line.search(/:\s*Subtitle:/i);
+    if (subIdx >= 0) {
+      const rest = line.slice(line.indexOf('Subtitle:', subIdx) + 9).trim();
+      const codec = rest.split(/[,\s(]+/)[0].trim().toLowerCase();
+      subtitleStreams.push({
+        streamIndex: hdr.streamIndex,
+        relIndex: subtitleStreams.length,
+        lang: hdr.lang,
+        codec,
+        isBitmap: /pgs|dvd_subtitle|dvb_subtitle|xsub/i.test(codec)
+      });
+    }
   }
 
   return { durationSec, video, audioStreams, subtitleStreams };
@@ -230,11 +277,12 @@ function parseMediaContainerProbe(stderrText) {
  */
 async function probeMediaStreams(filePath) {
   const ffmpegBin = resolveFfmpegBinary();
-  if (!ffmpegBin || !filePath || !fs.existsSync(filePath)) {
+  const safePath = validateSafeFilePath(filePath, { allowedExtensions: BRIDGE_MEDIA_EXTENSIONS });
+  if (!ffmpegBin || !safePath) {
     return { durationSec: 0, video: null, audioStreams: [], subtitleStreams: [] };
   }
   return new Promise((resolve) => {
-    execFile(ffmpegBin, ['-hide_banner', '-i', filePath], { timeout: 8000 }, (_err, _stdout, stderr) => {
+    execFile(ffmpegBin, ['-hide_banner', '-i', safePath], { timeout: 8000 }, (_err, _stdout, stderr) => {
       resolve(parseMediaContainerProbe(stderr || ''));
     });
   });
@@ -323,14 +371,15 @@ function parseEbuR128Summary(stderrText, targetLufs = -14.0) {
  */
 async function measureEbuR128Loudness(filePath, targetLufs = -14.0) {
   const ffmpegBin = resolveFfmpegBinary();
-  if (!ffmpegBin || !filePath || !fs.existsSync(filePath)) {
+  const safePath = validateSafeFilePath(filePath, { allowedExtensions: BRIDGE_MEDIA_EXTENSIONS });
+  if (!ffmpegBin || !safePath) {
     return { integratedLufs: targetLufs, truePeakDbfs: -1.0, replayGainDb: 0, linearGain: 1.0 };
   }
 
   return new Promise((resolve) => {
     execFile(
       ffmpegBin,
-      ['-hide_banner', '-nostats', '-i', filePath, '-vn', '-af', 'ebur128=peak=true', '-f', 'null', '-'],
+      ['-hide_banner', '-nostats', '-i', safePath, '-vn', '-af', 'ebur128=peak=true', '-f', 'null', '-'],
       { timeout: 25000, maxBuffer: 4 * 1024 * 1024 },
       (_err, _stdout, stderr) => {
         resolve(parseEbuR128Summary(stderr || '', targetLufs));
@@ -529,18 +578,35 @@ class NativeWasapiPlayer {
     await this.stopAsync();
     const mySession = ++this.sessionId;
 
+    const safePath = validateSafeFilePath(filePath, { allowedExtensions: BRIDGE_MEDIA_EXTENSIONS });
+    if (!safePath) {
+      throw new Error('Invalid or rejected audio file path');
+    }
+
+    const safeDeviceId =
+      typeof options.deviceId === 'string' &&
+      options.deviceId.trim() &&
+      !options.deviceId.trim().startsWith('-') &&
+      !/[\r\n\0]/.test(options.deviceId) &&
+      options.deviceId.trim().length <= 256
+        ? options.deviceId.trim()
+        : '';
+    const safeGain = Number.isFinite(Number(options.linearGain))
+      ? Math.max(0, Math.min(4.0, Number(options.linearGain)))
+      : 1.0;
+
     const ffmpegBin = resolveFfmpegBinary();
     const engineBin = resolveWasapiEngineBinary();
-    const useNativeDop = Boolean(options.dop) && options.exclusive !== false && isNativeDsdFile(filePath);
+    const useNativeDop = Boolean(options.dop) && options.exclusive !== false && isNativeDsdFile(safePath);
     if ((!useNativeDop && !ffmpegBin) || !engineBin) {
       throw new Error('Missing ffmpeg-static or vanta-audio-engine.exe');
     }
 
-    this.currentFilePath = filePath;
+    this.currentFilePath = safePath;
     this.currentOptions = options;
     this.seekOffsetSec = Math.max(0, Number(options.seekSec) || 0);
 
-    const probe = options.probe || (await probeAudioStreamInfo(filePath));
+    const probe = options.probe || (await probeAudioStreamInfo(safePath));
     if (mySession !== this.sessionId) return;
     this.currentProbe = probe;
 
@@ -561,18 +627,18 @@ class NativeWasapiPlayer {
       const engArgs = [
         '--exclusive',
         '--dop-file',
-        filePath,
+        safePath,
         '--seek-sec',
         String(this.seekOffsetSec.toFixed(3)),
         '--ctrl-pipe',
         pipeName
       ];
-      if (options.deviceId) {
-        engArgs.push('--device', options.deviceId);
+      if (safeDeviceId) {
+        engArgs.push('--device', safeDeviceId);
       }
 
       logger.info('WasapiEngine', 'Starting Native DoP v1.1 session', {
-        filePath,
+        filePath: safePath,
         sampleRate: probe.sampleRate,
         codec: probe.codec,
         channels: probe.channels,
@@ -593,7 +659,7 @@ class NativeWasapiPlayer {
 
       ffArgs.push(
         '-i',
-        filePath,
+        safePath,
         '-vn',
         '-f',
         's32le',
@@ -613,21 +679,21 @@ class NativeWasapiPlayer {
         '--channels',
         String(targetChannels),
         '--gain',
-        String(options.linearGain ?? 1.0),
+        String(safeGain),
         '--ctrl-pipe',
         pipeName
       ];
-      if (options.deviceId) {
-        engArgs.push('--device', options.deviceId);
+      if (safeDeviceId) {
+        engArgs.push('--device', safeDeviceId);
       }
 
       logger.info('WasapiEngine', 'Starting native WASAPI session', {
-        filePath,
+        filePath: safePath,
         exclusive: options.exclusive !== false,
         sampleRate: probe.sampleRate,
         codec: probe.codec,
         bitDepth: probe.bitDepth,
-        linearGain: options.linearGain ?? 1.0
+        linearGain: safeGain
       });
 
       this.ffmpegProc = spawn(ffmpegBin, ffArgs, { windowsHide: true });
@@ -813,17 +879,19 @@ class WindowsVolumeBridge {
 async function writeFfmpegMetadataOnDisk(filePath, patch = {}) {
   const ffmpegBin = resolveFfmpegBinary();
   if (!ffmpegBin) return { ok: false, error: 'FFmpeg binary not found' };
-  if (!filePath || !fs.existsSync(filePath)) return { ok: false, error: 'Media file not found' };
+  const safePath = validateSafeFilePath(filePath, { allowedExtensions: BRIDGE_MEDIA_EXTENSIONS });
+  if (!safePath) return { ok: false, error: 'Media file not found or rejected by path policy' };
 
-  const ext = path.extname(filePath);
-  const dir = path.dirname(filePath);
-  const stem = path.basename(filePath, ext);
-  const tmpPath = path.join(dir, `.vanta-tagtmp-${stem.slice(0, 24)}-${process.pid}-${Date.now()}${ext}`);
+  const ext = path.extname(safePath);
+  const dir = path.dirname(safePath);
+  const stem = path.basename(safePath, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const tmpPath = path.join(dir, `.vanta-tagtmp-${stem.slice(0, 24)}-${crypto.randomUUID()}${ext}`);
 
   const metaArgs = [];
   const pushMeta = (k, v) => {
     if (v !== undefined && v !== null) {
-      metaArgs.push('-metadata', `${k}=${String(v).trim()}`);
+      const cleanVal = String(v).replace(/[\r\n\0]/g, ' ').trim().slice(0, 512);
+      metaArgs.push('-metadata', `${k}=${cleanVal}`);
     }
   };
   pushMeta('title', patch.title);
@@ -845,13 +913,13 @@ async function writeFfmpegMetadataOnDisk(filePath, patch = {}) {
   try {
     await execFileAsync(
       ffmpegBin,
-      ['-hide_banner', '-loglevel', 'error', '-y', '-i', filePath, '-map', '0', '-map_metadata', '0', '-c', 'copy', ...metaArgs, tmpPath],
+      ['-hide_banner', '-loglevel', 'error', '-y', '-i', safePath, '-map', '0', '-map_metadata', '0', '-c', 'copy', ...metaArgs, tmpPath],
       { timeout: 15000 }
     );
     if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size === 0) {
       return { ok: false, error: 'Tagged temp file was empty' };
     }
-    fs.renameSync(tmpPath, filePath);
+    fs.renameSync(tmpPath, safePath);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message };

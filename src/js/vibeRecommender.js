@@ -161,7 +161,7 @@ export function parseSemanticSearchQuery(rawQuery) {
   const moodTags = moodDictionary.filter((m) => clean.includes(m));
   const stopWords = new Set(['for', 'with', 'and', 'the', 'around', 'bpm', 'mix', 'music', 'track', 'songs']);
   const tokens = clean
-    .replace(/\d{2,3}\s*[-–to]*\s*\d*\s*bpm/gi, '')
+    .replace(/\b\d{2,3}(?:\s?(?:[-–]|to)\s?\d{2,3})?\s?bpm\b/gi, '')
     .split(/[^a-z0-9ğüşıöç]+/i)
     .filter((w) => w.length >= 2 && !stopWords.has(w));
 
@@ -380,7 +380,7 @@ export function applyProSmartFilter(catalogTracks = [], filters = {}, anchorTrac
         keyFilter = part.slice(4).trim();
       } else if (lower.startsWith('star:') || lower.startsWith('stars:')) {
         const rawVal = lower.replace(/^stars?:/, '');
-        const num = parseInt(rawVal, 10);
+        const num = Number.parseInt(rawVal, 10);
         if (!Number.isNaN(num)) {
           if (rawVal.endsWith('+')) minStars = num;
           else exactStars = num;

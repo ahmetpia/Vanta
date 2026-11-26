@@ -189,16 +189,16 @@ class VantaStudioApp {
 
     // Scan C:\Vanta\VantaVault + saved folders & WASAPI hardware DACs via IPC
     if (window.vantaAPI) {
-      this.populateAudioDevices();
+      void this.populateAudioDevices().catch(() => {});
 
       window.vantaAPI.onVolumeEvent((vol) => {
         this.applySystemVolumeState(vol);
       });
       window.vantaAPI.onAudioDevicesChanged(() => {
-        this.populateAudioDevices(true);
+        void this.populateAudioDevices(true).catch(() => {});
       });
       navigator.mediaDevices?.addEventListener('devicechange', () => {
-        this.populateAudioDevices(true);
+        void this.populateAudioDevices(true).catch(() => {});
       });
       window.vantaAPI
         .getSystemVolume()
@@ -264,7 +264,7 @@ class VantaStudioApp {
    * @param {object} doctor - Quality Doctor report.
    * @param {object[]} [smartPlaylists] - Saved smart playlists.
    */
-  mergeVaultCatalog(diskTracks = [], doctor = { issues: [], healthScore: 100 }, smartPlaylists = null) {
+  mergeVaultCatalog(diskTracks = [], doctor = null, smartPlaylists = null) {
     this.doctorReport = doctor || { issues: [], healthScore: 100 };
     if (Array.isArray(smartPlaylists)) {
       this.smartPlaylists = smartPlaylists;
@@ -294,7 +294,7 @@ class VantaStudioApp {
     this.applyFiltersAndRender(false);
     this.updateSidebarBadges();
     this.renderSmartPlaylistBar();
-    this._scheduleBackgroundTechProbe();
+    void this._scheduleBackgroundTechProbe().catch(() => {});
   }
 
   /**
@@ -874,7 +874,7 @@ class VantaStudioApp {
       const targetSec = Math.max(0, Math.min(Math.max(1, totalSec - 1), (this.wasapiCurrentPositionSec || 0) + deltaSec));
       this.updateTimelineUi(targetSec, totalSec);
       if (this.isPlaying) {
-        this.startPlayback(targetSec);
+        void this.startPlayback(targetSec).catch(() => {});
       } else {
         this.wasapiCurrentPositionSec = targetSec;
       }
@@ -888,7 +888,7 @@ class VantaStudioApp {
     const nextSec = Math.max(0, Math.min(Math.max(1, totalSec - 0.5), currentActual + deltaSec));
     this.updateTimelineUi(nextSec, totalSec);
     if (this.isPlaying) {
-      this.startPlayback(nextSec);
+      void this.startPlayback(nextSec).catch(() => {});
     }
   }
 
@@ -926,7 +926,7 @@ class VantaStudioApp {
    */
   handleTrackEnded() {
     if (this.repeatMode === 'one') {
-      this.startPlayback(0);
+      void this.startPlayback(0).catch(() => {});
       return;
     }
     if (this.repeatMode === 'queue' || this.activeTrackIndex < this.displayedTracks.length - 1) {
@@ -1033,7 +1033,7 @@ class VantaStudioApp {
         }
         if (this.engineMode === 'wasapi' && this.isPlaying) {
           const resumeSec = this.wasapiCurrentPositionSec || 0;
-          this.startPlayback(resumeSec);
+          void this.startPlayback(resumeSec).catch(() => {});
         }
         this.setToast(`Audio Output DAC: ${item.displayLabel || item.label}`);
       };
@@ -1260,7 +1260,7 @@ class VantaStudioApp {
       this.audioEngine.setExternalSpectrum(null);
       if (this.engineMode === 'wasapi' && evt.message) {
         this.setToast(`WASAPI fallback -> Studio DSP (${evt.message})`);
-        this.setEngineMode('dsp', true);
+        void this.setEngineMode('dsp', true).catch(() => {});
       }
       return;
     }
@@ -1761,7 +1761,7 @@ class VantaStudioApp {
         });
         btn.addEventListener('dblclick', (e) => {
           e.stopPropagation();
-          chooseGenre(cat.main);
+          void chooseGenre(cat.main).catch(() => {});
         });
         mainList.appendChild(btn);
       }
@@ -1778,7 +1778,7 @@ class VantaStudioApp {
       setMainBtn.textContent = `Use "${activeCat.main}"`;
       setMainBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        chooseGenre(activeCat.main);
+        void chooseGenre(activeCat.main).catch(() => {});
       });
       subHdr.appendChild(hdrLbl);
       subHdr.appendChild(setMainBtn);
@@ -1793,7 +1793,7 @@ class VantaStudioApp {
         chip.textContent = sub;
         chip.addEventListener('click', (e) => {
           e.stopPropagation();
-          chooseGenre(sub);
+          void chooseGenre(sub).catch(() => {});
         });
         subGrid.appendChild(chip);
       }
@@ -1837,7 +1837,7 @@ class VantaStudioApp {
         item.appendChild(r);
         item.addEventListener('click', (e) => {
           e.stopPropagation();
-          chooseGenre(m.label);
+          void chooseGenre(m.label).catch(() => {});
         });
         searchResultsEl.appendChild(item);
       }
@@ -1850,7 +1850,7 @@ class VantaStudioApp {
         customBtn.textContent = `+ Set custom genre: "${customVal}"`;
         customBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          chooseGenre(customVal);
+          void chooseGenre(customVal).catch(() => {});
         });
         searchResultsEl.appendChild(customBtn);
       }
@@ -1866,7 +1866,7 @@ class VantaStudioApp {
       } else if (e.key === 'Enter') {
         e.preventDefault();
         const choice = searchResultsEl._topChoice || searchInput.value.trim();
-        if (choice) chooseGenre(choice);
+        if (choice) void chooseGenre(choice).catch(() => {});
       }
     });
     popover.onclick = (e) => e.stopPropagation();
@@ -1992,7 +1992,7 @@ class VantaStudioApp {
       e.stopPropagation();
       if (e.key === 'Enter') {
         e.preventDefault();
-        commit();
+        void commit().catch(() => {});
       } else if (e.key === 'Escape') {
         e.preventDefault();
         finished = true;
@@ -2000,7 +2000,7 @@ class VantaStudioApp {
       }
     });
     input.addEventListener('blur', () => {
-      if (!finished) commit();
+      if (!finished) void commit().catch(() => {});
     });
 
     cellEl.replaceChildren(input);
@@ -2098,6 +2098,7 @@ class VantaStudioApp {
         break;
       }
       case 'bpm': {
+        cell.classList.add('rb-cell-right');
         const txt = document.createElement('span');
         txt.className = 'rb-cell-text rb-cell-mono';
         txt.textContent = track.bpm ? String(track.bpm) : '—';
@@ -2142,6 +2143,7 @@ class VantaStudioApp {
         break;
       }
       case 'time': {
+        cell.classList.add('rb-cell-right');
         const txt = document.createElement('span');
         const durStr = this._formatTrackDurationCell(track);
         txt.className = durStr === '—' ? 'rb-cell-mono rb-cell-empty' : 'rb-cell-mono rb-cell-muted';
@@ -2290,15 +2292,17 @@ class VantaStudioApp {
         break;
       }
       case 'created': {
+        cell.classList.add('rb-cell-right');
         const txt = document.createElement('span');
         const createdStr = this._formatCreationDateCell(track);
-        txt.className = createdStr === '—' ? 'rb-cell-mono rb-cell-empty' : 'rb-cell-mono rb-cell-muted';
+        txt.className = createdStr === '—' ? 'rb-cell-text rb-cell-empty' : 'rb-cell-text rb-cell-muted';
         txt.textContent = createdStr;
         txt.title = track.createdAt || '';
         cell.appendChild(txt);
         break;
       }
       case 'size': {
+        cell.classList.add('rb-cell-right');
         const txt = document.createElement('span');
         const sizeStr = this._formatFileSizeCell(track.sizeBytes);
         txt.className = sizeStr === '—' ? 'rb-cell-mono rb-cell-empty' : 'rb-cell-mono rb-cell-muted';
@@ -2759,7 +2763,7 @@ class VantaStudioApp {
           }
         }
       }
-      this.probeActiveTrack(track);
+      void this.probeActiveTrack(track).catch(() => {});
     } else {
       this.audioEl.removeAttribute('src');
       this.deckBEl?.removeAttribute('src');
@@ -2769,7 +2773,7 @@ class VantaStudioApp {
     this.renderQueue();
 
     if (autoPlay) {
-      this.startPlayback(0);
+      void this.startPlayback(0).catch(() => {});
     } else {
       if (window.vantaAPI) window.vantaAPI.wasapiCmd('STOP').catch(() => {});
     }
@@ -2831,20 +2835,20 @@ class VantaStudioApp {
           if (mySeq !== this._playbackSeq) return;
           if (!res?.ok) {
             this.setToast(`WASAPI fallback -> Studio DSP (${res?.error || 'Device busy'})`);
-            this.setEngineMode('dsp', true);
+            void this.setEngineMode('dsp', true).catch(() => {});
           } else if (res.probe) {
             this.activeTrackProbe = res.probe;
             this.updateStreamTelemetry();
           }
         })
         .catch(() => {
-          if (mySeq === this._playbackSeq) this.setEngineMode('dsp', true);
+          if (mySeq === this._playbackSeq) void this.setEngineMode('dsp', true).catch(() => {});
         });
     } else if (track.filePath) {
       this.audioEngine.stopProceduralSynthPreview();
       if (window.vantaAPI) await window.vantaAPI.wasapiCmd('STOP').catch(() => {});
       if (mySeq !== this._playbackSeq) return;
-      if (track.isVideo && this._videoProbePromise) {
+      if (track.isVideo && Boolean(this._videoProbePromise)) {
         await this._videoProbePromise.catch(() => {});
         if (mySeq !== this._playbackSeq) return;
       }
@@ -2927,7 +2931,7 @@ class VantaStudioApp {
    */
   togglePlay() {
     if (this.isPlaying) this.pausePlayback();
-    else this.startPlayback();
+    else void this.startPlayback().catch(() => {});
   }
 
   /**
@@ -3066,7 +3070,7 @@ class VantaStudioApp {
    */
   handleSidebarSwitch(navId) {
     if (navId === 'explorer') {
-      this.toggleComputerExplorer();
+      void this.toggleComputerExplorer().catch(() => {});
       return;
     }
     this.activeNav = navId;
@@ -4169,7 +4173,7 @@ class VantaStudioApp {
         chev.textContent = node.expanded ? '▾' : '▸';
         chev.addEventListener('click', (e) => {
           e.stopPropagation();
-          this.toggleFolderNode(node.path);
+          void this.toggleFolderNode(node.path).catch(() => {});
         });
         row.appendChild(chev);
       } else {
@@ -4864,7 +4868,7 @@ class VantaStudioApp {
       siblingSubtitles: this.siblingSubtitles
     });
     if (isPrimaryVideo && this.isPlaying) {
-      this.startPlayback(curPos);
+      void this.startPlayback(curPos).catch(() => {});
     } else {
       const nextUrl = this.buildVideoStreamUrl(track, nextIdx, curPos);
       this.videoEl.src = nextUrl;
@@ -5064,7 +5068,7 @@ class VantaStudioApp {
         this.videoEl.currentTime = clamped;
       } else if (activeTrack?.isVideo && this.isPlaying) {
         this.studioSeekOffsetSec = clamped > 0.5 ? clamped : 0;
-        this.startPlayback(clamped);
+        void this.startPlayback(clamped).catch(() => {});
       } else if (videoTrack?.filePath) {
         const wasPlaying = Boolean(this.videoEl && !this.videoEl.paused);
         this.studioSeekOffsetSec = clamped > 0.5 ? clamped : 0;
@@ -5097,7 +5101,7 @@ class VantaStudioApp {
     mountEl?.addEventListener('dblclick', (e) => {
       e.stopPropagation();
       clearTimeout(videoClickTimer);
-      toggleFullscreen();
+      void toggleFullscreen().catch(() => {});
     });
 
     stageEl?.addEventListener('mousemove', () => this._pokeTheaterOsd());
@@ -5316,7 +5320,7 @@ class VantaStudioApp {
       } else if (e.key.toLowerCase() === 'm') {
         muteBtn?.click();
       } else if (e.key.toLowerCase() === 'f') {
-        toggleFullscreen();
+        void toggleFullscreen().catch(() => {});
       }
     });
   }
@@ -5372,7 +5376,7 @@ class VantaStudioApp {
     // 2B. Native WASAPI Exclusive vs Studio DSP Switcher
     document.querySelectorAll('[data-engine]').forEach((btn) => {
       btn.addEventListener('click', () => {
-        this.setEngineMode(btn.dataset.engine);
+        void this.setEngineMode(btn.dataset.engine).catch(() => {});
       });
     });
 
@@ -5565,10 +5569,10 @@ class VantaStudioApp {
       }
     });
     document.getElementById('tagInputField')?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') addMetaToEditingTrack('tags');
+      if (e.key === 'Enter') void addMetaToEditingTrack('tags').catch(() => {});
     });
     document.getElementById('groupInputField')?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') addMetaToEditingTrack('groups');
+      if (e.key === 'Enter') void addMetaToEditingTrack('groups').catch(() => {});
     });
     document.getElementById('btnCloseTagEditor')?.addEventListener('click', () => {
       document.getElementById('inlineTagEditor')?.classList.add('hidden');
@@ -5882,7 +5886,7 @@ class VantaStudioApp {
       const sec = Number(e.target.value) || 0;
       this.audioEngine.setCrossfadeSeconds(sec);
       if (sec > 0 && this.engineMode === 'wasapi') {
-        this.setEngineMode('dsp', true);
+        void this.setEngineMode('dsp', true).catch(() => {});
       }
       this.setToast(sec > 0 ? `Dual-Deck Equal-Power Crossfade: ${sec.toFixed(1)}s` : 'Gapless Playback (0.0s Cut)');
     });
@@ -5894,7 +5898,7 @@ class VantaStudioApp {
       const next = speeds[(speeds.indexOf(cur) + 1) % speeds.length];
       this.audioEngine.state.playbackRate = next;
       if (Math.abs(next - 1.0) > 0.001 && this.engineMode === 'wasapi') {
-        this.setEngineMode('dsp', true);
+        void this.setEngineMode('dsp', true).catch(() => {});
       }
       [this.audioEl, this.deckBEl].forEach((deck) => {
         if (!deck) return;
@@ -5938,7 +5942,7 @@ class VantaStudioApp {
         this.wasapiCurrentPositionSec = targetSec;
         this.wasapiResumeSec = targetSec;
         if (triggerPlay && this.isPlaying) {
-          this.startPlayback(targetSec);
+          void this.startPlayback(targetSec).catch(() => {});
         }
         return;
       }
@@ -5946,7 +5950,7 @@ class VantaStudioApp {
       if (track?.filePath && (!track.isVideo || this.activeVideoStrategy !== 'direct')) {
         this.studioSeekOffsetSec = targetSec > 0.5 ? targetSec : 0;
         if (triggerPlay && this.isPlaying) {
-          this.startPlayback(targetSec);
+          void this.startPlayback(targetSec).catch(() => {});
         } else if (!this.isPlaying && track.isVideo) {
           const pausedSeekUrl = this.buildVideoStreamUrl(track, this.activeVideoAudioIdx, this.studioSeekOffsetSec);
           this.videoEl.src = pausedSeekUrl;
@@ -6049,7 +6053,7 @@ class VantaStudioApp {
           if (nextTrack?.filePath && !nextTrack.isVideo) {
             this.crossfadeTriggeredForTrack = true;
             const nextUrl = `vanta-media://local?path=${encodeURIComponent(nextTrack.filePath)}`;
-            this.audioEngine.crossfadeToNext(nextUrl, fadeSec, this.getEffectiveReplayGain());
+            void this.audioEngine.crossfadeToNext(nextUrl, fadeSec, this.getEffectiveReplayGain()).catch(() => {});
             this.activeTrackIndex = nextIdx;
             this.activeTrackProbe = null;
             this.activeTrackR128 = null;
@@ -6057,7 +6061,7 @@ class VantaStudioApp {
             document.getElementById('dockTrackTitle').textContent = nextTrack.title;
             document.getElementById('dockTrackSubtitle').textContent = `${nextTrack.artist} · ${nextTrack.bpm} BPM · ${nextTrack.key}`;
             this.renderQueue();
-            this.probeActiveTrack(nextTrack);
+            void this.probeActiveTrack(nextTrack).catch(() => {});
             this.setToast(`Crossfading (${fadeSec}s) -> ${nextTrack.title}`);
             setTimeout(() => {
               this.crossfadeTriggeredForTrack = false;
@@ -6239,5 +6243,5 @@ class VantaStudioApp {
 
 window.addEventListener('DOMContentLoaded', () => {
   const app = new VantaStudioApp();
-  app.init();
+  void app.init().catch(() => {});
 });

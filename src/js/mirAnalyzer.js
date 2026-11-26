@@ -100,8 +100,8 @@ export function estimateBpmFromPcm(pcmSamples, sampleRate = 44100) {
 export function evaluateHarmonicCompatibility(keyA, keyB) {
   const entryA = CAMELOT_KEY_MAP[keyA] || CAMELOT_KEY_MAP['A min'];
   const entryB = CAMELOT_KEY_MAP[keyB] || CAMELOT_KEY_MAP['A min'];
-  const numA = parseInt(entryA.code, 10);
-  const numB = parseInt(entryB.code, 10);
+  const numA = Number.parseInt(entryA.code, 10);
+  const numB = Number.parseInt(entryB.code, 10);
   const rawDiff = Math.abs(numA - numB);
   const circularDistance = Math.min(rawDiff, 12 - rawDiff);
 

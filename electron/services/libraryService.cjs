@@ -11,6 +11,7 @@ const {
   writeId3v2Tags
 } = require('./id3Service.cjs');
 const logger = require('./loggerService.cjs');
+const { validateSafeDirectoryPath } = require('./pathSecurityService.cjs');
 
 const AUDIO_EXTENSIONS = new Set([
   '.mp3',
@@ -533,9 +534,8 @@ function getComputerRoots() {
  * @returns {{ path: string, entries: Array<object>, error?: string }}
  */
 function listDirectoryEntries(dirPath, userHiddenDirs = []) {
-  const target = String(dirPath || '').trim();
-  if (!target) return { path: '', entries: [], error: 'Invalid directory path' };
-  const normalized = path.normalize(target);
+  const normalized = validateSafeDirectoryPath(dirPath);
+  if (!normalized) return { path: '', entries: [], error: 'Invalid or unsafe directory path' };
   const userHiddenSet = new Set(
     (Array.isArray(userHiddenDirs) ? userHiddenDirs : [])
       .map((p) => path.normalize(String(p || '')).toLowerCase())
