@@ -5,6 +5,9 @@ const path = require('node:path');
 
 const SUBTITLE_EXTENSIONS = new Set(['.srt', '.vtt']);
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif']);
+const SACD_ISO_EXTENSIONS = new Set(['.iso']);
+const PEQ_TXT_EXTENSIONS = new Set(['.txt']);
+const CONVOLVER_IR_EXTENSIONS = new Set(['.wav']);
 
 const WINDOWS_RESERVED_DEVICE_RE = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i;
 
@@ -308,9 +311,48 @@ function resolveFromTrustedRoots(rawPath, trustedRoots, options = {}) {
   return canonicalizePath(current);
 }
 
+/**
+ * Validates that an `.iso` file exists, obeys all path security checks, and contains a genuine
+ * ScarletBook `SACDMTOC` header at LSN 510 (2048-byte or raw 2064-byte sector layout).
+ * Rejects OS/DVD/arbitrary `.iso` files before any ingestion or extraction.
+ * @param {string} rawPath - Untrusted ISO file path.
+ * @returns {string|null} Canonical verified SACD ISO path or null if rejected.
+ */
+function validateSafeSacdIsoPath(rawPath) {
+  const canon = validateSafeFilePath(rawPath, { allowedExtensions: SACD_ISO_EXTENSIONS });
+  if (!canon) return null;
+  let fd = null;
+  try {
+    fd = fs.openSync(canon, 'r');
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size < 511 * 2048) return null;
+    const sig = Buffer.alloc(8);
+    if (fs.readSync(fd, sig, 0, 8, 510 * 2048) === 8 && sig.toString('ascii') === 'SACDMTOC') {
+      return canon;
+    }
+    if (st.size >= 511 * 2064 && fs.readSync(fd, sig, 0, 8, 510 * 2064 + 12) === 8 && sig.toString('ascii') === 'SACDMTOC') {
+      return canon;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close error
+      }
+    }
+  }
+}
+
 module.exports = {
   SUBTITLE_EXTENSIONS,
   IMAGE_EXTENSIONS,
+  SACD_ISO_EXTENSIONS,
+  PEQ_TXT_EXTENSIONS,
+  CONVOLVER_IR_EXTENSIONS,
   VAULT_SUBFOLDER_MAP,
   hasSafePathSyntax,
   canonicalizePath,
@@ -318,6 +360,7 @@ module.exports = {
   resolveSafeVaultSubfolder,
   validateSafeFilePath,
   validateSafeDirectoryPath,
+  validateSafeSacdIsoPath,
   isPathAuthorizedInScope,
   resolveFromTrustedRoots
 };

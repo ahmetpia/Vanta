@@ -6,6 +6,54 @@ const path = require('node:path');
 const { validateSafeFilePath } = require('./pathSecurityService.cjs');
 
 const MP3_EXTENSIONS = new Set(['.mp3']);
+const FLAC_EXTENSIONS = new Set(['.flac']);
+
+/**
+ * Parses a ReplayGain dB string (e.g. "-6.42 dB", "+1.20 dB") or number into a bounded float.
+ * @param {string|number|null|undefined} raw - Raw tag value.
+ * @returns {number|null} Gain in dB or null if absent/invalid.
+ */
+function parseReplayGainDbValue(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? Math.max(-50, Math.min(30, Number(raw.toFixed(2)))) : null;
+  }
+  const m = /([+-]?\d+(?:\.\d+)?)/.exec(String(raw).trim());
+  if (!m) return null;
+  const val = Number(m[1]);
+  return Number.isFinite(val) ? Math.max(-50, Math.min(30, Number(val.toFixed(2)))) : null;
+}
+
+/**
+ * Parses a ReplayGain peak string (e.g. "0.987654") or number into a finite peak amplitude.
+ * @param {string|number|null|undefined} raw - Raw tag value.
+ * @returns {number|null} Linear sample/true peak or null if absent/invalid.
+ */
+function parseReplayGainPeakValue(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  const val = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  return Number.isFinite(val) && val > 0 && val <= 16 ? Number(val.toFixed(6)) : null;
+}
+
+/**
+ * Formats a dB gain according to ReplayGain 2.0 conventions (e.g. "-6.42 dB").
+ * @param {number} db - Gain in decibels.
+ * @returns {string}
+ */
+function formatReplayGainDb(db) {
+  const n = Number(db) || 0;
+  return `${n >= 0 ? '+' : ''}${n.toFixed(2)} dB`;
+}
+
+/**
+ * Formats a peak amplitude according to ReplayGain 2.0 conventions (6 decimals).
+ * @param {number} peak - Linear peak amplitude.
+ * @returns {string}
+ */
+function formatReplayGainPeak(peak) {
+  const n = Math.max(0, Number(peak) || 0);
+  return n.toFixed(6);
+}
 
 const ID3V1_GENRES = [
   'Blues', 'Classic Rock', 'Country', 'Dance', 'Disco', 'Funk', 'Grunge', 'Hip-Hop', 'Jazz', 'Metal',
@@ -120,6 +168,29 @@ function createTextFrame(frameId, text) {
 }
 
 /**
+ * Builds an ID3v2 TXXX (User Defined Text Information) frame using UTF-8 encoding (0x03).
+ * @param {string} description - TXXX field descriptor (e.g., 'REPLAYGAIN_TRACK_GAIN').
+ * @param {string|number} value - Field value text.
+ * @returns {Buffer|null} Complete TXXX frame buffer or null if empty.
+ */
+function createTxxxFrame(description, value) {
+  const cleanDesc = String(description || '').trim();
+  if (!cleanDesc || value === undefined || value === null || String(value).trim() === '') {
+    return null;
+  }
+  const enc = Buffer.from([0x03]);
+  const descBytes = Buffer.concat([Buffer.from(cleanDesc, 'utf8'), Buffer.from([0x00])]);
+  const valBytes = Buffer.from(String(value).trim(), 'utf8');
+  const payload = Buffer.concat([enc, descBytes, valBytes]);
+
+  const header = Buffer.alloc(10);
+  header.write('TXXX', 0, 4, 'ascii');
+  header.writeUInt32BE(payload.length, 4);
+  header.writeUInt16BE(0, 8);
+  return Buffer.concat([header, payload]);
+}
+
+/**
  * Builds an ID3v2 USLT (Unsynchronized Lyrics) or COMM (Comment) frame.
  * @param {'USLT'|'COMM'} frameId - Frame identifier.
  * @param {string} content - Lyrics or comment body.
@@ -188,6 +259,19 @@ function createApicFrame(imageBuffer, mimeType = 'image/jpeg') {
  */
 function writeId3v2Tags(mp3Buffer, metadata = {}) {
   const cleanAudio = stripExistingId3v2(mp3Buffer);
+  const rgTrackGain = metadata.replayGainTrackGainDb !== undefined && metadata.replayGainTrackGainDb !== null
+    ? formatReplayGainDb(metadata.replayGainTrackGainDb)
+    : metadata.REPLAYGAIN_TRACK_GAIN;
+  const rgTrackPeak = metadata.replayGainTrackPeak !== undefined && metadata.replayGainTrackPeak !== null
+    ? formatReplayGainPeak(metadata.replayGainTrackPeak)
+    : metadata.REPLAYGAIN_TRACK_PEAK;
+  const rgAlbumGain = metadata.replayGainAlbumGainDb !== undefined && metadata.replayGainAlbumGainDb !== null
+    ? formatReplayGainDb(metadata.replayGainAlbumGainDb)
+    : metadata.REPLAYGAIN_ALBUM_GAIN;
+  const rgAlbumPeak = metadata.replayGainAlbumPeak !== undefined && metadata.replayGainAlbumPeak !== null
+    ? formatReplayGainPeak(metadata.replayGainAlbumPeak)
+    : metadata.REPLAYGAIN_ALBUM_PEAK;
+
   const frames = [
     createTextFrame('TIT2', metadata.title),
     createTextFrame('TPE1', metadata.artist),
@@ -197,6 +281,10 @@ function writeId3v2Tags(mp3Buffer, metadata = {}) {
     createTextFrame('TKEY', metadata.key),
     createTextFrame('TYER', metadata.year),
     createTextFrame('TSRC', metadata.isrc),
+    createTxxxFrame('REPLAYGAIN_TRACK_GAIN', rgTrackGain),
+    createTxxxFrame('REPLAYGAIN_TRACK_PEAK', rgTrackPeak),
+    createTxxxFrame('REPLAYGAIN_ALBUM_GAIN', rgAlbumGain),
+    createTxxxFrame('REPLAYGAIN_ALBUM_PEAK', rgAlbumPeak),
     createLangTextFrame('USLT', metadata.lyrics, 'Lyrics'),
     createLangTextFrame('COMM', metadata.provenance, 'Provenance'),
     createApicFrame(metadata.coverBuffer)
@@ -253,6 +341,10 @@ function readId3v2Tags(mp3Buffer) {
     isrc: '',
     lyrics: '',
     provenance: '',
+    replayGainTrackGainDb: null,
+    replayGainTrackPeak: null,
+    replayGainAlbumGainDb: null,
+    replayGainAlbumPeak: null,
     hasCover: false,
     coverMime: '',
     coverDataUrl: '',
@@ -312,6 +404,41 @@ function readId3v2Tags(mp3Buffer) {
       case 'TSRC':
         result.isrc = decodeTextPayload(payload);
         break;
+      case 'TXXX': {
+        if (payload.length > 2) {
+          const enc = payload[0];
+          const body = payload.subarray(1);
+          let sep = -1;
+          let valueStart = -1;
+          if (enc === 0x01 || enc === 0x02) {
+            for (let k = 0; k + 1 < body.length; k += 2) {
+              if (body[k] === 0x00 && body[k + 1] === 0x00) {
+                sep = k;
+                valueStart = k + 2;
+                break;
+              }
+            }
+          } else {
+            sep = body.indexOf(0x00);
+            if (sep >= 0) valueStart = sep + 1;
+          }
+          if (sep >= 0 && valueStart <= body.length) {
+            const encByte = Buffer.from([enc]);
+            const desc = decodeTextPayload(Buffer.concat([encByte, body.subarray(0, sep)])).trim().toUpperCase();
+            const val = decodeTextPayload(Buffer.concat([encByte, body.subarray(valueStart)]));
+            if (desc === 'REPLAYGAIN_TRACK_GAIN') {
+              result.replayGainTrackGainDb = parseReplayGainDbValue(val);
+            } else if (desc === 'REPLAYGAIN_TRACK_PEAK') {
+              result.replayGainTrackPeak = parseReplayGainPeakValue(val);
+            } else if (desc === 'REPLAYGAIN_ALBUM_GAIN') {
+              result.replayGainAlbumGainDb = parseReplayGainDbValue(val);
+            } else if (desc === 'REPLAYGAIN_ALBUM_PEAK') {
+              result.replayGainAlbumPeak = parseReplayGainPeakValue(val);
+            }
+          }
+        }
+        break;
+      }
       case 'USLT':
       case 'COMM': {
         if (payload.length > 4) {
@@ -419,6 +546,10 @@ function updateMp3MetadataOnDisk(filePath, patch = {}) {
       isrc: current.isrc,
       lyrics: current.lyrics,
       provenance: current.provenance,
+      replayGainTrackGainDb: patch.replayGainTrackGainDb !== undefined ? patch.replayGainTrackGainDb : current.replayGainTrackGainDb,
+      replayGainTrackPeak: patch.replayGainTrackPeak !== undefined ? patch.replayGainTrackPeak : current.replayGainTrackPeak,
+      replayGainAlbumGainDb: patch.replayGainAlbumGainDb !== undefined ? patch.replayGainAlbumGainDb : current.replayGainAlbumGainDb,
+      replayGainAlbumPeak: patch.replayGainAlbumPeak !== undefined ? patch.replayGainAlbumPeak : current.replayGainAlbumPeak,
       coverBuffer: current.coverBuffer
     };
     const updatedBuf = writeId3v2Tags(rawBuf, merged);
@@ -459,6 +590,10 @@ function readFlacMetadataFromFile(filePath) {
     key: '',
     year: '',
     lyrics: '',
+    replayGainTrackGainDb: null,
+    replayGainTrackPeak: null,
+    replayGainAlbumGainDb: null,
+    replayGainAlbumPeak: null,
     sampleRate: 0,
     channels: 0,
     bitDepth: 0,
@@ -526,6 +661,10 @@ function readFlacMetadataFromFile(filePath) {
             else if ((k === 'INITIALKEY' || k === 'INITIAL_KEY' || k === 'KEY' || k === 'TKEY') && !empty.key) empty.key = v;
             else if ((k === 'DATE' || k === 'YEAR') && !empty.year) empty.year = v.slice(0, 4);
             else if ((k === 'LYRICS' || k === 'UNSYNCEDLYRICS' || k === 'USLT') && !empty.lyrics) empty.lyrics = v;
+            else if (k === 'REPLAYGAIN_TRACK_GAIN') empty.replayGainTrackGainDb = parseReplayGainDbValue(v);
+            else if (k === 'REPLAYGAIN_TRACK_PEAK') empty.replayGainTrackPeak = parseReplayGainPeakValue(v);
+            else if (k === 'REPLAYGAIN_ALBUM_GAIN') empty.replayGainAlbumGainDb = parseReplayGainDbValue(v);
+            else if (k === 'REPLAYGAIN_ALBUM_PEAK') empty.replayGainAlbumPeak = parseReplayGainPeakValue(v);
           }
         }
       }
@@ -546,14 +685,179 @@ function readFlacMetadataFromFile(filePath) {
   }
 }
 
+/**
+ * Atomically updates VORBIS_COMMENT tags (including ReplayGain 2.0 tags) on a FLAC file
+ * without touching audio frames, STREAMINFO MD5, or embedded PICTURE blocks.
+ * @param {string} filePath - Target .flac path.
+ * @param {object} [patch={}] - Fields (`title`, `artist`, `album`, `genre`, `bpm`, `key`, `year`,
+ *   `replayGainTrackGainDb`, `replayGainTrackPeak`, `replayGainAlbumGainDb`, `replayGainAlbumPeak`).
+ * @returns {{ ok: boolean, error?: string }}
+ */
+function updateFlacVorbisTagsOnDisk(filePath, patch = {}) {
+  const safePath = validateSafeFilePath(filePath, { allowedExtensions: FLAC_EXTENSIONS });
+  if (!safePath) {
+    return { ok: false, error: 'FLAC file not found or rejected by path policy' };
+  }
+  try {
+    const raw = fs.readFileSync(safePath);
+    if (raw.length < 42 || raw.toString('ascii', 0, 4) !== 'fLaC') {
+      return { ok: false, error: 'Invalid FLAC header' };
+    }
+
+    let offset = 4;
+    let isLast = false;
+    const preservedBlocks = [];
+    let vendorStr = 'reference libFLAC VANTA 2.0';
+    let comments = [];
+
+    while (!isLast && offset + 4 <= raw.length) {
+      const hdr = raw.subarray(offset, offset + 4);
+      isLast = (hdr[0] & 0x80) !== 0;
+      const blockType = hdr[0] & 0x7f;
+      const blockLen = (hdr[1] << 16) | (hdr[2] << 8) | hdr[3];
+      offset += 4;
+      if (blockLen < 0 || offset + blockLen > raw.length) {
+        return { ok: false, error: 'Corrupt FLAC metadata block length' };
+      }
+      const body = raw.subarray(offset, offset + blockLen);
+      offset += blockLen;
+
+      if (blockType === 1) {
+        // Drop old PADDING block; rebuild clean padding below
+        continue;
+      }
+      if (blockType === 4 && body.length >= 8) {
+        let pos = 0;
+        const vLen = body.readUInt32LE(pos);
+        pos += 4;
+        if (pos + vLen <= body.length) {
+          vendorStr = body.subarray(pos, pos + vLen).toString('utf8') || vendorStr;
+          pos += vLen;
+        }
+        if (pos + 4 <= body.length) {
+          const count = body.readUInt32LE(pos);
+          pos += 4;
+          for (let i = 0; i < count && pos + 4 <= body.length; i++) {
+            const cLen = body.readUInt32LE(pos);
+            pos += 4;
+            if (cLen <= 0 || pos + cLen > body.length) break;
+            const entry = body.subarray(pos, pos + cLen).toString('utf8');
+            pos += cLen;
+            const eq = entry.indexOf('=');
+            if (eq > 0) {
+              comments.push({
+                key: entry.slice(0, eq).trim(),
+                upperKey: entry.slice(0, eq).trim().toUpperCase(),
+                value: entry.slice(eq + 1)
+              });
+            }
+          }
+        }
+      } else {
+        preservedBlocks.push({ blockType, body });
+      }
+    }
+
+    const audioFrames = raw.subarray(offset);
+
+    const setOrRemoveTag = (upperKey, formattedValue) => {
+      comments = comments.filter((c) => c.upperKey !== upperKey);
+      if (formattedValue !== undefined && formattedValue !== null && String(formattedValue).trim() !== '') {
+        comments.push({ key: upperKey, upperKey, value: String(formattedValue).trim() });
+      }
+    };
+
+    if (patch.title !== undefined) setOrRemoveTag('TITLE', patch.title);
+    if (patch.artist !== undefined) setOrRemoveTag('ARTIST', patch.artist);
+    if (patch.album !== undefined) setOrRemoveTag('ALBUM', patch.album);
+    if (patch.genre !== undefined) setOrRemoveTag('GENRE', patch.genre);
+    if (patch.bpm !== undefined) setOrRemoveTag('BPM', patch.bpm);
+    if (patch.key !== undefined) setOrRemoveTag('INITIALKEY', patch.key);
+    if (patch.year !== undefined) setOrRemoveTag('DATE', patch.year);
+    if (patch.replayGainTrackGainDb !== undefined) {
+      setOrRemoveTag('REPLAYGAIN_TRACK_GAIN', patch.replayGainTrackGainDb === null ? null : formatReplayGainDb(patch.replayGainTrackGainDb));
+    }
+    if (patch.replayGainTrackPeak !== undefined) {
+      setOrRemoveTag('REPLAYGAIN_TRACK_PEAK', patch.replayGainTrackPeak === null ? null : formatReplayGainPeak(patch.replayGainTrackPeak));
+    }
+    if (patch.replayGainAlbumGainDb !== undefined) {
+      setOrRemoveTag('REPLAYGAIN_ALBUM_GAIN', patch.replayGainAlbumGainDb === null ? null : formatReplayGainDb(patch.replayGainAlbumGainDb));
+    }
+    if (patch.replayGainAlbumPeak !== undefined) {
+      setOrRemoveTag('REPLAYGAIN_ALBUM_PEAK', patch.replayGainAlbumPeak === null ? null : formatReplayGainPeak(patch.replayGainAlbumPeak));
+    }
+
+    const vendorBuf = Buffer.from(vendorStr, 'utf8');
+    const vLenBuf = Buffer.alloc(4);
+    vLenBuf.writeUInt32LE(vendorBuf.length, 0);
+    const countBuf = Buffer.alloc(4);
+    countBuf.writeUInt32LE(comments.length, 0);
+    const commentParts = [vLenBuf, vendorBuf, countBuf];
+    for (const c of comments) {
+      const entryBuf = Buffer.from(`${c.key}=${c.value}`, 'utf8');
+      const eLen = Buffer.alloc(4);
+      eLen.writeUInt32LE(entryBuf.length, 0);
+      commentParts.push(eLen, entryBuf);
+    }
+    const vorbisBody = Buffer.concat(commentParts);
+
+    const allBlocks = [
+      ...preservedBlocks,
+      { blockType: 4, body: vorbisBody },
+      { blockType: 1, body: Buffer.alloc(1024, 0) }
+    ];
+
+    const outParts = [Buffer.from('fLaC', 'ascii')];
+    for (let i = 0; i < allBlocks.length; i++) {
+      const blk = allBlocks[i];
+      const len = blk.body.length;
+      if (len > 0xffffff) {
+        return { ok: false, error: 'FLAC metadata block exceeds 16 MB limit' };
+      }
+      const hdr = Buffer.alloc(4);
+      hdr[0] = (i === allBlocks.length - 1 ? 0x80 : 0x00) | (blk.blockType & 0x7f);
+      hdr[1] = (len >> 16) & 0xff;
+      hdr[2] = (len >> 8) & 0xff;
+      hdr[3] = len & 0xff;
+      outParts.push(hdr, blk.body);
+    }
+    outParts.push(audioFrames);
+
+    const updatedBuf = Buffer.concat(outParts);
+    const dir = path.dirname(safePath);
+    const base = path.basename(safePath);
+    const tmpPath = path.join(dir, `.${base}.vanta-tmp-${crypto.randomUUID()}`);
+    fs.writeFileSync(tmpPath, updatedBuf);
+    try {
+      fs.renameSync(tmpPath, safePath);
+    } catch {
+      fs.writeFileSync(safePath, updatedBuf);
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {
+        // Ignore cleanup failure
+      }
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 module.exports = {
   normalizeId3Genre,
   encodeSynchsafeInt,
   decodeSynchsafeInt,
   stripExistingId3v2,
+  parseReplayGainDbValue,
+  parseReplayGainPeakValue,
+  formatReplayGainDb,
+  formatReplayGainPeak,
+  createTxxxFrame,
   writeId3v2Tags,
   readId3v2Tags,
   readId3v2FromFile,
   updateMp3MetadataOnDisk,
-  readFlacMetadataFromFile
+  readFlacMetadataFromFile,
+  updateFlacVorbisTagsOnDisk
 };

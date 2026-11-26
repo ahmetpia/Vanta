@@ -229,6 +229,10 @@ function inspectMediaFile(fullPath, index, options = {}) {
 
   const rawLyrics = id3.lyrics || flac.lyrics || '';
   const hasLyrics = Boolean(rawLyrics && rawLyrics.trim() && !/^Restored by VANTA Quality Doctor$/i.test(rawLyrics.trim()));
+  const replayGainTrackGainDb = id3.replayGainTrackGainDb ?? flac.replayGainTrackGainDb ?? null;
+  const replayGainTrackPeak = id3.replayGainTrackPeak ?? flac.replayGainTrackPeak ?? null;
+  const replayGainAlbumGainDb = id3.replayGainAlbumGainDb ?? flac.replayGainAlbumGainDb ?? null;
+  const replayGainAlbumPeak = id3.replayGainAlbumPeak ?? flac.replayGainAlbumPeak ?? null;
   const record = {
     id: id3.isrc || audioHash || `local-${index}`,
     filePath: fullPath,
@@ -252,6 +256,10 @@ function inspectMediaFile(fullPath, index, options = {}) {
     bitrateKbps: 0,
     lyrics: statCache ? '' : rawLyrics,
     hasLyrics,
+    replayGainTrackGainDb,
+    replayGainTrackPeak,
+    replayGainAlbumGainDb,
+    replayGainAlbumPeak,
     provenance,
     hasId3: Boolean(id3.hasId3 || flac.hasFlac),
     hasCover: Boolean(id3.hasCover || hasSiblingCover || coverDataUrl),

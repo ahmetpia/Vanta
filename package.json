@@ -10,6 +10,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test tests/vanta.test.mjs",
+    "build:native": "powershell -NoProfile -ExecutionPolicy Bypass -File native/build_engine.ps1",
     "build:dir": "electron-builder --dir",
     "build:win": "electron-builder --win --x64"
   },

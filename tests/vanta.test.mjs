@@ -15,7 +15,11 @@ import {
   computeEqualPowerCrossfade,
   computeMidSideSpatialGains,
   computeBauerCrossfeedParams,
-  computeSubBassCurveParams
+  computeSubBassCurveParams,
+  buildSignalPathDescriptor,
+  computeWasapiGainFactor,
+  resolveStartupAudioPrefs,
+  resolveReplayGain2
 } from '../src/js/audioEngine.js';
 import { VISUALIZER_MODES } from '../src/js/visualizer.js';
 import {
@@ -55,7 +59,12 @@ const {
   writeId3v2Tags,
   readId3v2Tags,
   updateMp3MetadataOnDisk,
-  readFlacMetadataFromFile
+  readFlacMetadataFromFile,
+  updateFlacVorbisTagsOnDisk,
+  parseReplayGainDbValue,
+  parseReplayGainPeakValue,
+  formatReplayGainDb,
+  formatReplayGainPeak
 } = require('../electron/services/id3Service.cjs');
 const {
   sanitizeFilename,
@@ -92,17 +101,27 @@ const {
   parseMediaContainerProbe,
   decideVideoPlaybackStrategy,
   convertSrtToVtt,
+  resolveFfmpegBinary,
   resolveWasapiEngineBinary,
-  listWasapiDevices
+  listWasapiDevices,
+  listAsioDevices,
+  inspectWavPackDsdHeader,
+  computeAlbumLoudnessSummary,
+  readReplayGainTagsForFile,
+  analyzeAlbumReplayGain,
+  listSacdIsoTracks,
+  buildSacdCatalogTracks
 } = require('../electron/services/audioBridgeService.cjs');
 
 const {
   resolveSafeVaultSubfolder,
   validateSafeFilePath,
   validateSafeDirectoryPath,
+  validateSafeSacdIsoPath,
   isPathAuthorizedInScope,
   resolveFromTrustedRoots,
-  SUBTITLE_EXTENSIONS
+  SUBTITLE_EXTENSIONS,
+  SACD_ISO_EXTENSIONS
 } = require('../electron/services/pathSecurityService.cjs');
 
 describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
@@ -260,13 +279,17 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
     // Legacy 8-band migration
     eng2.importPersistState({ gains: [1, 2, 3, 4, 5, 6, 7, 8] });
     assert.equal(eng2.state.gains.length, 10);
-    // Bit-Perfect Reset preserves clip Limiter & EBU R128 safety while zeroing FX
+    // Bit-Perfect Pure Reset zeroes coloring FX, Limiter, and EBU R128 for strict Bit-Perfect transport;
+    // Studio DSP Preset re-enables EBU R128 + True-Peak Limiter in one action
     eng2.toggleDspFlag('spatial');
+    eng2.applyStudioDspPreset();
+    assert.equal(eng2.state.limiter, true);
+    assert.equal(eng2.state.lufs, true);
     eng2.resetBitPerfect();
     assert.equal(eng2.state.spatial, false);
     assert.equal(eng2.state.pitchSemitones, 0);
-    assert.equal(eng2.state.limiter, true);
-    assert.equal(eng2.state.lufs, true);
+    assert.equal(eng2.state.limiter, false);
+    assert.equal(eng2.state.lufs, false);
   });
 
   it('5. MIR Song DNA, PCM BPM Onset Estimator, Semantic Search & Vibe Radio AI', () => {
@@ -466,8 +489,16 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
 
     const engine = new VantaAudioEngine();
     assert.equal(engine.activeDeck, 'A');
-    assert.equal(engine.state.lufs, true);
+    assert.equal(engine.state.lufs, false);
+    assert.equal(engine.state.limiter, false);
     assert.equal(engine.state.eqEnabled, false);
+    assert.equal(engine.state.volumeMode, 'auto');
+    engine.applyStudioDspPreset();
+    assert.equal(engine.state.lufs, true);
+    assert.equal(engine.state.limiter, true);
+    engine.resetBitPerfect();
+    assert.equal(engine.state.lufs, false);
+    assert.equal(engine.state.limiter, false);
     assert.equal(engine.state.crossfadeSeconds, 0.0);
     engine.setCrossfadeSeconds(6);
     assert.equal(engine.state.crossfadeSeconds, 6);
@@ -1371,7 +1402,7 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
     assert.equal(dsdArgs[0], '-af');
     assert.match(
       dsdArgs[1],
-      /aresample=resampler=swr:tsf=dblp:filter_type=kaiser:filter_size=128:phase_shift=12:kaiser_beta=14:cutoff=0\.95:osr=352800/
+      /aresample=resampler=swr:tsf=dblp:filter_type=kaiser:filter_size=256:phase_shift=12:kaiser_beta=16:cutoff=0\.95:exact_rational=1:osr=352800/
     );
 
     const studioDsdArgs = buildHighPrecisionResampleArgs(0, 176400, { force: true, ditherMethod: 'shibata' });
@@ -1512,5 +1543,771 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
     assert.match(purePathDesc.stages[1].detail, /Kaiser-Sinc.*352\.8 kHz/);
     assert.match(purePathDesc.stages[2].detail, /64-bit/i);
     assert.match(purePathDesc.stages[3].detail, /True-Peak Limiter.*TPDF Dither/);
+  });
+
+  it('20. Phase 0 Audiophile Harness: C++ --self-test, 24-bit PCM MSB fidelity, +3.5 dBFS float headroom & 64-bit Kaiser-Sinc', () => {
+    const exePath = resolveWasapiEngineBinary();
+    assert.ok(exePath && fs.existsSync(exePath), `Missing vanta-audio-engine.exe at ${exePath}`);
+    const ffmpegBin = resolveFfmpegBinary();
+    assert.ok(ffmpegBin && fs.existsSync(ffmpegBin), `Missing ffmpeg binary at ${ffmpegBin}`);
+
+    // 1. Native C++ --self-test (RingBuffer, Bit-Exact Pcm32/Pcm24, PurePath 64 EQ/PEQ32/Convolver/BitAudit, TruePeak 4x Hermite, TPDF16, DoP, Backend Lifecycle)
+    const selfTestRaw = execFileSync(exePath, ['--self-test'], { encoding: 'utf8', timeout: 10000 }).trim();
+    const selfTest = JSON.parse(selfTestRaw);
+    assert.equal(selfTest.ok, true, `C++ --self-test failed: ${selfTestRaw}`);
+    assert.equal(selfTest.failed, 0);
+    assert.ok(selfTest.passed >= 19, `Expected at least 19 C++ self-tests, got ${selfTest.passed}`);
+    assert.equal(selfTest.tests.peq32AutoEqStability, true);
+    assert.equal(selfTest.tests.fftConvolverDiracAndPerf192k, true);
+    assert.equal(selfTest.tests.liveMetersBitAuditAndTruePeak, true);
+    for (const [name, passed] of Object.entries(selfTest.tests)) {
+      assert.equal(passed, true, `Expected C++ self-test "${name}" to pass`);
+    }
+
+    const tmpFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-phase0-fixtures-'));
+    try {
+      // Helper to build minimal RIFF/WAVE PCM or IEEE-Float container cleanly
+      const buildWavBuffer = (sampleRate, channels, bitsPerSample, audioFormatTag, payloadBuf) => {
+        const blockAlign = (channels * bitsPerSample) / 8;
+        const byteRate = sampleRate * blockAlign;
+        const hdr = Buffer.alloc(44);
+        hdr.write('RIFF', 0, 'ascii');
+        hdr.writeUInt32LE(36 + payloadBuf.length, 4);
+        hdr.write('WAVE', 8, 'ascii');
+        hdr.write('fmt ', 12, 'ascii');
+        hdr.writeUInt32LE(16, 16);
+        hdr.writeUInt16LE(audioFormatTag, 20);
+        hdr.writeUInt16LE(channels, 22);
+        hdr.writeUInt32LE(sampleRate, 24);
+        hdr.writeUInt32LE(byteRate, 28);
+        hdr.writeUInt16LE(blockAlign, 32);
+        hdr.writeUInt16LE(bitsPerSample, 34);
+        hdr.write('data', 36, 'ascii');
+        hdr.writeUInt32LE(payloadBuf.length, 40);
+        return Buffer.concat([hdr, payloadBuf]);
+      };
+
+      // 2. 24-bit PCM MSB-aligned lossless extraction via FFmpeg -> pcm_s32le (0 bit loss)
+      const patterns24 = [0x123456, -0x234567, 0x7fffff, -0x800000, 0x000001, -0x000001, 0x400000, -0x400000];
+      const pcm24Payload = Buffer.alloc(patterns24.length * 3);
+      for (let i = 0; i < patterns24.length; i++) {
+        const u = patterns24[i] & 0xffffff;
+        pcm24Payload[i * 3] = u & 0xff;
+        pcm24Payload[i * 3 + 1] = (u >> 8) & 0xff;
+        pcm24Payload[i * 3 + 2] = (u >> 16) & 0xff;
+      }
+      const wav24Path = path.join(tmpFixtureDir, 'bitpattern_24bit.wav');
+      fs.writeFileSync(wav24Path, buildWavBuffer(48000, 2, 24, 1, pcm24Payload));
+
+      const rawS32Out = execFileSync(
+        ffmpegBin,
+        ['-hide_banner', '-loglevel', 'error', '-i', wav24Path, '-vn', '-f', 's32le', '-acodec', 'pcm_s32le', '-'],
+        { timeout: 8000 }
+      );
+      assert.equal(rawS32Out.length, patterns24.length * 4);
+      for (let i = 0; i < patterns24.length; i++) {
+        const s32 = rawS32Out.readInt32LE(i * 4);
+        assert.equal(s32 & 0xff, 0, '24-bit source must remain clean MSB-aligned in 32-bit container');
+        assert.equal(s32 >> 8, patterns24[i], `24-bit sample index ${i} must match bit-for-bit`);
+      }
+
+      // 3. +3.5 dBFS IEEE Float32 WAV headroom preservation via pcm_f64le + attenuation vs integer saturation
+      const floatFrames = 1024;
+      const floatPayload = Buffer.alloc(floatFrames * 2 * 4);
+      const peakAmp = Math.pow(10, 3.5 / 20); // ~1.4962 (+3.5 dBFS)
+      for (let f = 0; f < floatFrames; f++) {
+        const v = peakAmp * Math.sin((2 * Math.PI * 1000 * f) / 44100);
+        floatPayload.writeFloatLE(v, f * 8);
+        floatPayload.writeFloatLE(-v, f * 8 + 4);
+      }
+      const wavOverPath = path.join(tmpFixtureDir, 'headroom_plus3_5dbfs.wav');
+      fs.writeFileSync(wavOverPath, buildWavBuffer(44100, 2, 32, 3, floatPayload));
+
+      // Verify raw pcm_f64le pipe keeps peaks > 1.0 unclipped so ReplayGain/DSP can attenuate cleanly
+      const rawF64Out = execFileSync(
+        ffmpegBin,
+        ['-hide_banner', '-loglevel', 'error', '-i', wavOverPath, '-vn', '-f', 'f64le', '-acodec', 'pcm_f64le', '-'],
+        { timeout: 8000 }
+      );
+      assert.equal(rawF64Out.length, floatFrames * 2 * 8);
+      let maxF64 = 0;
+      for (let i = 0; i < floatFrames * 2; i++) {
+        const val = Math.abs(rawF64Out.readDoubleLE(i * 8));
+        if (val > maxF64) maxF64 = val;
+      }
+      assert.ok(maxF64 > 1.45 && maxF64 < 1.52, `Expected unclipped +3.5 dBFS headroom in f64le, got ${maxF64}`);
+
+      // Verify 64-bit dblp 256-tap Kaiser-Sinc (beta=16) resampling (44.1 kHz -> 96 kHz) preserves headroom without clipping or NaN
+      const resampledF64Out = execFileSync(
+        ffmpegBin,
+        [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-i',
+          wavOverPath,
+          '-vn',
+          '-af',
+          'volume=-4dB,aresample=resampler=swr:tsf=dblp:filter_type=kaiser:filter_size=256:phase_shift=12:kaiser_beta=16:cutoff=0.95:exact_rational=1:osr=96000',
+          '-f',
+          'f64le',
+          '-acodec',
+          'pcm_f64le',
+          '-'
+        ],
+        { timeout: 8000 }
+      );
+      const outSampleCount = resampledF64Out.length / 8;
+      assert.ok(outSampleCount > floatFrames * 2 * 2.1, 'Expected ~2.177x frames from 44.1 -> 96 kHz');
+      let maxAttenuated = 0;
+      for (let i = 0; i < outSampleCount; i++) {
+        const s = resampledF64Out.readDoubleLE(i * 8);
+        assert.ok(Number.isFinite(s), 'Kaiser-Sinc output must contain only finite float64 samples');
+        const absS = Math.abs(s);
+        if (absS > maxAttenuated) maxAttenuated = absS;
+      }
+      assert.ok(maxAttenuated > 0.85 && maxAttenuated <= 0.99, `Expected unclipped ~-0.5 dBFS peak after -4dB + Kaiser-Sinc, got ${maxAttenuated}`);
+    } finally {
+      fs.rmSync(tmpFixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  it('21. Phase 1 Core Transport: Endpoint --probe-caps, 64-bit f64le/rate routing, startup Pure defaults, Volume Modes & Signal Path', async () => {
+    const exePath = resolveWasapiEngineBinary();
+    assert.ok(exePath && fs.existsSync(exePath), `Missing vanta-audio-engine.exe at ${exePath}`);
+
+    // 1. Live Windows endpoint --probe-caps JSON contract
+    const capsRaw = execFileSync(exePath, ['--probe-caps'], { encoding: 'utf8', timeout: 8000 }).trim();
+    const liveCaps = JSON.parse(capsRaw);
+    assert.equal(liveCaps.ok, true, `Expected live --probe-caps ok=true, got ${capsRaw}`);
+    assert.equal(typeof liveCaps.deviceId, 'string');
+    assert.equal(typeof liveCaps.deviceName, 'string');
+    assert.equal(typeof liveCaps.exclusiveSupported, 'boolean');
+    assert.ok(Array.isArray(liveCaps.supportedRates) && liveCaps.supportedRates.length >= 1, 'Expected non-empty supportedRates');
+    assert.ok([16, 24, 32].includes(liveCaps.maxBitDepth));
+
+    // 2. Optimal Exclusive target rate selector keeps WASAPI Exclusive instead of dropping to Shared
+    const bridgeMod = await import('../electron/services/audioBridgeService.cjs');
+    const selectOptimalExclusiveTargetRate =
+      bridgeMod.selectOptimalExclusiveTargetRate || bridgeMod.default?.selectOptimalExclusiveTargetRate;
+    const selectFfmpegPipeFormat =
+      bridgeMod.selectFfmpegPipeFormat || bridgeMod.default?.selectFfmpegPipeFormat;
+    assert.equal(typeof selectOptimalExclusiveTargetRate, 'function');
+    assert.equal(typeof selectFfmpegPipeFormat, 'function');
+
+    const headsetCaps = {
+      ok: true,
+      exclusiveSupported: true,
+      sharedSampleRate: 48000,
+      maxBitDepth: 16,
+      supportedRates: [48000]
+    };
+    const btRes = selectOptimalExclusiveTargetRate(44100, headsetCaps, { exclusivePreferred: true });
+    assert.equal(btRes.targetRate, 48000);
+    assert.equal(btRes.useExclusive, true);
+    assert.equal(btRes.resampled, true);
+    assert.equal(btRes.reason, 'exclusive_swr_resample');
+
+    const dacCaps = {
+      ok: true,
+      exclusiveSupported: true,
+      sharedSampleRate: 48000,
+      maxBitDepth: 24,
+      supportedRates: [48000, 88200, 96000]
+    };
+    // Exact native match -> untouched rate, zero resampling
+    assert.deepEqual(
+      selectOptimalExclusiveTargetRate(96000, dacCaps, { exclusivePreferred: true }),
+      { targetRate: 96000, useExclusive: true, resampled: false, reason: 'native_rate_match' }
+    );
+    // 44.1k source on DAC without 44.1k native -> picks same-clock-family integer 2x (88.2 kHz)
+    assert.deepEqual(
+      selectOptimalExclusiveTargetRate(44100, dacCaps, { exclusivePreferred: true }),
+      { targetRate: 88200, useExclusive: true, resampled: true, reason: 'exclusive_swr_resample' }
+    );
+    // Fixed Rate Lock overrides automatic native matching
+    assert.deepEqual(
+      selectOptimalExclusiveTargetRate(44100, dacCaps, { exclusivePreferred: true, fixedRateLock: true, fixedTargetRate: 96000 }),
+      { targetRate: 96000, useExclusive: true, resampled: true, reason: 'fixed_rate_lock' }
+    );
+    // Genuine non-exclusive endpoint falls back cleanly to Shared mix rate
+    assert.deepEqual(
+      selectOptimalExclusiveTargetRate(96000, { ok: true, exclusiveSupported: false, sharedSampleRate: 48000, supportedRates: [] }, { exclusivePreferred: true }),
+      { targetRate: 48000, useExclusive: false, resampled: true, reason: 'shared_fallback_endpoint' }
+    );
+
+    // 3. Smart FFmpeg Pipe Format routing: s32le for lossless integer pass-through, f64le for lossy/float/resampled
+    const flac16 = selectFfmpegPipeFormat({ codec: 'FLAC', bitDepth: 16 }, { resampled: false });
+    assert.equal(flac16.ffCodec, 'pcm_s32le');
+    assert.equal(flac16.inFmt, 's32le');
+    assert.equal(flac16.effectiveSrcBits, 16);
+
+    const flac24Resampled = selectFfmpegPipeFormat({ codec: 'FLAC', bitDepth: 24 }, { resampled: true });
+    assert.equal(flac24Resampled.ffCodec, 'pcm_f64le');
+    assert.equal(flac24Resampled.inFmt, 'f64le');
+    assert.equal(flac24Resampled.effectiveSrcBits, 32);
+
+    const mp3Pipe = selectFfmpegPipeFormat({ codec: 'MP3', bitDepth: 0 }, { resampled: false });
+    assert.equal(mp3Pipe.ffCodec, 'pcm_f64le');
+    assert.equal(mp3Pipe.inFmt, 'f64le');
+    assert.equal(mp3Pipe.isLossyOrFloat, true);
+
+    // 4. Startup Profile Defaults (WASAPI + Bit-Perfect Pure), Persistence & v1 -> v2 Migration
+    const fresh = resolveStartupAudioPrefs(null, null);
+    assert.equal(fresh.engineMode, 'wasapi');
+    assert.equal(fresh.holdWasapiOnPause, false);
+    assert.equal(fresh.wasapiPushMode, false);
+
+    const restoredStudio = resolveStartupAudioPrefs(
+      JSON.stringify({ version: 2, preferredAudioEngineMode: 'dsp', holdWasapiOnPause: true, wasapiPushMode: true, wasapiBufferMs: 40, clockSwitchPreRollMs: 50, fixedRateLock: true, fixedTargetRate: 96000 }),
+      null
+    );
+    assert.equal(restoredStudio.engineMode, 'dsp');
+    assert.equal(restoredStudio.holdWasapiOnPause, true);
+    assert.equal(restoredStudio.wasapiPushMode, true);
+    assert.equal(restoredStudio.wasapiBufferMs, 40);
+    assert.equal(restoredStudio.clockSwitchPreRollMs, 50);
+    assert.equal(restoredStudio.fixedRateLock, true);
+    assert.equal(restoredStudio.fixedTargetRate, 96000);
+
+    const legacyImplicit = resolveStartupAudioPrefs(
+      null,
+      JSON.stringify({ eqEnabled: false, lufs: true, limiter: true, gains: new Array(10).fill(0), deviceProfile: 'Bit-Perfect (Flat)' })
+    );
+    assert.equal(legacyImplicit.engineMode, 'wasapi');
+    assert.equal(legacyImplicit.migratePureDspDefaults, true);
+
+    const legacyCustomStudio = resolveStartupAudioPrefs(
+      null,
+      JSON.stringify({ eqEnabled: true, spatial: true, lufs: true, limiter: true, gains: [2, 0, 0, 0, 0, 0, 0, 0, 0, 0] })
+    );
+    assert.equal(legacyCustomStudio.engineMode, 'dsp');
+    assert.equal(legacyCustomStudio.migratePureDspDefaults, false);
+
+    // 5. Volume Mode Gain Matrix & Honest Signal Path Reporting (SW Volume vs HW Volume vs Shared Fallback vs XRUNs)
+    assert.equal(computeWasapiGainFactor({ volumeMode: 'auto', windowsVolumeLinked: true, deviceHwVolumeSupport: 3, masterVolumeLinear: 0.4, replayGainLinear: 1.0 }), 1.0);
+    assert.equal(computeWasapiGainFactor({ volumeMode: 'auto', windowsVolumeLinked: true, deviceHwVolumeSupport: 0, masterVolumeLinear: 0.4, replayGainLinear: 1.0 }), 0.4);
+    assert.equal(computeWasapiGainFactor({ volumeMode: 'software', windowsVolumeLinked: true, deviceHwVolumeSupport: 3, masterVolumeLinear: 0.5, replayGainLinear: 0.8 }), 0.4);
+    assert.equal(computeWasapiGainFactor({ volumeMode: 'fixed0db', windowsVolumeLinked: true, deviceHwVolumeSupport: 0, masterVolumeLinear: 0.25, replayGainLinear: 1.0 }), 1.0);
+
+    const swVolPath = buildSignalPathDescriptor({
+      engineMode: 'wasapi',
+      filePath: 'C:\\Music\\track.flac',
+      probe: { codec: 'FLAC', sampleRate: 44100, bitDepth: 24, channels: 2 },
+      wasapiEvent: { mode: 'exclusive', pushMode: true, sampleRate: 48000, bitsPerSample: 16, validBits: 16, inFmt: 'f64le', bitExact: false, xrunCount: 2, deviceName: 'JBL Buds' },
+      ratePlan: btRes,
+      volumeMode: 'software',
+      preRollMs: 50,
+      linearGain: 0.5,
+      dspState: { eqEnabled: false, gains: new Array(10).fill(0), limiter: false, lufs: false }
+    });
+    assert.equal(swVolPath.qualityTone, 'purepath');
+    assert.equal(swVolPath.xrunCount, 2);
+    assert.match(swVolPath.stages[1].detail, /256-tap, beta=16/);
+    assert.match(swVolPath.stages[2].detail, /64-Bit Software Volume/);
+    assert.match(swVolPath.stages[3].title, /24->16 TPDF Dither/);
+    assert.match(swVolPath.stages[3].spec, /Pre-Roll 50 ms/);
+    assert.match(swVolPath.stages[4].detail, /Push Timer/);
+    assert.match(swVolPath.stages[4].spec, /XRUNs: 2/);
+
+    const sharedFallbackPath = buildSignalPathDescriptor({
+      engineMode: 'wasapi',
+      filePath: 'C:\\Music\\track.flac',
+      probe: { codec: 'FLAC', sampleRate: 96000, bitDepth: 24, channels: 2 },
+      wasapiEvent: { mode: 'shared', sampleRate: 48000, bitsPerSample: 32, validBits: 24, bitExact: false, xrunCount: 0, deviceName: 'Generic Endpoint' },
+      ratePlan: { targetRate: 48000, useExclusive: false, resampled: true, reason: 'shared_fallback_endpoint' },
+      linearGain: 1.0,
+      dspState: { eqEnabled: false, gains: new Array(10).fill(0), limiter: false, lufs: false }
+    });
+    assert.equal(sharedFallbackPath.qualityTone, 'shared');
+    assert.equal(sharedFallbackPath.qualityBadge, 'WASAPI SHARED FALLBACK');
+  });
+
+  it('22. Phase 2 Audiophile Harness: ReplayGain 2.0 Tagging/Math, ASIO Backend, WavPack DSD, SACD ISO & Signal Path', async () => {
+    const exePath = resolveWasapiEngineBinary();
+    const ffmpegBin = resolveFfmpegBinary();
+    assert.ok(exePath && fs.existsSync(exePath));
+    assert.ok(ffmpegBin && fs.existsSync(ffmpegBin));
+
+    // 1. ReplayGain 2.0 pure helpers & clip-protected math
+    assert.equal(parseReplayGainDbValue(' -7.45 dB '), -7.45);
+    assert.equal(parseReplayGainDbValue('+3.20 dB'), 3.2);
+    assert.equal(parseReplayGainPeakValue('0.988123'), 0.988123);
+    assert.equal(formatReplayGainDb(-7.4), '-7.40 dB');
+    assert.equal(formatReplayGainPeak(0.95), '0.950000');
+
+    const bypassedRg = resolveReplayGain2({ enabled: false, mode: 'track', targetLufs: -18, tags: { replayGainTrackGainDb: -6 } });
+    assert.equal(bypassedRg.linearGain, 1.0);
+    assert.equal(bypassedRg.appliedDb, 0);
+
+    const album18 = resolveReplayGain2({
+      enabled: true,
+      mode: 'album',
+      targetLufs: -18,
+      tags: { replayGainTrackGainDb: -4.0, replayGainTrackPeak: 0.9, replayGainAlbumGainDb: -6.0, replayGainAlbumPeak: 0.95 },
+      clipProtect: true
+    });
+    assert.equal(album18.appliedDb, -6);
+    assert.equal(album18.source, 'tag_album');
+
+    const album14 = resolveReplayGain2({
+      enabled: true,
+      mode: 'album',
+      targetLufs: -14,
+      tags: { replayGainAlbumGainDb: -6.0, replayGainAlbumPeak: 0.5 },
+      clipProtect: true
+    });
+    assert.equal(album14.appliedDb, -2); // -6 dB @ -18 ref -> -2 dB @ -14 ref
+
+    const peakCapped = resolveReplayGain2({
+      enabled: true,
+      mode: 'track',
+      targetLufs: -18,
+      tags: { replayGainTrackGainDb: 8.0, replayGainTrackPeak: 0.9 },
+      clipProtect: true
+    });
+    assert.ok(peakCapped.linearGain * 0.9 <= 0.945, `Expected clip protection to cap peak gain, got linearGain=${peakCapped.linearGain}`);
+
+    const albumSummary = computeAlbumLoudnessSummary([
+      { integratedLufs: -12.0, truePeakDbfs: -0.5, durationSec: 180 },
+      { integratedLufs: -20.0, truePeakDbfs: -3.0, durationSec: 60 }
+    ], -18.0);
+    assert.ok(albumSummary && albumSummary.albumLufs > -16 && albumSummary.albumLufs < -12);
+    assert.ok(albumSummary.albumGainDb < 0);
+
+    // 2. Startup v2 prefs persist ASIO fields cleanly
+    const asioPrefs = resolveStartupAudioPrefs(
+      JSON.stringify({ version: 2, preferredAudioEngineMode: 'wasapi', outputBackend: 'asio', asioDriver: 'Realtek ASIO', asioRawDsd: true }),
+      null
+    );
+    assert.equal(asioPrefs.outputBackend, 'asio');
+    assert.equal(asioPrefs.asioDriver, 'Realtek ASIO');
+    assert.equal(asioPrefs.asioRawDsd, true);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-phase2-fixtures-'));
+    try {
+      // 3. Atomic MP3 ID3v2 TXXX & FLAC VORBIS_COMMENT ReplayGain 2.0 writes + Album EBU R128 scan
+      const mp3Path = path.join(tmpDir, 'rg_track1.mp3');
+      const flac1Path = path.join(tmpDir, 'rg_album1.flac');
+      const flac2Path = path.join(tmpDir, 'rg_album2.flac');
+      const wvPcmPath = path.join(tmpDir, 'pcm_test.wv');
+
+      execFileSync(ffmpegBin, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=0.4', '-ar', '44100', '-ac', '2', '-c:a', 'libmp3lame', '-b:a', '192k', mp3Path], { stdio: 'ignore', timeout: 15000 });
+      execFileSync(ffmpegBin, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=0.4', '-af', 'volume=0.6', '-ar', '48000', '-ac', '2', '-c:a', 'flac', flac1Path], { stdio: 'ignore', timeout: 15000 });
+      execFileSync(ffmpegBin, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=880:duration=0.4', '-af', 'volume=0.2', '-ar', '48000', '-ac', '2', '-c:a', 'flac', flac2Path], { stdio: 'ignore', timeout: 15000 });
+      execFileSync(ffmpegBin, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=523.25:duration=0.25', '-ar', '48000', '-ac', '2', '-c:a', 'wavpack', wvPcmPath], { stdio: 'ignore', timeout: 15000 });
+
+      const mp3HashBefore = computeAudioPayloadFingerprint(mp3Path);
+      const mp3Updated = updateMp3MetadataOnDisk(mp3Path, {
+        title: 'RG2 MP3 Master',
+        artist: 'VANTA Test',
+        replayGainTrackGainDb: -7.45,
+        replayGainTrackPeak: 0.988123,
+        replayGainAlbumGainDb: -6.12,
+        replayGainAlbumPeak: 0.995
+      });
+      assert.equal(mp3Updated.ok, true);
+      assert.equal(computeAudioPayloadFingerprint(mp3Path), mp3HashBefore);
+      const mp3Tags = readId3v2Tags(fs.readFileSync(mp3Path));
+      assert.equal(mp3Tags.replayGainTrackGainDb, -7.45);
+      assert.equal(mp3Tags.replayGainAlbumGainDb, -6.12);
+      assert.ok(Math.abs(mp3Tags.replayGainTrackPeak - 0.988123) < 1e-6);
+
+      // Verify FLAC STREAMINFO (bytes 4..41) + trailing audio bytes remain bit-identical after VORBIS_COMMENT patch
+      const parseFlacAudioStart = (buf) => {
+        let pos = 4;
+        while (pos + 4 <= buf.length) {
+          const hdr = buf[pos];
+          const isLast = (hdr & 0x80) !== 0;
+          const len = (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3];
+          pos += 4 + len;
+          if (isLast) return pos;
+        }
+        return -1;
+      };
+      const flacOrigBuf = fs.readFileSync(flac1Path);
+      const origStreamInfo = flacOrigBuf.subarray(8, 42);
+      const origAudioFrames = flacOrigBuf.subarray(parseFlacAudioStart(flacOrigBuf));
+
+      const flacPatchedOk = updateFlacVorbisTagsOnDisk(flac1Path, {
+        artist: 'VANTA Studio',
+        replayGainTrackGainDb: -8.25,
+        replayGainTrackPeak: 0.912345,
+        replayGainAlbumGainDb: -7.8,
+        replayGainAlbumPeak: 0.995
+      });
+      assert.equal(flacPatchedOk.ok, true);
+      const flacNewBuf = fs.readFileSync(flac1Path);
+      const newAudioStart = parseFlacAudioStart(flacNewBuf);
+      assert.ok(newAudioStart > 42);
+      assert.deepEqual(flacNewBuf.subarray(8, 42), origStreamInfo, 'FLAC STREAMINFO must remain identical');
+      assert.deepEqual(flacNewBuf.subarray(newAudioStart), origAudioFrames, 'FLAC audio frames must remain bit-identical');
+      const flacMeta = readFlacMetadataFromFile(flac1Path);
+      assert.equal(flacMeta.artist, 'VANTA Studio');
+      assert.equal(flacMeta.replayGainTrackGainDb, -8.25);
+      assert.equal(flacMeta.replayGainAlbumGainDb, -7.8);
+
+      const rgAnalyze = await analyzeAlbumReplayGain([
+        { filePath: flac1Path, durationSec: 0.4 },
+        { filePath: flac2Path, durationSec: 0.4 }
+      ], { targetLufs: -18.0, writeTags: true });
+      assert.equal(rgAnalyze.ok, true);
+      assert.equal(rgAnalyze.tracks.length, 2);
+      assert.equal(rgAnalyze.tracks.filter((t) => t.taggedOk).length, 2);
+      assert.ok(Number.isFinite(rgAnalyze.albumSummary?.albumLufs));
+      assert.equal(rgAnalyze.tracks[0].albumGainDb, rgAnalyze.tracks[1].albumGainDb);
+      assert.ok(rgAnalyze.tracks[1].trackGainDb > rgAnalyze.tracks[0].trackGainDb, 'Quieter track should receive higher positive/less-negative ReplayGain');
+      const diskFlac2Tags = await readReplayGainTagsForFile(flac2Path);
+      assert.equal(diskFlac2Tags.replayGainAlbumGainDb, rgAnalyze.albumSummary.albumGainDb);
+
+      // 4. ASIO enumeration contract
+      const asioCliRaw = execFileSync(exePath, ['--list-asio-devices'], { encoding: 'utf8', timeout: 8000 }).trim();
+      const asioCli = JSON.parse(asioCliRaw);
+      assert.ok(Array.isArray(asioCli));
+      const asioSvc = await listAsioDevices();
+      assert.ok(Array.isArray(asioSvc));
+      assert.equal(asioSvc.length, asioCli.length);
+
+      // 5. WavPack DSD vs PCM inspection + FFmpeg probe parser
+      const wvPcmInfo = inspectWavPackDsdHeader(wvPcmPath);
+      assert.equal(wvPcmInfo.isWvDsd, false);
+      assert.ok(wvPcmInfo.blockSamples > 0);
+
+      const wvDsdPath = path.join(tmpDir, 'synthetic_dsd.wv');
+      const wvDsdHdr = Buffer.alloc(64);
+      wvDsdHdr.write('wvpk', 0, 'ascii');
+      wvDsdHdr.writeUInt32LE(56, 4); // ckSize
+      wvDsdHdr.writeUInt16LE(0x0410, 8); // version
+      wvDsdHdr.writeUInt32LE(0x80000000 >>> 0, 24); // flags bit 31 = DSD audio
+      fs.writeFileSync(wvDsdPath, wvDsdHdr);
+      const wvDsdInfo = inspectWavPackDsdHeader(wvDsdPath);
+      assert.equal(wvDsdInfo.isWvDsd, true);
+
+      const wvProbe = parseFfmpegProbeOutput(
+        '  Duration: 00:03:15.00, start: 0.000000\n  Stream #0:0: Audio: wavpack, 2822400 Hz, stereo, dsd_lsbf\n',
+        wvDsdPath
+      );
+      assert.equal(wvProbe.codec, 'DSD_WAVPACK');
+      assert.equal(wvProbe.sampleRate, 2822400);
+      assert.equal(wvProbe.bitDepth, 1);
+
+      // 6. SACD ISO validation + ScarletBook TOC parsing + catalog track generation
+      assert.equal(SACD_ISO_EXTENSIONS.has('.iso'), true);
+      const nonSacdIso = path.join(tmpDir, 'data_disc.iso');
+      fs.writeFileSync(nonSacdIso, Buffer.alloc(2048 * 4, 0));
+      assert.equal(validateSafeSacdIsoPath(nonSacdIso), null);
+      assert.equal(validateSafeSacdIsoPath('\\\\server\\share\\disc.iso'), null);
+
+      const sacdIsoPath = path.join(tmpDir, 'synthetic_sacd.iso');
+      // Build 520 * 2048 byte ISO matching SacdIsoReader layout: SACDMTOC @ LSN 510, TWOCHTOC @ 512, SACDTRL1 @ 513, SACDTRL2 @ 514, SACDTTxt @ 515, audio @ 516..517
+      const isoBuf = Buffer.alloc(520 * 2048, 0);
+      const mtocOff = 510 * 2048;
+      isoBuf.write('SACDMTOC', mtocOff, 'ascii');
+      isoBuf[mtocOff + 8] = 1; // major
+      isoBuf[mtocOff + 9] = 20; // minor
+      isoBuf.write('VANTA-SACD-001', mtocOff + 24, 'ascii');
+      isoBuf.writeUInt32BE(512, mtocOff + 64); // area_1_toc_1_start
+      isoBuf.writeUInt16BE(4, mtocOff + 84);   // area_1_toc_size (sectors)
+
+      // TWOCHTOC @ LSN 512
+      const atocOff = 512 * 2048;
+      isoBuf.write('TWOCHTOC', atocOff, 'ascii');
+      isoBuf[atocOff + 20] = 4;  // fs code -> 2822400 Hz
+      isoBuf[atocOff + 21] = 2;  // frame_format = raw DSD (0 = DST)
+      isoBuf[atocOff + 32] = 2;  // channels
+
+      // SACDTRL1 @ LSN 513 (toc sector 1)
+      const trl1Off = 513 * 2048;
+      isoBuf.write('SACDTRL1', trl1Off, 'ascii');
+      isoBuf.writeUInt32BE(516, trl1Off + 8);           // track_start_lsn[0]
+      isoBuf.writeUInt32BE(2, trl1Off + 8 + 255 * 4);   // track_length_lsn[0]
+
+      // SACDTRL2 @ LSN 514 (toc sector 2)
+      const trl2Off = 514 * 2048;
+      isoBuf.write('SACDTRL2', trl2Off, 'ascii');
+      isoBuf[trl2Off + 8 + 255 * 4 + 1] = 2; // 2 sec duration
+
+      // SACDTTxt @ LSN 515 (toc sector 3)
+      const ttxtOff = 515 * 2048;
+      isoBuf.write('SACDTTxt', ttxtOff, 'ascii');
+      isoBuf.writeUInt16BE(520, ttxtOff + 8);
+      const ttxtPayload = Buffer.concat([
+        Buffer.from([0x01]),
+        Buffer.from('Time Capsule SACD\0', 'utf8'),
+        Buffer.from([0x02]),
+        Buffer.from('ScarletBook Lab\0', 'utf8'),
+        Buffer.from([0x00])
+      ]);
+      ttxtPayload.copy(isoBuf, ttxtOff + 520);
+
+      // Raw DSD audio sectors @ LSN 516..517 (1 packet of 256 bytes each -> 512 DSD octet bytes)
+      for (const lsn of [516, 517]) {
+        const sOff = lsn * 2048;
+        isoBuf[sOff] = (1 << 5); // pktCount = 1, frmCount = 0, dstEnc = 0
+        isoBuf.writeUInt16BE((1 << 15) | (2 << 11) | 256, sOff + 1); // frameStart=1, DATA_TYPE_AUDIO=2, len=256
+        for (let bi = 0; bi < 256; bi++) {
+          isoBuf[sOff + 3 + bi] = (bi & 1) ? 0xaa : 0x55;
+        }
+      }
+
+      fs.writeFileSync(sacdIsoPath, isoBuf);
+      assert.equal(validateSafeSacdIsoPath(sacdIsoPath), sacdIsoPath);
+
+      const sacdProbeRes = await listSacdIsoTracks(sacdIsoPath);
+      assert.equal(sacdProbeRes.ok, true, `SACD listSacdIsoTracks failed: ${JSON.stringify(sacdProbeRes)}`);
+      assert.equal(sacdProbeRes.areas.length, 1);
+      assert.equal(sacdProbeRes.areas[0].tracks[0].title, 'Time Capsule SACD');
+      assert.equal(sacdProbeRes.areas[0].tracks[0].artist, 'ScarletBook Lab');
+      assert.equal(sacdProbeRes.areas[0].tracks[0].durationSec, 2);
+
+      const catTracks = buildSacdCatalogTracks(sacdIsoPath, sacdProbeRes);
+      assert.equal(catTracks.length, 1);
+      assert.equal(catTracks[0].sacdArea, 0);
+      assert.equal(catTracks[0].sacdTrack, 1);
+      assert.equal(catTracks[0].title, 'Time Capsule SACD');
+      assert.equal(catTracks[0].audioCodec, 'DSD_SACD');
+
+      // Extract valid Philips DSDIFF stream via --sacd-extract-dff and verify FFmpeg -f iff decode
+      const dffBuf = execFileSync(exePath, ['--sacd-extract-dff', sacdIsoPath, '--sacd-area', '0', '--sacd-track', '1'], { timeout: 10000 });
+      assert.equal(dffBuf.subarray(0, 4).toString('ascii'), 'FRM8');
+      assert.equal(dffBuf.subarray(12, 16).toString('ascii'), 'DSD ');
+      const dffOutPath = path.join(tmpDir, 'sacd_track1.dff');
+      fs.writeFileSync(dffOutPath, dffBuf);
+      const decodedPcm = execFileSync(ffmpegBin, ['-v', 'error', '-y', '-f', 'iff', '-i', dffOutPath, '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'], { timeout: 10000 });
+      assert.ok(decodedPcm.length > 0, 'Expected FFmpeg -f iff to decode extracted SACD DSDIFF stream to PCM');
+
+      // 7. Signal Path Descriptor coverage for ASIO PCM, ASIO Native Raw DSD512, SACD ISO & ReplayGain 2.0
+      const asioRawPath = buildSignalPathDescriptor({
+        engineMode: 'wasapi',
+        outputBackend: 'asio',
+        filePath: 'C:\\Music\\Reference.dsf',
+        probe: { codec: 'DSD_LSBF_PLANAR', sampleRate: 22579200, bitDepth: 1, channels: 2 },
+        wasapiEvent: { mode: 'asio_dsd_raw', dsdRate: 'DSD512', sampleRate: 22579200, deviceName: 'iFi USB ASIO', bufferFrames: 512, xrunCount: 0 },
+        dspState: { eqEnabled: false, gains: new Array(10).fill(0), lufs: false, limiter: false },
+        linearGain: 1.0
+      });
+      assert.equal(asioRawPath.qualityTone, 'dop');
+      assert.equal(asioRawPath.qualityBadge, 'ASIO NATIVE RAW DSD BITSTREAM');
+      assert.equal(asioRawPath.summaryLabel, 'ASIO RAW DSD512');
+      assert.equal(asioRawPath.stages.length, 4);
+      assert.match(asioRawPath.stages[1].detail, /DSD512/);
+      assert.match(asioRawPath.stages[3].detail, /Isolated ASIO Host · Native Raw DSD/);
+
+      const asioRgPath = buildSignalPathDescriptor({
+        engineMode: 'wasapi',
+        outputBackend: 'asio',
+        filePath: sacdIsoPath,
+        sacdArea: 1,
+        sacdTrack: 2,
+        probe: { codec: 'SACD DST', sampleRate: 2822400, bitDepth: 1, channels: 2, sacdArea: 1, sacdTrack: 2 },
+        wasapiEvent: { mode: 'asio', sampleRate: 352800, bitsPerSample: 32, validBits: 24, bitExact: false, deviceName: 'Realtek ASIO' },
+        replayGainInfo: { linearGain: 0.5, appliedDb: -6.02, source: 'tag_album', referenceLufs: -18 },
+        dspState: { eqEnabled: false, gains: new Array(10).fill(0), lufs: true, replayGainMode: 'album', replayGainTargetLufs: -18, limiter: true },
+        linearGain: 0.5
+      });
+      assert.equal(asioRgPath.stages[0].title, 'SACD ISO ScarletBook Container');
+      assert.match(asioRgPath.stages[1].detail, /ScarletBook \+ DST/);
+      assert.match(asioRgPath.stages[2].detail, /ReplayGain 2\.0 \(Album @ -18 LUFS, -6\.0 dB\)/);
+      assert.match(asioRgPath.summaryLabel, /PUREPATH 64 · ASIO/);
+
+      const wvSignalPath = buildSignalPathDescriptor({
+        engineMode: 'dsp',
+        filePath: wvDsdPath,
+        probe: wvProbe,
+        dspState: { eqEnabled: false, gains: new Array(10).fill(0), lufs: true, replayGainMode: 'track', replayGainTargetLufs: -14, limiter: true },
+        replayGainInfo: { linearGain: 0.7943, appliedDb: -2.0, source: 'tag_track', referenceLufs: -14 }
+      });
+      assert.match(wvSignalPath.stages[0].title, /WavPack DSD Lossless Container/);
+      assert.match(wvSignalPath.stages[1].detail, /WavPack DSD 64-bit dblp Kaiser-Sinc/);
+      assert.match(wvSignalPath.stages[2].detail, /ReplayGain 2\.0 \(Track @ -14 LUFS/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('23. Phase 3 Precision DSP: AutoEQ Parser/PEQ, FFT Convolver IR Header/Resampler, Live Bit-Audit & Double-Blind ABX Stats', async () => {
+    const engineMod = await import('../src/js/audioEngine.js');
+    const secMod = require('../electron/services/pathSecurityService.cjs');
+    const bridgeMod = require('../electron/services/audioBridgeService.cjs');
+
+    assert.equal(secMod.PEQ_TXT_EXTENSIONS.has('.txt'), true);
+    assert.equal(secMod.CONVOLVER_IR_EXTENSIONS.has('.wav'), true);
+
+    // 1. EqualizerAPO / AutoEQ .txt parsing + 32-band cap + wire serialization/sanitization
+    const autoEqSample = [
+      'Preamp: -6.4 dB',
+      'Filter 1: ON LSC Fc 105 Hz Gain 5.8 dB Q 0.70',
+      'Filter 2: ON PK Fc 2140 Hz Gain -3.2 dB Q 1.45',
+      'Filter 3: ON HSC Fc 10000 Hz Gain -1.5 dB Q 0.71',
+      'Filter 4: ON LPQ Fc 18500 Hz Q 0.707',
+      'Filter 5: ON HPQ Fc 22 Hz Q 0.707',
+      'Filter 6: ON NO Fc 50 Hz Q 8.0',
+      'Filter 7: ON AP Fc 1000 Hz Q 1.0',
+      'Filter 8: OFF PK Fc 500 Hz Gain 4.0 dB Q 1.0',
+      'Filter 9: ON None Fc 800 Hz Gain 2.0 dB Q 1.0'
+    ].join('\n');
+    const parsedPeq = engineMod.parseAutoEqTxt(autoEqSample);
+    assert.equal(parsedPeq.preampDb, -6.4);
+    assert.equal(parsedPeq.bands.length, 7);
+    assert.deepEqual(
+      parsedPeq.bands.map((b) => b.type),
+      ['LSC', 'PK', 'HSC', 'LPQ', 'HPQ', 'NO', 'AP']
+    );
+
+    // Cap at 32 filters
+    const manyFilters = Array.from({ length: 40 }, (_, i) => `Filter ${i + 1}: ON PK Fc ${100 + i * 20} Hz Gain 1.0 dB Q 1.41`).join('\n');
+    const cappedPeq = engineMod.parseAutoEqTxt(`Preamp: -2.0 dB\n${manyFilters}`);
+    assert.equal(cappedPeq.bands.length, 32);
+
+    const wireSpec = engineMod.serializePeqWireSpec({
+      peqEnabled: true,
+      peqPreampDb: parsedPeq.preampDb,
+      peqBands: parsedPeq.bands
+    });
+    assert.ok(wireSpec.startsWith('-6.4;LSC,105,0.7,5.8;PK,2140,1.45,-3.2'));
+    assert.equal(engineMod.serializePeqWireSpec(parsedPeq), wireSpec);
+    assert.equal(bridgeMod.sanitizePeqWireSpec(wireSpec), wireSpec);
+    assert.equal(bridgeMod.sanitizePeqWireSpec('-6.4;PK,1000,2,1;rm -rf'), '');
+    assert.equal(
+      engineMod.serializePeqWireSpec({ peqEnabled: false, peqPreampDb: -6.4, peqBands: parsedPeq.bands }),
+      ''
+    );
+
+    // 2. WAV IR Header validation & FFmpeg 64-bit dblp Kaiser-Sinc IR pre-resampling cache
+    const buildTestWav = (sr, ch, bits, tag, frames) => {
+      const blockAlign = (ch * bits) / 8;
+      const byteRate = sr * blockAlign;
+      const dataBytes = frames * blockAlign;
+      const buf = Buffer.alloc(44 + dataBytes);
+      buf.write('RIFF', 0, 'ascii');
+      buf.writeUInt32LE(36 + dataBytes, 4);
+      buf.write('WAVE', 8, 'ascii');
+      buf.write('fmt ', 12, 'ascii');
+      buf.writeUInt32LE(16, 16);
+      buf.writeUInt16LE(tag, 20);
+      buf.writeUInt16LE(ch, 22);
+      buf.writeUInt32LE(sr, 24);
+      buf.writeUInt32LE(byteRate, 28);
+      buf.writeUInt16LE(blockAlign, 32);
+      buf.writeUInt16LE(bits, 34);
+      buf.write('data', 36, 'ascii');
+      buf.writeUInt32LE(dataBytes, 40);
+      // Put a unit Dirac sample on frame 0 ch 0
+      if (tag === 3 && bits === 32) {
+        buf.writeFloatLE(1.0, 44);
+      } else if (tag === 1 && bits === 16) {
+        buf.writeInt16LE(16384, 44);
+      }
+      return buf;
+    };
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-phase3-fixtures-'));
+    let cachedResampledIr = null;
+    try {
+      const ir44Path = path.join(tmpDir, 'room_44k_stereo.wav');
+      const ir4chPath = path.join(tmpDir, 'true_stereo_4ch.wav');
+      const ir6chPath = path.join(tmpDir, 'invalid_6ch.wav');
+      const badHdrPath = path.join(tmpDir, 'corrupt.wav');
+
+      fs.writeFileSync(ir44Path, buildTestWav(44100, 2, 16, 1, 256));
+      fs.writeFileSync(ir4chPath, buildTestWav(48000, 4, 32, 3, 128));
+      fs.writeFileSync(ir6chPath, buildTestWav(48000, 6, 16, 1, 64));
+      fs.writeFileSync(badHdrPath, Buffer.from('NOT_A_RIFF_WAVE_FILE_AT_ALL_00000000000000000000'));
+
+      const hdr44 = bridgeMod.inspectWavHeader(ir44Path);
+      assert.equal(hdr44.ok, true);
+      assert.equal(hdr44.sampleRate, 44100);
+      assert.equal(hdr44.channels, 2);
+      assert.equal(hdr44.frames, 256);
+
+      const hdr4ch = bridgeMod.inspectWavHeader(ir4chPath);
+      assert.equal(hdr4ch.ok, true);
+      assert.equal(hdr4ch.channels, 4);
+
+      assert.equal(bridgeMod.inspectWavHeader(ir6chPath).ok, false);
+      assert.equal(bridgeMod.inspectWavHeader(badHdrPath).ok, false);
+      assert.equal(bridgeMod.inspectWavHeader('\\\\server\\share\\ir.wav').ok, false);
+
+      const passthroughIr = await bridgeMod.prepareConvolutionIrFile(ir44Path, 44100);
+      assert.equal(passthroughIr.ok, true);
+      assert.equal(passthroughIr.resampled, false);
+      assert.equal(passthroughIr.preparedPath, ir44Path);
+
+      const upsampledIr = await bridgeMod.prepareConvolutionIrFile(ir44Path, 96000);
+      assert.equal(upsampledIr.ok, true);
+      assert.equal(upsampledIr.resampled, true);
+      assert.equal(upsampledIr.info.sampleRate, 96000);
+      assert.equal(upsampledIr.info.bitsPerSample, 64);
+      assert.ok(fs.existsSync(upsampledIr.preparedPath));
+      cachedResampledIr = upsampledIr.preparedPath;
+    } finally {
+      if (cachedResampledIr && fs.existsSync(cachedResampledIr)) {
+        fs.rmSync(cachedResampledIr, { force: true });
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+
+    // 3. Double-Blind ABX Exact Binomial Statistics & Sequence Generation
+    assert.equal(engineMod.computeAbxBinomialPValue(12, 12), 0.000244);
+    assert.equal(engineMod.computeAbxBinomialPValue(10, 12), 0.019287);
+    assert.ok(engineMod.computeAbxBinomialPValue(6, 12) > 0.5);
+
+    const sigVerdict = engineMod.evaluateAbxVerdict({ correct: 11, total: 12, labelA: 'AutoEQ ON', labelB: 'Bit-Exact' });
+    assert.equal(sigVerdict.significant, true);
+    assert.ok(sigVerdict.confidencePct >= 99.6);
+    assert.match(sigVerdict.summary, /Audible difference detected/);
+
+    const nullVerdict = engineMod.evaluateAbxVerdict({ correct: 6, total: 12, labelA: 'A', labelB: 'B' });
+    assert.equal(nullVerdict.significant, false);
+    assert.match(nullVerdict.summary, /No statistically significant difference/);
+
+    const abxSeq = engineMod.generateAbxTrialSequence(8, (n) => Array.from({ length: n }, (_, i) => i));
+    assert.deepEqual(abxSeq, ['A', 'B', 'A', 'B', 'A', 'B', 'A', 'B']);
+
+    // 4. Live Bit-Audit Summary & Signal Path Descriptor Phase 3 Stages
+    const paddedAudit = engineMod.computeLiveBitAuditSummary({
+      telemetry: { truePeakDbtp: -0.4, crestDb: 11.2, drDb: 11.4, activeBits: 16, srcActiveBits: 16 },
+      probe: { bitDepth: 24, sampleRate: 96000 },
+      wasapiEvt: { bitExact: true, validBits: 24, bitsPerSample: 32 }
+    });
+    assert.equal(paddedAudit.bitAuditTone, 'warn');
+    assert.match(paddedAudit.bitAuditText, /16-in-24 Padded/);
+    assert.equal(paddedAudit.truePeakText, '-0.4 dBTP');
+    assert.match(paddedAudit.crestDrText, /DR 11\.4 dB/);
+
+    const true24Audit = engineMod.computeLiveBitAuditSummary({
+      telemetry: { truePeakDbtp: -1.2, crestDb: 13.0, drDb: 13.5, activeBits: 24, srcActiveBits: 24 },
+      probe: { bitDepth: 24, sampleRate: 192000 },
+      wasapiEvt: { bitExact: true, validBits: 24, bitsPerSample: 32 }
+    });
+    assert.equal(true24Audit.bitAuditTone, 'bit_exact');
+    assert.match(true24Audit.bitAuditText, /24-bit Active -> 24-bit Wire/);
+
+    const convPath = engineMod.buildSignalPathDescriptor({
+      engineMode: 'wasapi',
+      filePath: 'C:\\Music\\StudioMaster.flac',
+      probe: { codec: 'FLAC', sampleRate: 96000, bitDepth: 24, channels: 2 },
+      wasapiEvent: { mode: 'exclusive', sampleRate: 96000, bitsPerSample: 32, validBits: 24, bitExact: false, deviceName: 'Reference DAC' },
+      dspState: {
+        eqEnabled: false,
+        gains: new Array(10).fill(0),
+        peqEnabled: true,
+        peqName: 'HD650',
+        peqBands: parsedPeq.bands,
+        convolverEnabled: true,
+        convolverPath: 'C:\\Vanta\\room.wav',
+        convolverName: 'RoomCorrection.wav',
+        convolverWetPct: 85,
+        lufs: false,
+        limiter: false
+      },
+      convolverActive: true,
+      liveTelemetry: { truePeakDbtp: -0.4, crestDb: 12.1, drDb: 12.3, activeBits: 24, srcActiveBits: 24 },
+      linearGain: 1.0
+    });
+    assert.equal(convPath.qualityTone, 'purepath');
+    assert.match(convPath.stages[2].detail, /AutoEQ PEQ \(HD650 · 7 bands\)/);
+    assert.match(convPath.stages[2].detail, /FFT Convolver \(RoomCorrection\.wav · 85%\)/);
+    assert.equal(convPath.bitAudit.truePeakText, '-0.4 dBTP');
   });
 });

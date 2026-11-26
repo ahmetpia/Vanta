@@ -11,7 +11,14 @@ import {
   DEVICE_EQ_PROFILES,
   requiresStudioDsp,
   serializeNativeDspSpecFromState,
-  buildSignalPathDescriptor
+  buildSignalPathDescriptor,
+  computeWasapiGainFactor,
+  resolveStartupAudioPrefs,
+  resolveReplayGain2,
+  parseAutoEqTxt,
+  serializePeqWireSpec,
+  evaluateAbxVerdict,
+  generateAbxTrialSequence
 } from './audioEngine.js';
 import { VantaVisualizer } from './visualizer.js';
 import { StageLightEngine, STAGE_FX_MODES, STAGE_PALETTES } from './stageLights.js';
@@ -126,8 +133,23 @@ class VantaStudioApp {
     this.videoEl = document.getElementById('vantaVideoPlayer');
     this.canvasEl = document.getElementById('vantaWaveCanvas');
 
-    this.engineMode = 'dsp'; // 'dsp' (Shared Windows Audio + Studio DSP) | 'wasapi' (Bit-Perfect Exclusive on Play)
-    this.preferredAudioEngineMode = 'dsp'; // Remembers audio track engine preference across video sessions
+    const startupPrefs = resolveStartupAudioPrefs(
+      globalThis.localStorage?.getItem('vanta_audio_prefs_v2'),
+      globalThis.localStorage?.getItem('vanta_pro_dsp_v1')
+    );
+    this.engineMode = startupPrefs.engineMode; // 'wasapi' (Bit-Perfect Pure default) | 'dsp' (Studio DSP)
+    this.preferredAudioEngineMode = startupPrefs.engineMode;
+    this.outputBackend = startupPrefs.outputBackend || 'wasapi';
+    this.asioDriver = startupPrefs.asioDriver || '';
+    this.asioRawDsd = Boolean(startupPrefs.asioRawDsd);
+    this.asioDevices = [];
+    this.holdWasapiOnPause = startupPrefs.holdWasapiOnPause;
+    this.wasapiPushMode = startupPrefs.wasapiPushMode;
+    this.wasapiBufferMs = startupPrefs.wasapiBufferMs;
+    this.clockSwitchPreRollMs = startupPrefs.clockSwitchPreRollMs;
+    this.fixedRateLock = startupPrefs.fixedRateLock;
+    this.fixedTargetRate = startupPrefs.fixedTargetRate;
+    this._migratePureDspDefaults = startupPrefs.migratePureDspDefaults;
     this._currentFormattedLyrics = '';
     this._copyLyricsTimer = null;
     this._rbLastVStart = -1;
@@ -137,9 +159,20 @@ class VantaStudioApp {
     this._filterDebounceTimer = null;
     this.selectedDeviceId = '';
     this.selectedDeviceName = '';
+    this.deviceCaps = null;
+    this.lastWasapiRatePlan = null;
+    this.wasapiPausedHeld = false;
+    this.wasapiXrunCount = 0;
+    this.lastLiveAudioTelemetry = null;
+    this.abxSession = null;
     this.activeTrackProbe = null;
     this.activeTrackR128 = null;
-    this.wasapiStatusMode = 'STUDIO DSP';
+    this.activeTrackTags = null;
+    this.lastReplayGainInfo = null;
+    this.sacdVirtualTracks = [];
+    this.wasapiStatusMode = this.engineMode === 'wasapi'
+      ? (this.outputBackend === 'asio' ? 'ASIO ISOLATED READY' : 'WASAPI EXCLUSIVE READY')
+      : 'STUDIO DSP';
     this.wasapiPausedTrackKey = null;
     this.wasapiResumeSec = 0;
     this.wasapiCurrentPositionSec = 0;
@@ -206,20 +239,23 @@ class VantaStudioApp {
     this.bindEvents();
     this._syncEngineModeUi(null);
     this._syncAllDspUi();
-    this.setMasterVolume(this.masterVolumePct, true);
+    // Only paint local UI slider on boot; never overwrite Windows OS endpoint volume before getSystemVolume() arrives.
+    this._renderMasterVolumeUi(this.masterVolumePct, this.isMuted);
     this.visualizer.isPlaying = false;
     this.visualizer.start();
     this.audioEngine.bindElements(this.audioEl, this.videoEl, this.deckBEl);
 
-    // Scan C:\Vanta\VantaVault + saved folders & WASAPI hardware DACs via IPC
+    // Scan C:\Vanta\VantaVault + saved folders, WASAPI & ASIO hardware DACs via IPC
     if (window.vantaAPI) {
       void this.populateAudioDevices().catch(() => {});
+      void this.populateAsioDevices().catch(() => {});
 
       window.vantaAPI.onVolumeEvent((vol) => {
         this.applySystemVolumeState(vol);
       });
       window.vantaAPI.onAudioDevicesChanged(() => {
         void this.populateAudioDevices(true).catch(() => {});
+        void this.populateAsioDevices().catch(() => {});
       });
       navigator.mediaDevices?.addEventListener('devicechange', () => {
         void this.populateAudioDevices(true).catch(() => {});
@@ -288,6 +324,38 @@ class VantaStudioApp {
    * @param {object} doctor - Quality Doctor report.
    * @param {object[]} [smartPlaylists] - Saved smart playlists.
    */
+  /**
+   * Returns a globally unique identifier for any catalog track (including multi-track SACD ISO discs).
+   * @param {object|null} track - Track object.
+   * @returns {string|null} Unique track key.
+   */
+  _getTrackUniqueKey(track) {
+    if (!track) return null;
+    if (Number(track.sacdTrack) >= 1 && track.filePath) {
+      return `${track.filePath}#${Number(track.sacdArea) || 0}:${Number(track.sacdTrack)}`;
+    }
+    return track.filePath || track.id || null;
+  }
+
+  /**
+   * Builds a vanta-media:// playback URL for local files and virtual ScarletBook SACD ISO tracks.
+   * @param {object} track - Active track metadata.
+   * @param {number} [ssSec=0] - Optional start offset in seconds.
+   * @returns {string} Encoded custom protocol media URL.
+   */
+  _buildLocalMediaUrl(track, ssSec = 0) {
+    const params = new URLSearchParams();
+    params.set('path', String(track?.filePath || ''));
+    if (Number(track?.sacdTrack) >= 1) {
+      params.set('sacdArea', String(Number.isFinite(Number(track.sacdArea)) ? Number(track.sacdArea) : 0));
+      params.set('sacdTrack', String(Number(track.sacdTrack)));
+    }
+    if (Number(ssSec) > 0.5) {
+      params.set('ss', Number(ssSec).toFixed(2));
+    }
+    return `vanta-media://local?${params.toString()}`;
+  }
+
   mergeVaultCatalog(diskTracks = [], doctor = null, smartPlaylists = null) {
     this.doctorReport = doctor || { issues: [], healthScore: 100 };
     if (Array.isArray(smartPlaylists)) {
@@ -295,8 +363,9 @@ class VantaStudioApp {
     }
 
     const merged = [];
-    for (const dt of diskTracks) {
-      merged.push({
+    const seenKeys = new Set();
+    const pushTrack = (dt) => {
+      const item = {
         ...dt,
         stars: Number(dt.stars) || 0,
         favorite: Boolean(dt.favorite),
@@ -307,11 +376,18 @@ class VantaStudioApp {
         grad: dt.isVideo
           ? 'linear-gradient(135deg, #f43f5e, #ffd166)'
           : 'linear-gradient(135deg, #2f6fed, #06b6d4)'
-      });
-    }
+      };
+      const k = this._getTrackUniqueKey(item);
+      if (k && seenKeys.has(k)) return;
+      if (k) seenKeys.add(k);
+      merged.push(item);
+    };
+
+    for (const dt of diskTracks) pushTrack(dt);
+    for (const st of this.sacdVirtualTracks || []) pushTrack(st);
 
     this.catalog = merged;
-    const catalogKeys = new Set(merged.map((t) => t.filePath || t.id));
+    const catalogKeys = new Set(merged.map((t) => this._getTrackUniqueKey(t)));
     this.playbackHistory = (this.playbackHistory || []).filter((h) => h && h.key && catalogKeys.has(h.key));
     this._updateLastPlayedButton();
     this.renderTagFilterOptions();
@@ -650,13 +726,21 @@ class VantaStudioApp {
   }
 
   /**
-   * Loads persisted Pro DSP settings safely from localStorage.
+   * Loads persisted Pro DSP settings safely from localStorage, migrating legacy implicit defaults cleanly.
    */
   _loadProDspSettings() {
     try {
       const raw = globalThis.localStorage?.getItem('vanta_pro_dsp_v1');
       if (raw) {
         this.audioEngine.importPersistState(JSON.parse(raw));
+      }
+      if (this._migratePureDspDefaults) {
+        this.audioEngine.state.lufs = false;
+        this.audioEngine.state.limiter = false;
+        this.audioEngine.syncDspState();
+        this._saveProDspSettings();
+        this._saveAudioPrefs();
+        this._migratePureDspDefaults = false;
       }
     } catch {
       // Ignore corrupt storage
@@ -675,7 +759,33 @@ class VantaStudioApp {
   }
 
   /**
-   * Synchronizes all DSP chips, slider readouts, and EQ preset pills in both Right Dock and DSP Rack modal.
+   * Persists preferred audio engine, ASIO backend, pause behavior, transport mode, rate lock, and pre-roll settings.
+   */
+  _saveAudioPrefs() {
+    try {
+      globalThis.localStorage?.setItem(
+        'vanta_audio_prefs_v2',
+        JSON.stringify({
+          version: 2,
+          preferredAudioEngineMode: this.preferredAudioEngineMode,
+          outputBackend: this.outputBackend === 'asio' ? 'asio' : 'wasapi',
+          asioDriver: this.asioDriver || '',
+          asioRawDsd: Boolean(this.asioRawDsd),
+          holdWasapiOnPause: Boolean(this.holdWasapiOnPause),
+          wasapiPushMode: Boolean(this.wasapiPushMode),
+          wasapiBufferMs: Number(this.wasapiBufferMs) || 0,
+          clockSwitchPreRollMs: Number(this.clockSwitchPreRollMs) || 0,
+          fixedRateLock: Boolean(this.fixedRateLock),
+          fixedTargetRate: Number(this.fixedTargetRate) || 48000
+        })
+      );
+    } catch {
+      // Ignore storage quota errors
+    }
+  }
+
+  /**
+   * Synchronizes all DSP chips, hardware transport controls, slider readouts, and EQ preset pills.
    */
   _syncAllDspUi() {
     const st = this.audioEngine.state;
@@ -685,6 +795,86 @@ class VantaStudioApp {
         chip.classList.toggle('on', Boolean(st[key]));
       }
     });
+
+    const rgMode = st.replayGainMode || 'track';
+    const rgTarget = Number(st.replayGainTargetLufs) === -14 ? -14 : -18;
+    const lufsChip = document.querySelector('[data-dsp="lufs"]');
+    if (lufsChip) {
+      lufsChip.title = `ReplayGain 2.0 (${rgMode.toUpperCase()} @ ${rgTarget}.0 LUFS)`;
+    }
+    document.querySelectorAll('[data-rg-mode]').forEach((btn) => {
+      btn.classList.toggle('on', btn.dataset.rgMode === rgMode);
+    });
+    document.querySelectorAll('[data-rg-lufs]').forEach((btn) => {
+      btn.classList.toggle('on', Number(btn.dataset.rgLufs) === rgTarget);
+    });
+
+    const backend = this.outputBackend === 'asio' ? 'asio' : 'wasapi';
+    document.querySelectorAll('[data-output-backend]').forEach((btn) => {
+      btn.classList.toggle('on', btn.dataset.outputBackend === backend);
+    });
+    const asioSel = document.getElementById('selectAsioDriver');
+    if (asioSel) {
+      asioSel.disabled = !(this.asioDevices && this.asioDevices.length);
+      if (this.asioDriver && Array.from(asioSel.options).some((o) => o.value === this.asioDriver)) {
+        asioSel.value = this.asioDriver;
+      }
+    }
+    const rawDsdBtn = document.getElementById('btnToggleAsioRawDsd');
+    if (rawDsdBtn) {
+      rawDsdBtn.classList.toggle('on', Boolean(this.asioRawDsd));
+      rawDsdBtn.disabled = backend !== 'asio';
+    }
+
+    const isStudioPreset = Boolean(st.lufs || st.limiter || st.eqEnabled || st.spatial || st.crossfeed || st.bassBoost);
+    document.getElementById('btnStudioDspPreset')?.classList.toggle('on', isStudioPreset);
+    document.getElementById('btnApplyStudioPreset')?.classList.toggle('active', Boolean(st.lufs && st.limiter));
+    document.getElementById('btnWasapiModeEvent')?.classList.toggle('on', !this.wasapiPushMode);
+    document.getElementById('btnWasapiModePush')?.classList.toggle('on', Boolean(this.wasapiPushMode));
+
+    const holdBtn = document.getElementById('btnToggleHoldOnPause');
+    if (holdBtn) {
+      holdBtn.classList.toggle('on', Boolean(this.holdWasapiOnPause));
+      holdBtn.textContent = this.holdWasapiOnPause ? 'Hold Device (0 ms)' : 'Release DAC on Pause';
+    }
+
+    document.querySelectorAll('[data-vol-mode]').forEach((btn) => {
+      btn.classList.toggle('on', btn.dataset.volMode === (st.volumeMode || 'auto'));
+    });
+
+    const rateLockBtn = document.getElementById('btnToggleFixedRateLock');
+    if (rateLockBtn) rateLockBtn.classList.toggle('on', Boolean(this.fixedRateLock));
+    const rateSel = document.getElementById('selectFixedTargetRate');
+    if (rateSel) {
+      rateSel.value = String(this.fixedTargetRate || 48000);
+      rateSel.disabled = !this.fixedRateLock;
+    }
+    document.querySelectorAll('[data-preroll-ms]').forEach((btn) => {
+      btn.classList.toggle('on', Number(btn.dataset.prerollMs) === Number(this.clockSwitchPreRollMs));
+    });
+
+    const bufSlider = document.getElementById('wasapiBufferMsSlider');
+    const bufVal = document.getElementById('wasapiBufferMsVal');
+    if (bufSlider && document.activeElement !== bufSlider) bufSlider.value = String(this.wasapiBufferMs || 0);
+    if (bufVal) bufVal.textContent = this.wasapiBufferMs > 0 ? `${this.wasapiBufferMs} ms` : 'Auto';
+
+    const capsBadge = document.getElementById('dspHardwareCapsBadge');
+    if (capsBadge) {
+      if (backend === 'asio') {
+        capsBadge.textContent = this.asioDriver
+          ? `ASIO: ${this.asioDriver}${this.asioRawDsd ? ' · Raw DSD Ready' : ''}`
+          : (this.asioDevices?.length ? `ASIO: ${this.asioDevices[0].name}` : 'ASIO: No Driver Found');
+      } else if (this.deviceCaps && this.deviceCaps.ok) {
+        const rates = Array.isArray(this.deviceCaps.supportedRates) ? this.deviceCaps.supportedRates : [];
+        const maxRate = rates.length ? Math.max(...rates) : (this.deviceCaps.sharedSampleRate || 48000);
+        const rateTxt = `${(maxRate / 1000).toFixed(1).replace(/\.0$/, '')} kHz`;
+        const hwVol = (this.deviceCaps.hwVolumeSupport & 1) !== 0 ? 'HW Vol ✓' : 'SW Vol Only';
+        const modeTxt = this.deviceCaps.exclusiveSupported ? `${rateTxt} · ${this.deviceCaps.maxBitDepth}-bit Excl` : 'Shared Only';
+        capsBadge.textContent = `${modeTxt} · ${hwVol}`;
+      } else {
+        capsBadge.textContent = 'Endpoint: Default Ready';
+      }
+    }
 
     const sliderMap = [
       ['dspSpatialWidth', 'dspSpatialWidthVal', `${Math.round(st.spatialWidthPct)}%`, st.spatialWidthPct],
@@ -707,6 +897,58 @@ class VantaStudioApp {
     document.querySelectorAll('#dspEqPresetRow [data-eq-preset]').forEach((btn) => {
       btn.classList.toggle('on', btn.dataset.eqPreset === activePreset);
     });
+
+    const peqBands = Array.isArray(st.peqBands) ? st.peqBands : [];
+    const hasPeq = peqBands.length > 0;
+    const peqActive = Boolean(st.peqEnabled && hasPeq);
+    const peqSummaryBadge = document.getElementById('peqSummaryBadge');
+    if (peqSummaryBadge) {
+      if (!hasPeq) {
+        peqSummaryBadge.textContent = 'No profile';
+      } else {
+        const preampStr = `${Number(st.peqPreampDb || 0) >= 0 ? '+' : ''}${Number(st.peqPreampDb || 0).toFixed(1)}dB`;
+        const title = st.peqName || 'AutoEQ';
+        peqSummaryBadge.textContent = peqActive
+          ? `${title} (${peqBands.length}b · ${preampStr})`
+          : `[Bypass] ${title} (${peqBands.length}b)`;
+      }
+    }
+    const togglePeqBtn = document.getElementById('btnTogglePeqActive');
+    if (togglePeqBtn) {
+      togglePeqBtn.disabled = !hasPeq;
+      togglePeqBtn.classList.toggle('on', peqActive);
+      togglePeqBtn.textContent = peqActive ? 'PEQ ON' : 'Bypassed';
+    }
+    const clearPeqBtn = document.getElementById('btnClearAutoEq');
+    if (clearPeqBtn) clearPeqBtn.disabled = !hasPeq;
+
+    const hasIr = Boolean(st.convolverPath);
+    const irActive = Boolean(st.convolverEnabled && hasIr);
+    const convInfoBadge = document.getElementById('convolverInfoBadge');
+    if (convInfoBadge) {
+      if (!hasIr) {
+        convInfoBadge.textContent = 'No IR loaded';
+      } else {
+        const srTxt = st.convolverSampleRate ? `${(st.convolverSampleRate / 1000).toFixed(1).replace(/\.0$/, '')}k` : '';
+        const chTxt = st.convolverChannels ? `${st.convolverChannels}ch` : '';
+        const metaParts = [srTxt, chTxt].filter(Boolean).join(' · ');
+        convInfoBadge.textContent = `${irActive ? '' : '[Bypass] '}${st.convolverName || 'Room IR'}${metaParts ? ` (${metaParts})` : ''}`;
+      }
+    }
+    const toggleConvBtn = document.getElementById('btnToggleConvolverActive');
+    if (toggleConvBtn) {
+      toggleConvBtn.disabled = !hasIr;
+      toggleConvBtn.classList.toggle('on', irActive);
+      toggleConvBtn.textContent = irActive ? 'Convolver ON' : 'Bypassed';
+    }
+    const clearConvBtn = document.getElementById('btnClearConvolverIr');
+    if (clearConvBtn) clearConvBtn.disabled = !hasIr;
+
+    const wetPct = Math.max(0, Math.min(100, Math.round(Number(st.convolverWetPct ?? 100) || 0)));
+    const wetSlider = document.getElementById('convolverWetSlider');
+    const wetVal = document.getElementById('convolverWetVal');
+    if (wetSlider && document.activeElement !== wetSlider) wetSlider.value = String(wetPct);
+    if (wetVal) wetVal.textContent = `${wetPct}%`;
   }
 
   /**
@@ -767,14 +1009,178 @@ class VantaStudioApp {
   }
 
   /**
-   * Returns effective linear ReplayGain based on EBU R128 toggle and measured LUFS.
+   * Resolves effective ReplayGain 2.0 multiplier from embedded ID3/Vorbis tags or measured EBU R128 loudness.
    * @returns {number} Linear gain factor.
    */
   getEffectiveReplayGain() {
-    if (this.audioEngine.state.lufs && this.activeTrackR128?.linearGain) {
-      return this.activeTrackR128.linearGain;
+    const activeTrack = this.currentLoadedTrack || this.displayedTracks[this.activeTrackIndex] || null;
+    const mergedTags = {
+      replayGainTrackGainDb: activeTrack?.replayGainTrackGainDb,
+      replayGainTrackPeak: activeTrack?.replayGainTrackPeak,
+      replayGainAlbumGainDb: activeTrack?.replayGainAlbumGainDb,
+      replayGainAlbumPeak: activeTrack?.replayGainAlbumPeak,
+      ...(this.activeTrackTags || {})
+    };
+    const info = resolveReplayGain2({
+      enabled: Boolean(this.audioEngine.state.lufs),
+      mode: this.audioEngine.state.replayGainMode || 'track',
+      targetLufs: Number(this.audioEngine.state.replayGainTargetLufs) === -14 ? -14 : -18,
+      tags: mergedTags,
+      r128: this.activeTrackR128,
+      clipProtect: true
+    });
+    this.lastReplayGainInfo = info;
+    return info.linearGain;
+  }
+
+  /**
+   * Enumerates clean-room Win32 ASIO drivers via Main Process and populates the ASIO selector safely.
+   */
+  async populateAsioDevices() {
+    const sel = document.getElementById('selectAsioDriver');
+    if (!window.vantaAPI?.listAsioDevices) return [];
+    try {
+      const devices = await window.vantaAPI.listAsioDevices();
+      this.asioDevices = Array.isArray(devices) ? devices : [];
+      if (sel) {
+        const opts = [];
+        if (!this.asioDevices.length) {
+          const emptyOpt = document.createElement('option');
+          emptyOpt.value = '';
+          emptyOpt.textContent = 'No ASIO Drivers Detected';
+          opts.push(emptyOpt);
+        } else {
+          for (const drv of this.asioDevices) {
+            const opt = document.createElement('option');
+            opt.value = drv.name || '';
+            opt.textContent = drv.name || drv.description || drv.clsid || 'ASIO Driver';
+            opts.push(opt);
+          }
+          if (!this.asioDriver || !this.asioDevices.some((d) => d.name === this.asioDriver)) {
+            this.asioDriver = this.asioDevices[0].name || '';
+          }
+        }
+        sel.replaceChildren(...opts);
+        if (this.asioDriver) sel.value = this.asioDriver;
+      }
+      this._syncAllDspUi();
+      return this.asioDevices;
+    } catch {
+      return [];
     }
-    return 1.0;
+  }
+
+  /**
+   * Opens a ScarletBook SACD ISO disc image and merges its 2ch/Multichannel tracks into the library view.
+   * @param {string} [isoPath=''] - Optional disk path; opens file dialog when omitted.
+   */
+  async importSacdIsoFiles(isoPath = '') {
+    if (!window.vantaAPI?.importSacdIso) return;
+    try {
+      const res = await window.vantaAPI.importSacdIso(isoPath);
+      if (!res || res.canceled) return;
+      if (!res.ok || !Array.isArray(res.tracks) || !res.tracks.length) {
+        this.setToast(`SACD ISO import failed: ${res?.error || 'No playable DSD tracks found'}`);
+        return;
+      }
+      const existing = new Map((this.sacdVirtualTracks || []).map((t) => [this._getTrackUniqueKey(t), t]));
+      for (const tr of res.tracks) {
+        const k = this._getTrackUniqueKey(tr);
+        if (k) existing.set(k, tr);
+      }
+      this.sacdVirtualTracks = Array.from(existing.values());
+      const diskTracks = this.catalog.filter((t) => !t.sacdTrack);
+      this.mergeVaultCatalog(diskTracks, this.doctorReport, this.smartPlaylists);
+      this.setToast(`SACD ISO mounted: ${res.info?.albumTitle || res.tracks?.[0]?.album || 'SACD Album'} (${res.tracks.length} DSD tracks)`);
+    } catch (err) {
+      this.setToast(`SACD ISO error: ${err?.message || 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Scans the active album with EBU R128 Album+Track loudness and writes ReplayGain 2.0 ID3v2/FLAC tags.
+   */
+  async analyzeActiveAlbumReplayGain() {
+    if (!window.vantaAPI?.analyzeAlbumReplayGain) return;
+    const activeTrack = this.currentLoadedTrack || this.displayedTracks[this.activeTrackIndex] || this.catalog[0] || null;
+    if (!activeTrack) {
+      this.setToast('Select a track or album first to run ReplayGain 2.0 analysis');
+      return;
+    }
+    const albumNorm = String(activeTrack.album || '').trim().toLowerCase();
+    let albumPool = albumNorm
+      ? this.catalog.filter((t) => !t.isVideo && !t.sacdTrack && t.filePath && String(t.album || '').trim().toLowerCase() === albumNorm)
+      : [];
+    if (!albumPool.length && activeTrack.filePath && !activeTrack.isVideo && !activeTrack.sacdTrack) {
+      albumPool = [activeTrack];
+    }
+    if (!albumPool.length) {
+      this.setToast('No taggable local audio files selected for ReplayGain 2.0 scan');
+      return;
+    }
+
+    const st = this.audioEngine.state;
+    const targetLufs = Number(st.replayGainTargetLufs) === -14 ? -14 : -18;
+    const btn = document.getElementById('btnAnalyzeAlbumRg');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = `Scanning ${albumPool.length}...`;
+    }
+    try {
+      this.setToast(`Scanning ${albumPool.length} track(s) @ ${targetLufs}.0 LUFS (ReplayGain 2.0)...`);
+      const res = await window.vantaAPI.analyzeAlbumReplayGain({
+        tracks: albumPool.slice(0, 64).map((t) => ({ filePath: t.filePath, durationSec: Number(t.durationSec) || 180 })),
+        targetLufs,
+        writeTags: true
+      });
+      if (!res?.ok) {
+        this.setToast(`ReplayGain scan failed: ${res?.error || 'Could not measure tracks'}`);
+        return;
+      }
+
+      const byPath = new Map((res.tracks || []).map((r) => [String(r.filePath || '').toLowerCase(), r]));
+      for (const item of this.catalog) {
+        const hit = byPath.get(String(item.filePath || '').toLowerCase());
+        if (!hit) continue;
+        item.replayGainTrackGainDb = hit.trackGainDb;
+        item.replayGainTrackPeak = hit.trackPeakLinear;
+        item.replayGainAlbumGainDb = hit.albumGainDb;
+        item.replayGainAlbumPeak = hit.albumPeakLinear;
+      }
+      const activeHit = activeTrack.filePath ? byPath.get(String(activeTrack.filePath).toLowerCase()) : null;
+      if (activeHit) {
+        this.activeTrackTags = {
+          replayGainTrackGainDb: activeHit.trackGainDb,
+          replayGainTrackPeak: activeHit.trackPeakLinear,
+          replayGainAlbumGainDb: activeHit.albumGainDb,
+          replayGainAlbumPeak: activeHit.albumPeakLinear
+        };
+      }
+
+      if (!st.lufs) {
+        st.lufs = true;
+        if (st.replayGainMode === 'off') st.replayGainMode = albumPool.length > 1 ? 'album' : 'track';
+        this.audioEngine.syncDspState();
+        this._saveProDspSettings();
+      }
+      this.audioEngine.setReplayGainLinear(this.getEffectiveReplayGain());
+      if (this.engineMode === 'wasapi' && this.isPlaying && window.vantaAPI) {
+        window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
+      }
+      this._syncAllDspUi();
+      this.updateStreamTelemetry();
+      const taggedCount = (res.tracks || []).filter((r) => r.taggedOk).length;
+      const albLufs = res.albumSummary?.albumLufs ?? res.tracks?.[0]?.albumLufs ?? targetLufs;
+      const albGain = res.albumSummary?.albumGainDb ?? res.tracks?.[0]?.albumGainDb ?? 0;
+      this.setToast(
+        `ReplayGain 2.0: Album ${albLufs} LUFS (${albGain > 0 ? '+' : ''}${albGain} dB) · ${taggedCount}/${res.tracks.length} tagged`
+      );
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Analyze & Tag Album';
+      }
+    }
   }
 
   /**
@@ -783,9 +1189,31 @@ class VantaStudioApp {
    * @returns {number} Combined gain multiplier.
    */
   getEffectiveWasapiGain() {
-    const hwScalesExclusive = this.windowsVolumeLinked && (this.deviceHwVolumeSupport & 1) !== 0;
-    const volFactor = this.isMuted ? 0 : hwScalesExclusive ? 1.0 : this.masterVolumeLinear;
-    return this.getEffectiveReplayGain() * volFactor;
+    return computeWasapiGainFactor({
+      volumeMode: this.audioEngine?.state?.volumeMode || 'auto',
+      windowsVolumeLinked: this.windowsVolumeLinked,
+      deviceHwVolumeSupport: this.deviceHwVolumeSupport,
+      isMuted: this.isMuted,
+      masterVolumeLinear: this.masterVolumeLinear,
+      replayGainLinear: this.getEffectiveReplayGain()
+    });
+  }
+
+  /**
+   * Renders master volume slider/icon/percentage UI without pushing any write to Windows Core Audio.
+   * @param {number} pct - Display volume [0..100].
+   * @param {boolean} muted - Mute state.
+   */
+  _renderMasterVolumeUi(pct, muted) {
+    const visualPct = muted ? 0 : pct;
+    const slider = document.getElementById('masterVolumeSlider');
+    const pctLabel = document.getElementById('volumePercentLabel');
+    if (slider) {
+      slider.value = String(visualPct);
+      slider.style.setProperty('--vol-pct', `${visualPct}%`);
+    }
+    if (pctLabel) pctLabel.textContent = `${visualPct}%`;
+    this.renderVolumeIcon(pct, muted);
   }
 
   /**
@@ -829,36 +1257,40 @@ class VantaStudioApp {
     if (volState.hwSupport !== undefined) {
       this.deviceHwVolumeSupport = Number(volState.hwSupport) || 0;
     }
-    const pct = Math.max(0, Math.min(100, Math.round(volState.level * 100)));
-    const muted = Boolean(volState.muted) || pct === 0;
-    this.masterVolumePct = pct;
-    this.isMuted = muted;
-    if (pct > 0 && !muted) this.preMuteVolumePct = pct;
-    this.masterVolumeLinear = muted ? 0 : Math.pow(pct / 100, 1.75);
-
-    const slider = document.getElementById('masterVolumeSlider');
-    const pctLabel = document.getElementById('volumePercentLabel');
-    const visualPct = muted ? 0 : pct;
-    if (slider) {
-      slider.value = String(visualPct);
-      slider.style.setProperty('--vol-pct', `${visualPct}%`);
+    const volMode = this.audioEngine?.state?.volumeMode || 'auto';
+    if (volMode === 'auto') {
+      const pct = Math.max(0, Math.min(100, Math.round(volState.level * 100)));
+      const muted = Boolean(volState.muted) || pct === 0;
+      this.masterVolumePct = pct;
+      this.isMuted = muted;
+      if (pct > 0 && !muted) this.preMuteVolumePct = pct;
+      this.masterVolumeLinear = muted ? 0 : Math.pow(pct / 100, 1.75);
+      this._renderMasterVolumeUi(pct, muted);
+      this.audioEngine.setVolume(muted ? 0 : 1.0);
+    } else {
+      const studioVol = volMode === 'fixed0db' ? (this.isMuted ? 0 : 1.0) : (this.isMuted ? 0 : this.masterVolumeLinear);
+      this.audioEngine.setVolume(studioVol);
     }
-    if (pctLabel) pctLabel.textContent = `${visualPct}%`;
-    this.renderVolumeIcon(pct, muted);
 
-    // Avoid double-attenuation in Studio DSP when Windows endpoint handles hardware/mixer volume
-    this.audioEngine.setVolume(muted ? 0 : 1.0);
     if (this.engineMode === 'wasapi' && this.isPlaying && window.vantaAPI) {
       window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
     }
+    this.updateStreamTelemetry();
   }
 
   /**
-   * Sets Master Volume (0-100%) synced bidirectionally with Windows Master Endpoint Volume.
+   * Sets Master Volume (0-100%), routing cleanly via Windows Hardware Volume, 64-Bit Software Volume,
+   * or Fixed 0 dBFS bypass depending on `volumeMode`.
    * @param {number} pct - Volume percentage in [0, 100].
    * @param {boolean} [silent=false] - Skip toast notification.
    */
   setMasterVolume(pct, silent = false) {
+    const volMode = this.audioEngine?.state?.volumeMode || 'auto';
+    if (volMode === 'fixed0db') {
+      if (!silent) this.setToast('Volume locked at Fixed 0 dBFS unity output');
+      return;
+    }
+
     const clamped = Math.max(0, Math.min(100, Math.round(Number(pct) || 0)));
     this.masterVolumePct = clamped;
     this.isMuted = clamped === 0;
@@ -871,36 +1303,32 @@ class VantaStudioApp {
       // Ignore storage quota issues
     }
 
-    const slider = document.getElementById('masterVolumeSlider');
-    const pctLabel = document.getElementById('volumePercentLabel');
-    if (slider) {
-      slider.value = String(clamped);
-      slider.style.setProperty('--vol-pct', `${clamped}%`);
-    }
-    if (pctLabel) pctLabel.textContent = `${clamped}%`;
-    this.renderVolumeIcon(clamped, this.isMuted);
+    this._renderMasterVolumeUi(clamped, this.isMuted);
 
-    if (window.vantaAPI) {
+    if (volMode === 'auto' && window.vantaAPI) {
       this.windowsVolumeLinked = true;
       window.vantaAPI.setSystemVolume(clamped / 100).catch(() => {});
       this.audioEngine.setVolume(this.isMuted ? 0 : 1.0);
     } else {
-      this.audioEngine.setVolume(this.masterVolumeLinear);
+      this.audioEngine.setVolume(this.isMuted ? 0 : this.masterVolumeLinear);
     }
 
     if (this.engineMode === 'wasapi' && this.isPlaying && window.vantaAPI) {
       window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
     }
+    this.updateStreamTelemetry();
     if (!silent) {
-      this.setToast(clamped === 0 ? 'System & Master Audio Muted' : `System Volume: ${clamped}%`);
+      const modeTag = volMode === 'software' ? '64-Bit SW Volume' : 'System Volume';
+      this.setToast(clamped === 0 ? 'Master Audio Muted' : `${modeTag}: ${clamped}%`);
     }
   }
 
   /**
-   * Toggles Mute / Unmute cleanly across both Windows System Endpoint & VANTA.
+   * Toggles Mute / Unmute cleanly across Windows Endpoint or 64-Bit Software Volume.
    */
   toggleMute() {
-    if (window.vantaAPI && this.windowsVolumeLinked) {
+    const volMode = this.audioEngine?.state?.volumeMode || 'auto';
+    if (volMode === 'auto' && window.vantaAPI && this.windowsVolumeLinked) {
       const nextMuted = !this.isMuted;
       this.isMuted = nextMuted;
       if (!nextMuted && this.masterVolumePct === 0) {
@@ -908,28 +1336,24 @@ class VantaStudioApp {
         return;
       }
       window.vantaAPI.setSystemMute(nextMuted).catch(() => {});
-      const visualPct = nextMuted ? 0 : this.masterVolumePct;
-      const slider = document.getElementById('masterVolumeSlider');
-      const pctLabel = document.getElementById('volumePercentLabel');
-      if (slider) {
-        slider.value = String(visualPct);
-        slider.style.setProperty('--vol-pct', `${visualPct}%`);
-      }
-      if (pctLabel) pctLabel.textContent = `${visualPct}%`;
-      this.renderVolumeIcon(this.masterVolumePct, nextMuted);
+      this._renderMasterVolumeUi(this.masterVolumePct, nextMuted);
       this.audioEngine.setVolume(nextMuted ? 0 : 1.0);
       if (this.engineMode === 'wasapi' && this.isPlaying) {
         window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
       }
-      this.setToast(nextMuted ? 'System Audio Muted' : `System Volume: ${this.masterVolumePct}%`);
+      this.setToast(nextMuted ? 'Audio Muted' : `System Volume: ${this.masterVolumePct}%`);
       return;
     }
 
-    if (this.isMuted || this.masterVolumePct === 0) {
-      this.setMasterVolume(this.preMuteVolumePct || 85);
-    } else {
-      this.setMasterVolume(0);
+    const nextMuted = !this.isMuted;
+    this.isMuted = nextMuted;
+    this._renderMasterVolumeUi(this.masterVolumePct, nextMuted);
+    this.audioEngine.setVolume(nextMuted ? 0 : (volMode === 'fixed0db' ? 1.0 : this.masterVolumeLinear));
+    if (this.engineMode === 'wasapi' && this.isPlaying && window.vantaAPI) {
+      window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
     }
+    this.updateStreamTelemetry();
+    this.setToast(nextMuted ? 'Audio Muted' : 'Audio Unmuted');
   }
 
   /**
@@ -1089,6 +1513,24 @@ class VantaStudioApp {
    * Automatically refreshes when Bluetooth/USB audio endpoints hot-plug or when combo opens.
    * @param {boolean} [isHotPlugRefresh=false] - True when triggered by devicechange or combo open.
    */
+  async refreshDeviceCaps(deviceId = this.selectedDeviceId) {
+    if (!window.vantaAPI?.probeAudioCaps) return null;
+    try {
+      const caps = await window.vantaAPI.probeAudioCaps({ deviceId: deviceId || '', channels: 2 });
+      if (caps && caps.ok) {
+        this.deviceCaps = caps;
+        if (caps.hwVolumeSupport !== undefined) {
+          this.deviceHwVolumeSupport = Number(caps.hwVolumeSupport) || 0;
+        }
+        this._syncAllDspUi();
+        this.updateStreamTelemetry();
+      }
+      return caps;
+    } catch {
+      return null;
+    }
+  }
+
   async populateAudioDevices(isHotPlugRefresh = false) {
     if (this._refreshingDevices) return;
     this._refreshingDevices = true;
@@ -1100,6 +1542,7 @@ class VantaStudioApp {
         await this.audioEngine.setOutputSinkId(this.selectedDeviceId, this.selectedDeviceName);
         if (window.vantaAPI) {
           window.vantaAPI.setVolumeDevice(this.selectedDeviceId).catch(() => {});
+          await this.refreshDeviceCaps(this.selectedDeviceId);
         }
         if (this.engineMode === 'wasapi' && this.isPlaying) {
           const resumeSec = this.wasapiCurrentPositionSec || 0;
@@ -1143,6 +1586,7 @@ class VantaStudioApp {
           }
         }
       }
+      await this.refreshDeviceCaps(this.selectedDeviceId);
     } catch {
       // Keep existing device options
     } finally {
@@ -1157,14 +1601,71 @@ class VantaStudioApp {
    * Pushes PurePath 64 native DSP settings (10-band EQ, Sub-Bass, Bauer Crossfeed, Limiter)
    * over the active WASAPI named-pipe without interrupting Bit-Perfect exclusive playback.
    */
+  /**
+   * Pushes PurePath 64 native DSP settings (10-band EQ, Sub-Bass, Bauer Crossfeed, Limiter)
+   * and AutoEQ Parametric EQ filters over the active WASAPI/ASIO pipe without interrupting playback.
+   */
   syncNativeWasapiDsp() {
     if (this.engineMode !== 'wasapi' || !window.vantaAPI) return;
     const spec = serializeNativeDspSpecFromState(this.audioEngine.state);
     window.vantaAPI.wasapiCmd(`DSP ${spec}`).catch(() => {});
+    const peqSpec = serializePeqWireSpec(this.audioEngine.state);
+    window.vantaAPI.wasapiCmd(peqSpec ? `PEQ_SPEC ${peqSpec}` : 'PEQ_OFF').catch(() => {});
   }
 
   /**
-   * Keeps WASAPI PurePath 64 active for EQ/Bass/Crossfeed/Limiter changes, and seamlessly
+   * Synchronizes the 64-bit partitioned FFT Convolver IR with the native engine when active.
+   * @param {boolean|null} [forceEnable=null] - Optional override for enabled state.
+   */
+  async syncNativeConvolver(forceEnable = null) {
+    if (this.engineMode !== 'wasapi' || !window.vantaAPI?.loadConvolverIr) return null;
+    const st = this.audioEngine.state;
+    const enabled = forceEnable === null
+      ? Boolean(st.convolverEnabled && st.convolverPath)
+      : Boolean(forceEnable && st.convolverPath);
+    const wetPct = Math.max(0, Math.min(100, Math.round(Number(st.convolverWetPct ?? 100) || 0)));
+    try {
+      const res = await window.vantaAPI.loadConvolverIr({
+        enabled,
+        filePath: enabled ? st.convolverPath : '',
+        wetPct
+      });
+      if (res?.ok && res.resampled) {
+        this.setToast(`Convolver IR resampled cleanly (64-bit Kaiser-Sinc -> ${res.sampleRate} Hz)`);
+      } else if (res && !res.ok && res.error && enabled) {
+        this.setToast(`Convolver load failed: ${res.error}`);
+      }
+      return res;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Fetches and decodes the persisted convolution WAV IR into the Web Audio ConvolverNode when Studio DSP is active.
+   */
+  async _ensureStudioConvolverIrLoaded() {
+    const st = this.audioEngine?.state;
+    if (!st?.convolverEnabled || !st?.convolverPath || !this.audioEngine?.irConvolverNode) return false;
+    if (this.audioEngine.irConvolverNode.buffer && this.audioEngine._loadedConvolverPath === st.convolverPath) {
+      return true;
+    }
+    try {
+      const res = await fetch(this._buildLocalMediaUrl({ filePath: st.convolverPath }));
+      if (!res.ok) return false;
+      const wavBytes = await res.arrayBuffer();
+      const loaded = await this.audioEngine.setStudioConvolverIrBytes(wavBytes);
+      if (loaded) {
+        this.audioEngine._loadedConvolverPath = st.convolverPath;
+      }
+      return loaded;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Keeps WASAPI PurePath 64 active for EQ/PEQ/Convolver/Bass/Crossfeed/Limiter changes, and seamlessly
    * transitions to Studio DSP only when Web Audio-exclusive processors (Spatial/Reverb/Pitch) engage.
    * @param {boolean} [actionRequiresStudio=false] - Whether the triggering action requires Studio DSP.
    */
@@ -1188,18 +1689,32 @@ class VantaStudioApp {
    */
   getSignalPathDescriptor() {
     const activeTrack = this.currentLoadedTrack || this.displayedTracks[this.activeTrackIndex] || null;
+    this.getEffectiveReplayGain();
     return buildSignalPathDescriptor({
       engineMode: this.engineMode,
+      outputBackend: this.outputBackend,
       isVideo: Boolean(activeTrack?.isVideo),
       filePath: activeTrack?.filePath || '',
+      sacdArea: Number(activeTrack?.sacdArea) || 0,
+      sacdTrack: Number(activeTrack?.sacdTrack) || 0,
       trackTitle: activeTrack?.title || '',
       probe: this.activeTrackProbe,
       r128: this.activeTrackR128,
+      replayGainInfo: this.lastReplayGainInfo,
       wasapiEvent: this.lastWasapiReadyEvent,
+      caps: this.deviceCaps,
+      ratePlan: this.lastWasapiRatePlan,
       dspState: this.audioEngine.state,
-      deviceName: this.lastWasapiReadyEvent?.deviceName || '',
+      convolverActive: Boolean(this.audioEngine.state.convolverEnabled && this.audioEngine.state.convolverPath),
+      liveTelemetry: this.lastLiveAudioTelemetry,
+      deviceName: this.lastWasapiReadyEvent?.deviceName || (this.outputBackend === 'asio' ? this.asioDriver : this.selectedDeviceName) || '',
       linearGain: this.engineMode === 'wasapi' ? this.getEffectiveWasapiGain() : this.getEffectiveReplayGain(),
-      gaplessQueued: Boolean(this._wasapiGaplessTarget)
+      volumeMode: this.audioEngine?.state?.volumeMode || 'auto',
+      pushMode: this.wasapiPushMode,
+      preRollMs: this.clockSwitchPreRollMs,
+      xrunCount: this.wasapiXrunCount,
+      gaplessQueued: Boolean(this._wasapiGaplessTarget),
+      gaplessCrossFormat: Boolean(this._wasapiGaplessTarget?.crossFormat)
     });
   }
 
@@ -1217,15 +1732,23 @@ class VantaStudioApp {
       const chTag = ch > 2 ? (ch === 6 ? ' 5.1' : ch === 8 ? ' 7.1' : ` ${ch}ch`) : '';
       parts.push(`${this.activeTrackProbe.codec} ${srKhz}/${bits}${chTag}`);
     }
-    if (this.audioEngine.state.lufs && this.activeTrackR128?.integratedLufs !== undefined) {
-      parts.push(`R128 ${this.activeTrackR128.integratedLufs.toFixed(1)} LUFS`);
+    if (this.audioEngine.state.lufs && this.audioEngine.state.replayGainMode !== 'off') {
+      const targetLufs = Number(this.audioEngine.state.replayGainTargetLufs) === -14 ? -14 : -18;
+      if (this.lastReplayGainInfo && this.lastReplayGainInfo.source !== 'unmeasured') {
+        const db = Number(this.lastReplayGainInfo.appliedDb) || 0;
+        const m = this.lastReplayGainInfo.source.includes('album') ? 'Album' : 'Track';
+        parts.push(`RG2 ${m} ${db >= 0 ? '+' : ''}${db.toFixed(1)}dB @${targetLufs}`);
+      } else if (this.activeTrackR128?.integratedLufs !== undefined) {
+        parts.push(`R128 ${this.activeTrackR128.integratedLufs.toFixed(1)} LUFS`);
+      }
     }
 
-    el.classList.remove('tone-bit-exact', 'tone-purepath', 'tone-dop');
+    el.classList.remove('tone-bit-exact', 'tone-purepath', 'tone-dop', 'tone-shared');
     if (this.engineMode === 'wasapi' && !activeTrack?.isVideo) {
       if (desc.qualityTone === 'bit_exact') el.classList.add('tone-bit-exact');
       else if (desc.qualityTone === 'purepath') el.classList.add('tone-purepath');
       else if (desc.qualityTone === 'dop') el.classList.add('tone-dop');
+      else if (desc.qualityTone === 'shared') el.classList.add('tone-shared');
     }
 
     const icon = desc.qualityTone === 'bit_exact'
@@ -1234,12 +1757,45 @@ class VantaStudioApp {
         ? '◈'
         : desc.qualityTone === 'dop'
           ? '⚡'
-          : '🎛️';
+          : desc.qualityTone === 'shared'
+            ? '⚠'
+            : '🎛️';
     el.textContent = `${icon} ${parts.join(' · ')} ▾`;
 
     const modal = document.getElementById('signalPathModal');
     if (modal && !modal.classList.contains('hidden')) {
       this.renderSignalPathModal(desc);
+    }
+  }
+
+  /**
+   * Updates only the high-frequency Bit-Audit, True-Peak dBTP, Crest/DR, and XRUN badges cleanly.
+   * @param {object} desc - Signal Path descriptor returned by getSignalPathDescriptor().
+   */
+  _renderSignalPathAuditBadges(desc) {
+    const xrunPill = document.getElementById('signalPathXrunBadge');
+    if (xrunPill) {
+      const xruns = Math.max(0, Number(desc?.xrunCount ?? this.wasapiXrunCount ?? 0) || 0);
+      xrunPill.textContent = `XRUNs: ${xruns}`;
+      xrunPill.classList.toggle('warn', xruns > 0);
+    }
+    const audit = desc?.bitAudit;
+    if (!audit) return;
+
+    const bitAuditPill = document.getElementById('signalPathBitAuditBadge');
+    if (bitAuditPill) {
+      bitAuditPill.textContent = audit.bitAuditText;
+      bitAuditPill.className = `signal-path-audit-pill${audit.bitAuditTone ? ` tone-${audit.bitAuditTone}` : ''}`;
+    }
+    const tpPill = document.getElementById('signalPathTruePeakBadge');
+    if (tpPill) {
+      const tpVal = Number(this.lastLiveAudioTelemetry?.truePeakDbtp);
+      tpPill.textContent = `True Peak: ${audit.truePeakText}`;
+      tpPill.className = `signal-path-audit-pill${Number.isFinite(tpVal) && tpVal > -0.3 ? ' tone-warn' : ''}`;
+    }
+    const drPill = document.getElementById('signalPathDrBadge');
+    if (drPill) {
+      drPill.textContent = audit.crestDrText;
     }
   }
 
@@ -1260,6 +1816,7 @@ class VantaStudioApp {
       badge.className = `signal-path-quality-badge ${toneClass}`;
       badge.textContent = desc.qualityBadge;
     }
+    this._renderSignalPathAuditBadges(desc);
 
     const statusGlyph = {
       bit_exact: '◆',
@@ -1388,6 +1945,7 @@ class VantaStudioApp {
     }
 
     this.preferredAudioEngineMode = targetMode;
+    this._saveAudioPrefs();
     if (this.engineMode === targetMode) {
       this._syncEngineModeUi(track);
       return;
@@ -1401,6 +1959,7 @@ class VantaStudioApp {
 
     this.engineMode = targetMode;
     this.wasapiPausedTrackKey = null;
+    this.wasapiPausedHeld = false;
     this.wasapiResumeSec = 0;
     this._syncEngineModeUi(track);
 
@@ -1456,7 +2015,6 @@ class VantaStudioApp {
     if (nextIdx < 0) return null;
     const nextTrack = this.displayedTracks[nextIdx];
     if (!nextTrack?.filePath || nextTrack.isVideo) return null;
-    if (/\.(?:dsf|dff)$/i.test(nextTrack.filePath)) return null;
     return { index: nextIdx, track: nextTrack };
   }
 
@@ -1467,11 +2025,12 @@ class VantaStudioApp {
     if (remaining > 6.5 || remaining <= 0.15) return;
 
     const currentTrack = this.currentLoadedTrack || this.displayedTracks[this.activeTrackIndex];
-    const currentKey = currentTrack?.filePath || currentTrack?.id;
+    const currentKey = this._getTrackUniqueKey(currentTrack);
     const nextInfo = this._getNextTrackForWasapiGapless();
     if (!currentKey || !nextInfo) return;
+    if (Number(currentTrack?.sacdTrack) >= 1 || Number(nextInfo.track?.sacdTrack) >= 1) return;
 
-    const pairKey = `${currentKey}==>${nextInfo.track.filePath}`;
+    const pairKey = `${currentKey}==>${this._getTrackUniqueKey(nextInfo.track)}`;
     if (this._wasapiGaplessQueuedKey === pairKey) return;
     this._wasapiGaplessQueuedKey = pairKey;
 
@@ -1480,6 +2039,17 @@ class VantaStudioApp {
       .wasapiQueueNext({
         filePath: nextInfo.track.filePath,
         dop: Boolean(this.dopEnabled),
+        deviceId: this.selectedDeviceId || '',
+        backend: this.outputBackend === 'asio' ? 'asio' : 'wasapi',
+        asioDriver: this.asioDriver || '',
+        asioRawDsd: Boolean(this.asioRawDsd),
+        sacdTrack: Number(nextInfo.track.sacdTrack) || 0,
+        exclusive: true,
+        pushMode: Boolean(this.wasapiPushMode),
+        bufferMs: Number(this.wasapiBufferMs) || 0,
+        preRollMs: Number(this.clockSwitchPreRollMs) || 0,
+        fixedRateLock: Boolean(this.fixedRateLock),
+        fixedTargetRate: Number(this.fixedTargetRate) || 0,
         linearGain: this.getEffectiveWasapiGain(),
         seq
       })
@@ -1490,7 +2060,9 @@ class VantaStudioApp {
             index: nextInfo.index,
             track: nextInfo.track,
             probe: res.probe || null,
-            r128: res.r128 || null
+            r128: res.r128 || null,
+            crossFormat: Boolean(res.crossFormat),
+            ratePlan: res.ratePlan || null
           };
           this.updateStreamTelemetry();
         } else {
@@ -1507,12 +2079,12 @@ class VantaStudioApp {
     if (!target || target.seq !== Number(evt.seq)) return false;
 
     const prevTrack = this.currentLoadedTrack;
-    const prevKey = prevTrack ? (prevTrack.filePath || prevTrack.id) : null;
+    const prevKey = this._getTrackUniqueKey(prevTrack);
     const nextTrack = target.track;
     const resolvedIdx = this.displayedTracks.indexOf(nextTrack);
     const nextIdx = resolvedIdx >= 0 ? resolvedIdx : Math.max(0, Math.min(this.displayedTracks.length - 1, target.index));
 
-    if (prevTrack && prevKey && prevKey !== (nextTrack.filePath || nextTrack.id)) {
+    if (prevTrack && prevKey && prevKey !== this._getTrackUniqueKey(nextTrack)) {
       const top = this.playbackHistory[this.playbackHistory.length - 1];
       if (!top || top.key !== prevKey) {
         this.playbackHistory.push({ key: prevKey, title: prevTrack.title, artist: prevTrack.artist || '' });
@@ -1526,13 +2098,25 @@ class VantaStudioApp {
     this.currentLoadedTrack = nextTrack;
     this.activeTrackIndex = nextIdx;
     this._pausedTrackKey = null;
+    this.wasapiPausedHeld = false;
     this.wasapiCurrentPositionSec = 0;
     this.activeTrackProbe = target.probe || evt.probe || null;
     this.activeTrackR128 = target.r128 || null;
+    if (target.ratePlan || evt.ratePlan) {
+      this.lastWasapiRatePlan = evt.ratePlan || target.ratePlan;
+    }
+    if (evt.caps) this.deviceCaps = evt.caps;
     if (this.lastWasapiReadyEvent) {
       this.lastWasapiReadyEvent = {
         ...this.lastWasapiReadyEvent,
+        mode: evt.mode ?? this.lastWasapiReadyEvent.mode,
+        dsdRate: evt.dsdRate ?? this.lastWasapiReadyEvent.dsdRate,
         sampleRate: evt.sampleRate ?? this.lastWasapiReadyEvent.sampleRate,
+        bitsPerSample: evt.bitsPerSample ?? this.lastWasapiReadyEvent.bitsPerSample,
+        validBits: evt.validBits ?? this.lastWasapiReadyEvent.validBits,
+        channels: evt.channels ?? this.lastWasapiReadyEvent.channels,
+        bufferFrames: evt.bufferFrames ?? this.lastWasapiReadyEvent.bufferFrames,
+        inFmt: evt.inFmt ?? this.lastWasapiReadyEvent.inFmt,
         bitExact: evt.bitExact ?? this.lastWasapiReadyEvent.bitExact,
         signalMode: evt.signalMode ?? this.lastWasapiReadyEvent.signalMode
       };
@@ -1572,8 +2156,22 @@ class VantaStudioApp {
     if (!evt || typeof evt !== 'object') return;
     if (evt.event === 'ready') {
       this.lastWasapiReadyEvent = evt;
+      if (evt.caps) {
+        this.deviceCaps = evt.caps;
+        if (evt.caps.hwVolumeSupport !== undefined) {
+          this.deviceHwVolumeSupport = Number(evt.caps.hwVolumeSupport) || 0;
+        }
+      }
+      if (evt.ratePlan) this.lastWasapiRatePlan = evt.ratePlan;
+      if (evt.xrunCount !== undefined) this.wasapiXrunCount = Number(evt.xrunCount) || 0;
       const rateKhz = evt.sampleRate ? `${(evt.sampleRate / 1000).toFixed(1).replace(/\.0$/, '')}kHz` : 'Native';
-      if (evt.mode === 'dop_exclusive') {
+      if (evt.mode === 'asio_dsd_raw') {
+        this.wasapiStatusMode = `ASIO RAW DSD (${evt.dsdRate || 'DSD'} @ ${rateKhz})`;
+      } else if (evt.mode === 'asio') {
+        this.wasapiStatusMode = evt.bitExact
+          ? `BIT-EXACT ASIO (${rateKhz})`
+          : `PUREPATH 64 ASIO (${rateKhz})`;
+      } else if (evt.mode === 'dop_exclusive') {
         this.wasapiStatusMode = `NATIVE DoP v1.1 (${evt.dsdRate || 'DSD'} @ ${rateKhz})`;
       } else if (evt.mode === 'exclusive') {
         this.wasapiStatusMode = evt.bitExact
@@ -1582,6 +2180,12 @@ class VantaStudioApp {
       } else {
         this.wasapiStatusMode = 'WASAPI SHARED (Auto-Fallback)';
       }
+      this._syncAllDspUi();
+      this.updateStreamTelemetry();
+      return;
+    }
+    if (evt.event === 'asio_fallback') {
+      this.setToast(`ASIO fallback -> WASAPI Exclusive (${evt.reason || evt.message || 'Driver unavailable'})`);
       this.updateStreamTelemetry();
       return;
     }
@@ -1591,6 +2195,8 @@ class VantaStudioApp {
           ...this.lastWasapiReadyEvent,
           bitExact: evt.bitExact,
           eqActive: evt.eqActive,
+          peqActive: evt.peqActive ?? this.lastWasapiReadyEvent.peqActive,
+          convolverActive: evt.convolverActive ?? this.lastWasapiReadyEvent.convolverActive,
           bass: evt.bass,
           crossfeed: evt.crossfeed,
           limiter: evt.limiter,
@@ -1600,10 +2206,33 @@ class VantaStudioApp {
       const rateKhz = this.lastWasapiReadyEvent?.sampleRate
         ? `${(this.lastWasapiReadyEvent.sampleRate / 1000).toFixed(1).replace(/\.0$/, '')}kHz`
         : 'Native';
-      if (this.lastWasapiReadyEvent?.mode === 'exclusive') {
+      if (this.lastWasapiReadyEvent?.mode === 'asio') {
+        this.wasapiStatusMode = evt.bitExact ? `BIT-EXACT ASIO (${rateKhz})` : `PUREPATH 64 ASIO (${rateKhz})`;
+      } else if (this.lastWasapiReadyEvent?.mode === 'exclusive') {
         this.wasapiStatusMode = evt.bitExact
           ? `BIT-EXACT WASAPI (${rateKhz})`
           : `PUREPATH 64 WASAPI (${rateKhz})`;
+      }
+      this.updateStreamTelemetry();
+      return;
+    }
+    if (evt.event === 'convolver_state') {
+      if (this.lastWasapiReadyEvent) {
+        this.lastWasapiReadyEvent = {
+          ...this.lastWasapiReadyEvent,
+          convolverActive: Boolean(evt.active)
+        };
+      }
+      if (evt.error) {
+        this.setToast(`Convolver warning: ${evt.error}`);
+      }
+      this.updateStreamTelemetry();
+      return;
+    }
+    if (evt.event === 'paused' || evt.event === 'resumed') {
+      if (evt.xrunCount !== undefined) this.wasapiXrunCount = Number(evt.xrunCount) || 0;
+      if (Number.isFinite(Number(evt.positionMs))) {
+        this.wasapiCurrentPositionSec = (Number(evt.positionMs) || 0) / 1000;
       }
       this.updateStreamTelemetry();
       return;
@@ -1615,6 +2244,10 @@ class VantaStudioApp {
       return;
     }
     if (evt.event === 'spectrum') {
+      if (evt.xrunCount !== undefined) {
+        this.wasapiXrunCount = Number(evt.xrunCount) || 0;
+      }
+      this.lastLiveAudioTelemetry = evt;
       if (this.engineMode === 'wasapi' && this.isPlaying) {
         if (Array.isArray(evt.bars)) {
           this.audioEngine.setExternalSpectrum(evt.bars, evt);
@@ -1623,13 +2256,20 @@ class VantaStudioApp {
         const totalSec = Number(evt.durationSec) || this.activeTrackProbe?.durationSec || 0;
         this.updateTimelineUi(this.wasapiCurrentPositionSec, totalSec);
         this._maybeQueueGaplessWasapiNext(this.wasapiCurrentPositionSec, totalSec);
+        const spModal = document.getElementById('signalPathModal');
+        if (spModal && !spModal.classList.contains('hidden')) {
+          this._renderSignalPathAuditBadges(this.getSignalPathDescriptor());
+        }
       }
       return;
     }
     if (evt.event === 'ended') {
       this.audioEngine.setExternalSpectrum(null);
+      this.lastLiveAudioTelemetry = null;
       this._wasapiGaplessTarget = null;
       this._wasapiGaplessQueuedKey = null;
+      this.wasapiPausedHeld = false;
+      if (evt.xrunCount !== undefined) this.wasapiXrunCount = Number(evt.xrunCount) || 0;
       if (this.engineMode === 'wasapi' && this.isPlaying) {
         this.wasapiCurrentPositionSec = 0;
         this.wasapiPausedTrackKey = null;
@@ -1640,6 +2280,8 @@ class VantaStudioApp {
     }
     if (evt.event === 'error') {
       this.audioEngine.setExternalSpectrum(null);
+      this.lastLiveAudioTelemetry = null;
+      this.wasapiPausedHeld = false;
       if (this.engineMode === 'wasapi' && evt.message) {
         this.setToast(`WASAPI fallback -> Studio DSP (${evt.message})`);
         void this.setEngineMode('dsp', true).catch(() => {});
@@ -1648,6 +2290,8 @@ class VantaStudioApp {
     }
     if (evt.event === 'closed') {
       this.audioEngine.setExternalSpectrum(null);
+      this.lastLiveAudioTelemetry = null;
+      this.wasapiPausedHeld = false;
     }
   }
 
@@ -1656,7 +2300,7 @@ class VantaStudioApp {
    * @param {object} track - Active catalog track.
    */
   async probeActiveTrack(track) {
-    if (!track?.filePath || !window.vantaAPI) return;
+    if (!track?.filePath || Number(track.sacdTrack) >= 1 || !window.vantaAPI) return;
     const requestedPath = track.filePath;
     try {
       const info = await window.vantaAPI.probeAudio(requestedPath);
@@ -1664,6 +2308,7 @@ class VantaStudioApp {
       if (!info || !current || current.filePath !== requestedPath) return;
       this.activeTrackProbe = info.probe || null;
       this.activeTrackR128 = info.r128 || null;
+      this.activeTrackTags = info.tags || null;
       const gain = this.getEffectiveReplayGain();
       this.audioEngine.setReplayGainLinear(gain);
       if (this.engineMode === 'wasapi' && this.isPlaying) {
@@ -1739,7 +2384,8 @@ class VantaStudioApp {
     if (elEl) elEl.textContent = '00:00';
     if (remEl) remEl.textContent = '-00:00';
 
-    const filePaths = this.catalog.map((t) => t.filePath).filter(Boolean);
+    this.sacdVirtualTracks = [];
+    const filePaths = this.catalog.filter((t) => !t.sacdTrack).map((t) => t.filePath).filter(Boolean);
     this.wasapiStatusMode = this.engineMode === 'wasapi' ? 'WASAPI EXCLUSIVE READY' : 'STUDIO DSP';
     this.updateStreamTelemetry();
 
@@ -2436,8 +3082,8 @@ class VantaStudioApp {
     switch (col.id) {
       case 'num': {
         cell.classList.add('rb-cell-num');
-        const trackKey = track?.filePath || track?.id || null;
-        const loadedKey = this.currentLoadedTrack ? (this.currentLoadedTrack.filePath || this.currentLoadedTrack.id || null) : null;
+        const trackKey = this._getTrackUniqueKey(track);
+        const loadedKey = this._getTrackUniqueKey(this.currentLoadedTrack);
         const indicator = resolveQueueRowNumIndicator({
           index: idx,
           trackKey,
@@ -2861,8 +3507,8 @@ class VantaStudioApp {
         clearTimeout(this._rowClickTimer);
         const fireSelect = () => {
           if (this._activeInlineEdit) return;
-          const clickedKey = track?.filePath || track?.id || null;
-          const loadedKey = this.currentLoadedTrack ? (this.currentLoadedTrack.filePath || this.currentLoadedTrack.id || null) : null;
+          const clickedKey = this._getTrackUniqueKey(track);
+          const loadedKey = this._getTrackUniqueKey(this.currentLoadedTrack);
           if (resolveRowClickAction({ clickedKey, loadedKey }) === 'toggle') {
             this.activeTrackIndex = idx;
             this.togglePlay();
@@ -3046,9 +3692,9 @@ class VantaStudioApp {
     if (!this.displayedTracks.length) return;
     const clampedIdx = Math.max(0, Math.min(this.displayedTracks.length - 1, index));
     const incomingTrack = this.displayedTracks[clampedIdx];
-    const incomingKey = incomingTrack?.filePath || incomingTrack?.id;
+    const incomingKey = this._getTrackUniqueKey(incomingTrack);
     const prevTrack = this.currentLoadedTrack;
-    const prevKey = prevTrack ? (prevTrack.filePath || prevTrack.id) : null;
+    const prevKey = this._getTrackUniqueKey(prevTrack);
 
     if (!this._navigatingHistory && prevTrack && prevKey && prevKey !== incomingKey) {
       const top = this.playbackHistory[this.playbackHistory.length - 1];
@@ -3128,6 +3774,9 @@ class VantaStudioApp {
     this.crossfadeTriggeredForTrack = false;
     this.activeTrackProbe = null;
     this.activeTrackR128 = null;
+    this.activeTrackTags = null;
+    this.lastReplayGainInfo = null;
+    this.lastLiveAudioTelemetry = null;
     this.wasapiPausedTrackKey = null;
     this.wasapiResumeSec = 0;
     this.wasapiCurrentPositionSec = 0;
@@ -3153,7 +3802,7 @@ class VantaStudioApp {
       }
     } else if (this.preferredAudioEngineMode === 'wasapi' && this.engineMode !== 'wasapi') {
       this.engineMode = 'wasapi';
-      this.wasapiStatusMode = 'WASAPI EXCLUSIVE READY';
+      this.wasapiStatusMode = this.outputBackend === 'asio' ? 'ASIO ISOLATED READY' : 'WASAPI EXCLUSIVE READY';
     }
     this._syncEngineModeUi(track);
 
@@ -3163,9 +3812,10 @@ class VantaStudioApp {
         this.audioEl.removeAttribute('src');
         this.switchStage('video');
         this.prepareVideoTrack(track, this.theaterOpen);
+        void this.probeActiveTrack(track).catch(() => {});
       } else {
         if (this.theaterOpen) this.openTheaterStage(false);
-        const mediaUrl = `vanta-media://local?path=${encodeURIComponent(track.filePath)}`;
+        const mediaUrl = this._buildLocalMediaUrl(track);
         this.videoEl.pause();
         if (this.engineMode === 'dsp') {
           const activeDeck = this.audioEngine.getActiveDeckElement() || this.audioEl;
@@ -3178,8 +3828,20 @@ class VantaStudioApp {
             this.audioEngine.suspendEngine().catch(() => {});
           }
         }
+        if (Number(track.sacdTrack) >= 1) {
+          this.activeTrackProbe = {
+            codec: track.audioCodec || track.codec || 'SACD DST/DSD',
+            sampleRate: Number(track.sampleRate) || 2822400,
+            bitDepth: 1,
+            channels: Number(track.channels) || 2,
+            durationSec: Number(track.durationSec) || 0,
+            sacdArea: Number.isFinite(Number(track.sacdArea)) ? Number(track.sacdArea) : 0,
+            sacdTrack: Number(track.sacdTrack)
+          };
+        } else {
+          void this.probeActiveTrack(track).catch(() => {});
+        }
       }
-      void this.probeActiveTrack(track).catch(() => {});
     } else {
       this.audioEl.removeAttribute('src');
       this.deckBEl?.removeAttribute('src');
@@ -3216,7 +3878,7 @@ class VantaStudioApp {
     document.getElementById('vinylPlatterDisc')?.classList.remove('paused');
     this.renderQueue();
 
-    const trackKey = track.filePath || track.id;
+    const trackKey = this._getTrackUniqueKey(track);
     const useNativeWasapi =
       this.engineMode === 'wasapi' &&
       Boolean(window.vantaAPI) &&
@@ -3232,32 +3894,75 @@ class VantaStudioApp {
       await this.audioEngine.suspendEngine();
       if (mySeq !== this._playbackSeq) return;
 
+      const isHeldResume =
+        Boolean(this.wasapiPausedHeld) &&
+        this.wasapiPausedTrackKey === trackKey &&
+        seekSecOverride === 0;
+      if (isHeldResume) {
+        this.wasapiPausedHeld = false;
+        this.wasapiPausedTrackKey = null;
+        window.vantaAPI.wasapiCmd('RESUME').catch(() => {});
+        const evtRate = this.lastWasapiReadyEvent?.sampleRate;
+        const rKhz = evtRate ? `${(evtRate / 1000).toFixed(1).replace(/\.0$/, '')}kHz` : 'Native';
+        const isAsioEvt = this.lastWasapiReadyEvent?.mode === 'asio' || this.lastWasapiReadyEvent?.mode === 'asio_dsd_raw';
+        this.wasapiStatusMode = this.lastWasapiReadyEvent?.mode === 'asio_dsd_raw'
+          ? `ASIO RAW DSD (${this.lastWasapiReadyEvent?.dsdRate || 'DSD'})`
+          : (this.lastWasapiReadyEvent?.bitExact
+            ? `BIT-EXACT ${isAsioEvt ? 'ASIO' : 'WASAPI'} (${rKhz})`
+            : `PUREPATH 64 ${isAsioEvt ? 'ASIO' : 'WASAPI'} (${rKhz})`);
+        this.updateStreamTelemetry();
+        return;
+      }
+
       const resumeOffset =
         this.wasapiPausedTrackKey === trackKey && seekSecOverride === 0
           ? this.wasapiResumeSec
           : (Number(seekSecOverride) || 0);
       this.wasapiPausedTrackKey = null;
+      this.wasapiPausedHeld = false;
       this.wasapiResumeSec = 0;
       this._wasapiGaplessTarget = null;
       this._wasapiGaplessQueuedKey = null;
       this.wasapiCurrentPositionSec = resumeOffset;
+      this.wasapiXrunCount = 0;
       window.vantaAPI
         .wasapiPlay({
           filePath: track.filePath,
           exclusive: true,
           dop: Boolean(this.dopEnabled),
           deviceId: this.selectedDeviceId || '',
+          backend: this.outputBackend === 'asio' ? 'asio' : 'wasapi',
+          asioDriver: this.asioDriver || '',
+          asioRawDsd: Boolean(this.asioRawDsd),
+          sacdArea: Number(track.sacdArea) || 0,
+          sacdTrack: Number(track.sacdTrack) || 0,
           linearGain: this.getEffectiveWasapiGain(),
           seekSec: resumeOffset,
-          dspSpec: serializeNativeDspSpecFromState(this.audioEngine.state)
+          dspSpec: serializeNativeDspSpecFromState(this.audioEngine.state),
+          peqSpec: serializePeqWireSpec(this.audioEngine.state),
+          convolverIrPath: (this.audioEngine.state.convolverEnabled && this.audioEngine.state.convolverPath) ? this.audioEngine.state.convolverPath : '',
+          convolverWetPct: Math.max(0, Math.min(100, Math.round(Number(this.audioEngine.state.convolverWetPct ?? 100) || 0))),
+          pushMode: Boolean(this.wasapiPushMode),
+          bufferMs: Number(this.wasapiBufferMs) || 0,
+          preRollMs: Number(this.clockSwitchPreRollMs) || 0,
+          fixedRateLock: Boolean(this.fixedRateLock),
+          fixedTargetRate: Number(this.fixedTargetRate) || 0
         })
         .then((res) => {
           if (mySeq !== this._playbackSeq) return;
           if (!res?.ok) {
             this.setToast(`WASAPI fallback -> Studio DSP (${res?.error || 'Device busy'})`);
             void this.setEngineMode('dsp', true).catch(() => {});
-          } else if (res.probe) {
-            this.activeTrackProbe = res.probe;
+          } else {
+            if (res.probe) this.activeTrackProbe = res.probe;
+            if (res.caps) {
+              this.deviceCaps = res.caps;
+              if (res.caps.hwVolumeSupport !== undefined) {
+                this.deviceHwVolumeSupport = Number(res.caps.hwVolumeSupport) || 0;
+              }
+            }
+            if (res.ratePlan) this.lastWasapiRatePlan = res.ratePlan;
+            this._syncAllDspUi();
             this.updateStreamTelemetry();
           }
         })
@@ -3278,6 +3983,9 @@ class VantaStudioApp {
       await this.audioEngine.resumeEngine();
       if (mySeq !== this._playbackSeq) return;
       this.audioEngine.setReplayGainLinear(this.getEffectiveReplayGain());
+      if (this.audioEngine.state.convolverEnabled && this.audioEngine.state.convolverPath) {
+        void this._ensureStudioConvolverIrLoaded().catch(() => {});
+      }
       const targetEl = track.isVideo
         ? this.videoEl
         : (this.audioEngine.getActiveDeckElement() || this.audioEl);
@@ -3286,12 +3994,11 @@ class VantaStudioApp {
       this.studioSeekOffsetSec = (usesFfmpegStream && seekSecOverride > 0.5) ? Number(seekSecOverride) : 0;
       const expectedUrl = track.isVideo
         ? this.buildVideoStreamUrl(track, this.activeVideoAudioIdx, this.studioSeekOffsetSec)
-        : (usesFfmpegStream
-          ? `vanta-media://local?path=${encodeURIComponent(track.filePath)}&ss=${this.studioSeekOffsetSec.toFixed(2)}`
-          : `vanta-media://local?path=${encodeURIComponent(track.filePath)}`);
+        : this._buildLocalMediaUrl(track, usesFfmpegStream ? this.studioSeekOffsetSec : 0);
+      const sacdMismatch = Number(track.sacdTrack) >= 1 && !String(targetEl.src || '').includes(`sacdTrack=${Number(track.sacdTrack)}`);
       if (
         (track.isVideo && (this._lastLoadedVideoUrl !== expectedUrl || !targetEl.src)) ||
-        (!track.isVideo && (usesFfmpegStream || !targetEl.src || !targetEl.src.includes(encodeURIComponent(track.filePath)) || targetEl.src.includes('&ss=')))
+        (!track.isVideo && (usesFfmpegStream || !targetEl.src || !targetEl.src.includes(encodeURIComponent(track.filePath)) || targetEl.src.includes('&ss=') || sacdMismatch))
       ) {
         targetEl.src = expectedUrl;
         if (track.isVideo) this._lastLoadedVideoUrl = expectedUrl;
@@ -3330,7 +4037,7 @@ class VantaStudioApp {
     this.isPlaying = false;
     this.visualizer.isPlaying = false;
     const pausedTarget = this.currentLoadedTrack || track;
-    this._pausedTrackKey = pausedTarget ? (pausedTarget.filePath || pausedTarget.id || null) : null;
+    this._pausedTrackKey = this._getTrackUniqueKey(pausedTarget);
     this.audioEl.pause();
     this.deckBEl?.pause();
     this.videoEl.pause();
@@ -3338,14 +4045,30 @@ class VantaStudioApp {
     this.audioEngine.setExternalSpectrum(null);
 
     if (this.engineMode === 'wasapi' && window.vantaAPI && track?.filePath && !track.isVideo) {
-      this.wasapiPausedTrackKey = track.filePath || track.id;
-      this.wasapiResumeSec = Math.max(0, Number(this.wasapiCurrentPositionSec) || 0);
-      this._wasapiGaplessTarget = null;
-      this._wasapiGaplessQueuedKey = null;
-      this.lastWasapiReadyEvent = null;
-      window.vantaAPI.wasapiCmd('STOP').catch(() => {});
-      this.wasapiStatusMode = 'WASAPI EXCLUSIVE (RELEASED)';
-      this.updateStreamTelemetry();
+      this.wasapiPausedTrackKey = this._getTrackUniqueKey(track);
+      if (this.holdWasapiOnPause) {
+        this.wasapiPausedHeld = true;
+        window.vantaAPI.wasapiCmd('PAUSE').catch(() => {});
+        this.wasapiStatusMode = 'WASAPI EXCLUSIVE (HELD · 0ms)';
+        this.updateStreamTelemetry();
+      } else {
+        this.wasapiPausedHeld = false;
+        this.wasapiResumeSec = Math.max(0, Number(this.wasapiCurrentPositionSec) || 0);
+        this._wasapiGaplessTarget = null;
+        this._wasapiGaplessQueuedKey = null;
+        this.lastWasapiReadyEvent = null;
+        window.vantaAPI
+          .wasapiCmd('STOP')
+          .then((res) => {
+            if (!this.isPlaying && res && Number.isFinite(Number(res.positionSec))) {
+              this.wasapiResumeSec = Math.max(0, Number(res.positionSec));
+              this.wasapiCurrentPositionSec = this.wasapiResumeSec;
+            }
+          })
+          .catch(() => {});
+        this.wasapiStatusMode = 'WASAPI EXCLUSIVE (RELEASED)';
+        this.updateStreamTelemetry();
+      }
     }
 
     this.setPlayPauseIcon(false);
@@ -3394,17 +4117,17 @@ class VantaStudioApp {
    * Returns to and plays the most recently played track from playback history.
    */
   goBackToLastPlayedTrack() {
-    const currentKey = this.currentLoadedTrack ? (this.currentLoadedTrack.filePath || this.currentLoadedTrack.id) : null;
+    const currentKey = this._getTrackUniqueKey(this.currentLoadedTrack);
     while (this.playbackHistory.length > 0) {
       const entry = this.playbackHistory.pop();
       if (!entry || !entry.key || entry.key === currentKey) continue;
 
-      let targetIdx = this.displayedTracks.findIndex((t) => (t.filePath || t.id) === entry.key);
+      let targetIdx = this.displayedTracks.findIndex((t) => this._getTrackUniqueKey(t) === entry.key);
       if (targetIdx < 0) {
-        const inCatalog = this.catalog.find((t) => (t.filePath || t.id) === entry.key);
+        const inCatalog = this.catalog.find((t) => this._getTrackUniqueKey(t) === entry.key);
         if (!inCatalog) continue;
         document.getElementById('btnResetFilters')?.click();
-        targetIdx = this.displayedTracks.findIndex((t) => (t.filePath || t.id) === entry.key);
+        targetIdx = this.displayedTracks.findIndex((t) => this._getTrackUniqueKey(t) === entry.key);
       }
       if (targetIdx >= 0) {
         this._savePlaybackHistory();
@@ -5705,16 +6428,23 @@ class VantaStudioApp {
    */
   async addPathsToPlaylist(paths = [], autoPlayFirst = false) {
     const list = (Array.isArray(paths) ? paths : []).filter(Boolean);
-    if (!list.length || !window.vantaAPI?.addPaths) return;
+    if (!list.length || !window.vantaAPI) return;
 
-    this.setToast(`Adding ${list.length} item${list.length > 1 ? 's' : ''} to playlist...`);
-    const res = await window.vantaAPI.addPaths(list);
+    const isoPaths = list.filter((p) => /\.iso$/i.test(String(p)));
+    const mediaPaths = list.filter((p) => !/\.iso$/i.test(String(p)));
+    for (const isoPath of isoPaths) {
+      await this.importSacdIsoFiles(isoPath);
+    }
+    if (!mediaPaths.length || !window.vantaAPI.addPaths) return;
+
+    this.setToast(`Adding ${mediaPaths.length} item${mediaPaths.length > 1 ? 's' : ''} to playlist...`);
+    const res = await window.vantaAPI.addPaths(mediaPaths);
     if (!res) return;
 
     this.mergeVaultCatalog(res.catalog, res.doctor, res.smartPlaylists);
 
-    if (autoPlayFirst && list.length === 1) {
-      const targetNorm = list[0].toLowerCase();
+    if (autoPlayFirst && mediaPaths.length === 1) {
+      const targetNorm = mediaPaths[0].toLowerCase();
       const addedTrack = this.catalog.find((t) => String(t.filePath || '').toLowerCase() === targetNorm);
       if (addedTrack?.isVideo && this.activeNav !== 'videos' && !isMusicVideoTagged(addedTrack)) {
         this.handleSidebarSwitch('videos');
@@ -5728,7 +6458,7 @@ class VantaStudioApp {
     }
 
     this.setToast(
-      `Playlist updated: ${res.addedCount || list.length} source item(s) processed (${res.catalog.length} tracks)`
+      `Playlist updated: ${res.addedCount || mediaPaths.length} source item(s) processed (${this.catalog.length} tracks)`
     );
   }
 
@@ -7015,7 +7745,11 @@ class VantaStudioApp {
     document.getElementById('btnRunBatchDownload')?.addEventListener('click', () => this.runUniversalBatch());
     document.getElementById('btnQuickSaveTrack')?.addEventListener('click', () => this.runUniversalBatch());
 
-    // 8. Left Sidebar SOURCES Actions (Split Computer Explorer + Refresh + Hidden Folder Restore)
+    // 8. Left Sidebar SOURCES Actions (Split Computer Explorer + Refresh + Hidden Folder Restore + SACD ISO Import)
+    document.getElementById('btnImportSacdIso')?.addEventListener('click', () => {
+      void this.importSacdIsoFiles('').catch(() => {});
+    });
+
     document.getElementById('btnRefreshExplorer')?.addEventListener('click', async () => {
       await this.refreshComputerExplorer(false);
     });
@@ -7170,13 +7904,21 @@ class VantaStudioApp {
         this._saveProDspSettings();
 
         if (flag === 'lufs') {
+          if (active && this.audioEngine.state.replayGainMode === 'off') {
+            this.audioEngine.state.replayGainMode = 'track';
+            this.audioEngine.syncDspState();
+            this._syncAllDspUi();
+            this._saveProDspSettings();
+          }
           const gain = this.getEffectiveReplayGain();
           this.audioEngine.setReplayGainLinear(gain);
           if (this.engineMode === 'wasapi' && this.isPlaying && window.vantaAPI) {
             window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
           }
           this.updateStreamTelemetry();
-          this.setToast(`EBU R128 ReplayGain (-14.0 LUFS) ${active ? 'ENABLED' : 'BYPASSED (UNITY 0dB)'}`);
+          const rgTarget = Number(this.audioEngine.state.replayGainTargetLufs) === -14 ? -14 : -18;
+          const rgMode = String(this.audioEngine.state.replayGainMode || 'track').toUpperCase();
+          this.setToast(`ReplayGain 2.0 (${rgMode} @ ${rgTarget}.0 LUFS) ${active ? 'ENABLED' : 'BYPASSED (UNITY 0dB)'}`);
           return;
         }
 
@@ -7188,8 +7930,41 @@ class VantaStudioApp {
       });
     });
 
+    const toggleStudioPreset = async (forceEnable = null) => {
+      this.audioEngine.bindElements(this.audioEl, this.videoEl, this.deckBEl);
+      const st = this.audioEngine.state;
+      const currentlyStudio = Boolean(st.lufs || st.limiter);
+      const nextEnable = forceEnable !== null ? Boolean(forceEnable) : !currentlyStudio;
+      if (nextEnable) {
+        this.audioEngine.applyStudioDspPreset();
+      } else {
+        this.audioEngine.resetBitPerfect();
+        if (this.engineMode === 'wasapi' && window.vantaAPI) {
+          void this.syncNativeConvolver(false).catch(() => {});
+        }
+      }
+      this.audioEngine.setReplayGainLinear(this.getEffectiveReplayGain());
+      this._syncAllDspUi();
+      this._saveProDspSettings();
+      await this.ensurePlaybackEngineForCurrentDsp(false);
+      if (this.engineMode === 'wasapi' && this.isPlaying && window.vantaAPI) {
+        window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
+      }
+      this.updateStreamTelemetry();
+      this.setToast(nextEnable ? 'Studio DSP Preset ENABLED (EBU R128 + True-Peak Limiter)' : 'Bit-Perfect Pure ENABLED (Zero LUFS · Zero Limiter)');
+    };
+
+    document.getElementById('btnStudioDspPreset')?.addEventListener('click', () => {
+      void toggleStudioPreset(null).catch(() => {});
+    });
+
+    document.getElementById('btnApplyStudioPreset')?.addEventListener('click', () => {
+      void toggleStudioPreset(true).catch(() => {});
+    });
+
     this._bindDspRackModal();
     this._bindSignalPathModal();
+    this._bindAbxModal();
 
     document.getElementById('btnCopyLyrics')?.addEventListener('click', async () => {
       const text = this._currentFormattedLyrics || '';
@@ -7262,7 +8037,7 @@ class VantaStudioApp {
             : 'Native DoP v1.1 OFF (DSF/DFF decoded as Studio DXD PCM)'
         );
         const track = this.displayedTracks[this.activeTrackIndex];
-        const isDsd = track?.filePath && /\.(?:dsf|dff)$/i.test(track.filePath);
+        const isDsd = Boolean(track?.sacdTrack >= 1 || (track?.filePath && /\.(?:dsf|dff|wv)$/i.test(track.filePath)));
         if (this.isPlaying && this.engineMode === 'wasapi' && isDsd) {
           await this.startPlayback(this.wasapiCurrentPositionSec || 0);
         }
@@ -7590,11 +8365,642 @@ class VantaStudioApp {
       this._syncAllDspUi();
       this._saveProDspSettings();
       this.syncNativeWasapiDsp();
+      void this.syncNativeConvolver(false).catch(() => {});
       this.updateStreamTelemetry();
-      this.setToast('DSP reset to Bit-Perfect transparency (Unity 0 dB)');
+      this.setToast('DSP reset to Bit-Perfect Pure (Unity 0 dB · PEQ/Convolver/LUFS/Limiter OFF)');
+    });
+
+    const restartWasapiIfActive = () => {
+      if (this.engineMode === 'wasapi' && this.isPlaying && this.currentLoadedTrack && !this.currentLoadedTrack.isVideo) {
+        const resumePos = Math.max(0, Number(this.wasapiCurrentPositionSec) || 0);
+        void this.startPlayback(resumePos).catch(() => {});
+      }
+    };
+
+    document.getElementById('btnWasapiModeEvent')?.addEventListener('click', () => {
+      this.wasapiPushMode = false;
+      this._saveAudioPrefs();
+      this._syncAllDspUi();
+      restartWasapiIfActive();
+      this.setToast('WASAPI Transport: Event-Driven (Low Jitter)');
+    });
+
+    document.getElementById('btnWasapiModePush')?.addEventListener('click', () => {
+      this.wasapiPushMode = true;
+      this._saveAudioPrefs();
+      this._syncAllDspUi();
+      restartWasapiIfActive();
+      this.setToast('WASAPI Transport: Push Mode (Universal Compatibility)');
+    });
+
+    document.getElementById('btnToggleHoldOnPause')?.addEventListener('click', () => {
+      this.holdWasapiOnPause = !this.holdWasapiOnPause;
+      this._saveAudioPrefs();
+      if (!this.holdWasapiOnPause && this.wasapiPausedHeld && window.vantaAPI) {
+        this.wasapiPausedHeld = false;
+        window.vantaAPI.wasapiCmd('STOP').catch(() => {});
+        this.wasapiStatusMode = 'WASAPI EXCLUSIVE (RELEASED)';
+      }
+      this._syncAllDspUi();
+      this.updateStreamTelemetry();
+      this.setToast(
+        this.holdWasapiOnPause
+          ? 'Pause Mode: Hold WASAPI Device (0 ms Resume)'
+          : 'Pause Mode: Release DAC on Pause (Recommended)'
+      );
+    });
+
+    document.querySelectorAll('[data-vol-mode]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const mode = btn.dataset.volMode;
+        if (!['auto', 'software', 'fixed0db'].includes(mode)) return;
+        this.audioEngine.state.volumeMode = mode;
+        this._saveProDspSettings();
+        this._syncAllDspUi();
+        if (window.vantaAPI && this.engineMode === 'wasapi' && this.isPlaying) {
+          window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
+        }
+        const studioVol = mode === 'fixed0db' ? (this.isMuted ? 0 : 1.0) : (mode === 'auto' ? (this.isMuted ? 0 : 1.0) : (this.isMuted ? 0 : this.masterVolumeLinear));
+        this.audioEngine.setVolume(studioVol);
+        this.updateStreamTelemetry();
+        this.setToast(`Volume Mode: ${btn.textContent.trim()}`);
+      });
+    });
+
+    document.getElementById('btnToggleFixedRateLock')?.addEventListener('click', () => {
+      this.fixedRateLock = !this.fixedRateLock;
+      this._saveAudioPrefs();
+      this._syncAllDspUi();
+      restartWasapiIfActive();
+      this.setToast(this.fixedRateLock ? `Fixed Rate Lock: ${this.fixedTargetRate} Hz` : 'Sample Rate: Native Auto Match');
+    });
+
+    document.getElementById('selectFixedTargetRate')?.addEventListener('change', (e) => {
+      const rate = Number(e.target.value) || 48000;
+      this.fixedTargetRate = rate;
+      this._saveAudioPrefs();
+      this._syncAllDspUi();
+      if (this.fixedRateLock) restartWasapiIfActive();
+      this.setToast(`Locked Target Rate set to ${rate} Hz`);
+    });
+
+    document.querySelectorAll('[data-output-backend]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const backend = btn.dataset.outputBackend === 'asio' ? 'asio' : 'wasapi';
+        if (backend === 'asio' && (!this.asioDevices || !this.asioDevices.length)) {
+          await this.populateAsioDevices();
+          if (!this.asioDevices.length) {
+            this.setToast('No ASIO drivers found on Windows — staying on WASAPI Exclusive');
+            return;
+          }
+        }
+        this.outputBackend = backend;
+        this._saveAudioPrefs();
+        this._syncAllDspUi();
+        restartWasapiIfActive();
+        this.updateStreamTelemetry();
+        this.setToast(
+          backend === 'asio'
+            ? `Output Backend: Isolated ASIO Host (${this.asioDriver || this.asioDevices?.[0]?.name || 'Auto'})`
+            : 'Output Backend: Windows WASAPI Exclusive'
+        );
+      });
+    });
+
+    document.getElementById('selectAsioDriver')?.addEventListener('change', (e) => {
+      this.asioDriver = String(e.target.value || '');
+      this._saveAudioPrefs();
+      this._syncAllDspUi();
+      if (this.outputBackend === 'asio') restartWasapiIfActive();
+      this.updateStreamTelemetry();
+      this.setToast(`ASIO Driver selected: ${this.asioDriver || 'Auto'}`);
+    });
+
+    document.getElementById('btnToggleAsioRawDsd')?.addEventListener('click', () => {
+      this.asioRawDsd = !this.asioRawDsd;
+      this._saveAudioPrefs();
+      this._syncAllDspUi();
+      if (this.outputBackend === 'asio') restartWasapiIfActive();
+      this.updateStreamTelemetry();
+      this.setToast(
+        this.asioRawDsd
+          ? 'ASIO Native Raw DSD512/1024 ENABLED (Direct ASIOSTDSDInt8 hardware path)'
+          : 'ASIO Native Raw DSD OFF (Uses DoP v1.1 or 64-bit DXD PCM)'
+      );
+    });
+
+    document.querySelectorAll('[data-rg-mode]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const mode = btn.dataset.rgMode;
+        if (!['off', 'track', 'album'].includes(mode)) return;
+        this.audioEngine.state.replayGainMode = mode;
+        this.audioEngine.state.lufs = mode !== 'off';
+        this.audioEngine.syncDspState();
+        this._saveProDspSettings();
+        this.audioEngine.setReplayGainLinear(this.getEffectiveReplayGain());
+        if (this.engineMode === 'wasapi' && this.isPlaying && window.vantaAPI) {
+          window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
+        }
+        this._syncAllDspUi();
+        this.updateStreamTelemetry();
+        this.setToast(mode === 'off' ? 'ReplayGain 2.0: OFF (Unity 0 dBFS)' : `ReplayGain 2.0 Mode: ${mode.toUpperCase()}`);
+      });
+    });
+
+    document.querySelectorAll('[data-rg-lufs]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const lufs = Number(btn.dataset.rgLufs) === -14 ? -14 : -18;
+        this.audioEngine.state.replayGainTargetLufs = lufs;
+        if (!this.audioEngine.state.lufs || this.audioEngine.state.replayGainMode === 'off') {
+          this.audioEngine.state.lufs = true;
+          if (this.audioEngine.state.replayGainMode === 'off') {
+            this.audioEngine.state.replayGainMode = 'track';
+          }
+        }
+        this.audioEngine.syncDspState();
+        this._saveProDspSettings();
+        this.audioEngine.setReplayGainLinear(this.getEffectiveReplayGain());
+        if (this.engineMode === 'wasapi' && this.isPlaying && window.vantaAPI) {
+          window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
+        }
+        this._syncAllDspUi();
+        this.updateStreamTelemetry();
+        this.setToast(`ReplayGain 2.0 Reference: ${lufs}.0 LUFS`);
+      });
+    });
+
+    document.getElementById('btnAnalyzeAlbumRg')?.addEventListener('click', () => {
+      void this.analyzeActiveAlbumReplayGain().catch(() => {});
+    });
+
+    document.querySelectorAll('[data-preroll-ms]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const ms = Number(btn.dataset.prerollMs) || 0;
+        this.clockSwitchPreRollMs = ms;
+        this._saveAudioPrefs();
+        this._syncAllDspUi();
+        this.updateStreamTelemetry();
+        this.setToast(`Clock-Switch Pre-Roll Silence: ${ms} ms`);
+      });
+    });
+
+    const bufSlider = document.getElementById('wasapiBufferMsSlider');
+    bufSlider?.addEventListener('input', (e) => {
+      const ms = Math.max(0, Math.min(200, Math.round(Number(e.target.value) || 0)));
+      this.wasapiBufferMs = ms;
+      const valEl = document.getElementById('wasapiBufferMsVal');
+      if (valEl) valEl.textContent = ms > 0 ? `${ms} ms` : 'Auto';
+    });
+    bufSlider?.addEventListener('change', () => {
+      this._saveAudioPrefs();
+      this._syncAllDspUi();
+      restartWasapiIfActive();
+      this.setToast(`WASAPI Buffer Override: ${this.wasapiBufferMs > 0 ? `${this.wasapiBufferMs} ms` : 'Auto'}`);
+    });
+
+    // Precision 64-bit AutoEQ / EqualizerAPO (.txt) Parametric EQ controls
+    document.getElementById('btnImportAutoEqTxt')?.addEventListener('click', async () => {
+      if (!window.vantaAPI?.importAutoEqTxt) return;
+      const res = await window.vantaAPI.importAutoEqTxt();
+      if (!res || res.canceled) return;
+      if (!res.ok || !res.text) {
+        this.setToast(`AutoEQ import failed: ${res.error || 'Could not read filter file'}`);
+        return;
+      }
+      const parsed = parseAutoEqTxt(res.text);
+      if (!parsed.bands.length) {
+        this.setToast(`No valid EqualizerAPO Filter lines found in ${res.fileName || 'selected file'}`);
+        return;
+      }
+      const cleanName = String(res.fileName || 'AutoEQ').replace(/\.txt$/i, '');
+      this.audioEngine.applyAutoEqProfile({
+        enabled: true,
+        name: cleanName,
+        preampDb: parsed.preampDb,
+        bands: parsed.bands
+      });
+      this._syncAllDspUi();
+      this._saveProDspSettings();
+      await this.ensurePlaybackEngineForCurrentDsp(false);
+      this.setToast(`Loaded AutoEQ "${cleanName}" (${parsed.bands.length} bands · Preamp ${parsed.preampDb.toFixed(1)} dB)`);
+    });
+
+    document.getElementById('btnTogglePeqActive')?.addEventListener('click', async () => {
+      const st = this.audioEngine.state;
+      if (!Array.isArray(st.peqBands) || st.peqBands.length === 0) return;
+      st.peqEnabled = !st.peqEnabled;
+      this.audioEngine._rebuildStudioPeqGraph();
+      this.audioEngine.syncDspState();
+      this._syncAllDspUi();
+      this._saveProDspSettings();
+      await this.ensurePlaybackEngineForCurrentDsp(false);
+      this.setToast(st.peqEnabled ? `AutoEQ "${st.peqName || 'PEQ'}" ENABLED` : 'AutoEQ PEQ Bypassed');
+    });
+
+    document.getElementById('btnClearAutoEq')?.addEventListener('click', async () => {
+      this.audioEngine.applyAutoEqProfile({ enabled: false, name: '', preampDb: 0, bands: [] });
+      this._syncAllDspUi();
+      this._saveProDspSettings();
+      await this.ensurePlaybackEngineForCurrentDsp(false);
+      this.setToast('AutoEQ Parametric EQ profile cleared');
+    });
+
+    // Precision 64-bit Partitioned FFT Convolution (Room & Headphone .wav IR) controls
+    document.getElementById('btnPickConvolverIr')?.addEventListener('click', async () => {
+      if (!window.vantaAPI?.pickConvolverIr) return;
+      const res = await window.vantaAPI.pickConvolverIr();
+      if (!res || res.canceled) return;
+      if (!res.ok || !res.filePath) {
+        this.setToast(`Impulse Response error: ${res.error || 'Unsupported WAV header'}`);
+        return;
+      }
+      const st = this.audioEngine.state;
+      st.convolverEnabled = true;
+      st.convolverPath = res.filePath;
+      st.convolverName = res.fileName || 'Impulse.wav';
+      st.convolverSampleRate = Number(res.sampleRate) || 0;
+      st.convolverChannels = Number(res.channels) || 2;
+      st.convolverFrames = Number(res.frames) || 0;
+      this.audioEngine._loadedConvolverPath = '';
+
+      if (this.engineMode === 'wasapi') {
+        await this.syncNativeConvolver(true);
+      } else {
+        await this._ensureStudioConvolverIrLoaded();
+      }
+      this.audioEngine.syncDspState();
+      this._syncAllDspUi();
+      this._saveProDspSettings();
+      this.updateStreamTelemetry();
+      this.setToast(`Loaded 64-bit Convolver IR "${st.convolverName}" (${st.convolverSampleRate} Hz · ${st.convolverChannels}ch)`);
+    });
+
+    document.getElementById('btnToggleConvolverActive')?.addEventListener('click', async () => {
+      const st = this.audioEngine.state;
+      if (!st.convolverPath) return;
+      st.convolverEnabled = !st.convolverEnabled;
+      if (this.engineMode === 'wasapi') {
+        await this.syncNativeConvolver(st.convolverEnabled);
+      } else if (st.convolverEnabled) {
+        await this._ensureStudioConvolverIrLoaded();
+      }
+      this.audioEngine.syncDspState();
+      this._syncAllDspUi();
+      this._saveProDspSettings();
+      this.updateStreamTelemetry();
+      this.setToast(st.convolverEnabled ? '64-Bit FFT Convolver ENABLED' : '64-Bit FFT Convolver Bypassed');
+    });
+
+    document.getElementById('btnClearConvolverIr')?.addEventListener('click', async () => {
+      const st = this.audioEngine.state;
+      st.convolverEnabled = false;
+      st.convolverPath = '';
+      st.convolverName = '';
+      st.convolverSampleRate = 0;
+      st.convolverChannels = 0;
+      st.convolverFrames = 0;
+      this.audioEngine._loadedConvolverPath = '';
+      if (this.audioEngine.irConvolverNode) this.audioEngine.irConvolverNode.buffer = null;
+      if (this.engineMode === 'wasapi') {
+        await this.syncNativeConvolver(false);
+      }
+      this.audioEngine.syncDspState();
+      this._syncAllDspUi();
+      this._saveProDspSettings();
+      this.updateStreamTelemetry();
+      this.setToast('Convolution Impulse Response unloaded');
+    });
+
+    const wetSlider = document.getElementById('convolverWetSlider');
+    wetSlider?.addEventListener('input', (e) => {
+      const wet = Math.max(0, Math.min(100, Math.round(Number(e.target.value) || 0)));
+      this.audioEngine.state.convolverWetPct = wet;
+      const wetVal = document.getElementById('convolverWetVal');
+      if (wetVal) wetVal.textContent = `${wet}%`;
+      this.audioEngine.syncDspState();
+    });
+    wetSlider?.addEventListener('change', () => {
+      const wet = Math.max(0, Math.min(100, Math.round(Number(this.audioEngine.state.convolverWetPct ?? 100) || 0)));
+      this._saveProDspSettings();
+      if (this.engineMode === 'wasapi' && this.audioEngine.state.convolverEnabled && window.vantaAPI) {
+        window.vantaAPI.wasapiCmd(`CONVOLVER_WET ${wet}`).catch(() => {});
+      }
+      this.updateStreamTelemetry();
+      this.setToast(`Convolver Wet Mix: ${wet}%`);
     });
 
     this._syncAllDspUi();
+  }
+
+  /**
+   * Wires and drives the Double-Blind ABX Comparator modal (with loudness matching & binomial p-value verdict).
+   */
+  _bindAbxModal() {
+    const modal = document.getElementById('abxModal');
+    const openBtn = document.getElementById('btnOpenAbxModal');
+    const closeBtn = document.getElementById('btnCloseAbxModal');
+    const loudnessBtn = document.getElementById('btnAbxLoudnessMatch');
+    const modeBtns = document.querySelectorAll('[data-abx-mode]');
+    const trialsSel = document.getElementById('abxTrialsSelect');
+    const trackBWrap = document.getElementById('abxTrackBWrap');
+    const trackBSel = document.getElementById('abxTrackBSelect');
+    const startBtn = document.getElementById('btnStartAbxSession');
+    const revealBtn = document.getElementById('btnRevealAbxEarly');
+    const progressBadge = document.getElementById('abxProgressBadge');
+    const activeNote = document.getElementById('abxActiveNote');
+    const playABtn = document.getElementById('btnAbxPlayA');
+    const playBBtn = document.getElementById('btnAbxPlayB');
+    const playXBtn = document.getElementById('btnAbxPlayX');
+    const voteABtn = document.getElementById('btnAbxVoteA');
+    const voteBBtn = document.getElementById('btnAbxVoteB');
+    const resultsBox = document.getElementById('abxResultsBox');
+    const scoreBadge = document.getElementById('abxScoreBadge');
+    const pValBadge = document.getElementById('abxPValueBadge');
+    const verdictEl = document.getElementById('abxVerdictSummary');
+    const logList = document.getElementById('abxTrialLogList');
+    if (!modal || !openBtn) return;
+
+    let selectedMode = 'chain';
+    let loudnessMatch = true;
+
+    const populateTrackBOptions = () => {
+      if (!trackBSel) return;
+      const pool = (this.displayedTracks || []).filter((t) => t && !t.isVideo);
+      trackBSel.replaceChildren();
+      pool.forEach((tr) => {
+        const idx = this.displayedTracks.indexOf(tr);
+        const opt = document.createElement('option');
+        opt.value = String(idx);
+        opt.textContent = `${tr.artist ? `${tr.artist} — ` : ''}${tr.title || 'Untitled'}`;
+        trackBSel.appendChild(opt);
+      });
+      const fallbackIdx = pool.length > 1
+        ? this.displayedTracks.indexOf(pool.find((t) => this.displayedTracks.indexOf(t) !== this.activeTrackIndex) || pool[0])
+        : this.activeTrackIndex;
+      if (fallbackIdx >= 0) trackBSel.value = String(fallbackIdx);
+    };
+
+    const setAuditionActiveBtn = (slot) => {
+      playABtn?.classList.toggle('active', slot === 'A');
+      playBBtn?.classList.toggle('active', slot === 'B');
+      playXBtn?.classList.toggle('active', slot === 'X');
+    };
+
+    const restorePreAbxState = async () => {
+      const sess = this.abxSession;
+      if (!sess) return;
+      if (sess.mode === 'chain' && sess.snapshotDsp) {
+        this.audioEngine.importPersistState(sess.snapshotDsp);
+        this.audioEngine.setReplayGainLinear(this.getEffectiveReplayGain());
+        this.syncNativeWasapiDsp();
+        if (this.engineMode === 'wasapi') {
+          await this.syncNativeConvolver();
+          if (this.isPlaying && window.vantaAPI) {
+            window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
+          }
+        }
+        this._syncAllDspUi();
+        this.updateStreamTelemetry();
+      }
+      this.abxSession = null;
+    };
+
+    const syncAbxModalControls = () => {
+      const sess = this.abxSession;
+      const running = Boolean(sess && sess.active && !sess.completed);
+      modeBtns.forEach((btn) => btn.classList.toggle('on', btn.dataset.abxMode === selectedMode));
+      if (loudnessBtn) loudnessBtn.classList.toggle('on', loudnessMatch);
+      if (trackBWrap) trackBWrap.classList.toggle('hidden', selectedMode !== 'tracks');
+
+      if (playABtn) playABtn.disabled = !running;
+      if (playBBtn) playBBtn.disabled = !running;
+      if (playXBtn) playXBtn.disabled = !running;
+
+      const trialIdx = sess ? sess.results.length : 0;
+      const canVote = running && trialIdx < sess.trials.length;
+      if (voteABtn) voteABtn.disabled = !canVote;
+      if (voteBBtn) voteBBtn.disabled = !canVote;
+      if (revealBtn) revealBtn.classList.toggle('hidden', !(running && sess.results.length > 0));
+      if (startBtn) startBtn.textContent = running ? 'Restart Blind Test' : 'Start Blind Test';
+    };
+
+    const renderAbxResults = (sess) => {
+      if (!resultsBox || !sess) return;
+      const correct = sess.results.filter((r) => r.correct).length;
+      const total = sess.results.length;
+      const verdict = evaluateAbxVerdict({
+        correct,
+        total,
+        labelA: sess.labelA,
+        labelB: sess.labelB
+      });
+      resultsBox.classList.remove('hidden');
+      if (scoreBadge) scoreBadge.textContent = `Score: ${verdict.correct} / ${verdict.total} (${verdict.accuracyPct}%)`;
+      if (pValBadge) {
+        pValBadge.textContent = `p = ${verdict.pValue.toFixed(4)}`;
+        pValBadge.classList.toggle('warn', !verdict.significant);
+      }
+      if (verdictEl) {
+        verdictEl.textContent = verdict.summary;
+        verdictEl.classList.toggle('sig', verdict.significant);
+      }
+      if (logList) {
+        const items = sess.results.map((r) => {
+          const pill = document.createElement('div');
+          pill.className = `abx-log-pill ${r.correct ? 'ok' : 'miss'}`;
+          pill.textContent = `#${r.trial}: X=${r.actual} · Pick=${r.guess} ${r.correct ? '✓' : '✗'}`;
+          return pill;
+        });
+        logList.replaceChildren(...items);
+      }
+    };
+
+    const finishAbxSession = async () => {
+      const sess = this.abxSession;
+      if (!sess) return;
+      sess.active = false;
+      sess.completed = true;
+      setAuditionActiveBtn('');
+      if (progressBadge) {
+        progressBadge.textContent = `Completed (${sess.results.length}/${sess.trials.length} trials)`;
+      }
+      if (activeNote) {
+        activeNote.textContent = `Blind session finished (${sess.labelA} vs ${sess.labelB}). Original DSP chain restored.`;
+      }
+      renderAbxResults(sess);
+      if (sess.mode === 'chain' && sess.snapshotDsp) {
+        this.audioEngine.importPersistState(sess.snapshotDsp);
+        this.audioEngine.setReplayGainLinear(this.getEffectiveReplayGain());
+        this.syncNativeWasapiDsp();
+        if (this.engineMode === 'wasapi') {
+          await this.syncNativeConvolver();
+        }
+        this._syncAllDspUi();
+        this.updateStreamTelemetry();
+      }
+      syncAbxModalControls();
+    };
+
+    const auditionChoice = async (slot) => {
+      const sess = this.abxSession;
+      if (!sess || !sess.active) return;
+      const targetChar = slot === 'X' ? sess.trials[sess.results.length] : slot;
+      sess.activeAuditionSlot = slot;
+      setAuditionActiveBtn(slot);
+
+      if (sess.mode === 'chain') {
+        if (targetChar === 'A') {
+          this.audioEngine.importPersistState(sess.snapshotDsp);
+        } else {
+          this.audioEngine.resetBitPerfect();
+        }
+        if (sess.loudnessMatch) {
+          this.audioEngine.state.lufs = true;
+          this.audioEngine.state.replayGainMode = 'track';
+          this.audioEngine.state.replayGainTargetLufs = -18;
+        } else if (targetChar === 'B') {
+          this.audioEngine.state.lufs = false;
+        }
+        this.audioEngine.syncDspState();
+        this.audioEngine.setReplayGainLinear(this.getEffectiveReplayGain());
+        if (this.engineMode === 'wasapi' && window.vantaAPI) {
+          this.syncNativeWasapiDsp();
+          await this.syncNativeConvolver(targetChar === 'A' && Boolean(sess.snapshotDsp?.convolverEnabled));
+          if (this.isPlaying) {
+            window.vantaAPI.wasapiCmd(`GAIN ${this.getEffectiveWasapiGain().toFixed(4)}`).catch(() => {});
+          }
+        }
+        if (!this.isPlaying && this.displayedTracks.length > 0) {
+          await this.startPlayback(0);
+        }
+        this.updateStreamTelemetry();
+      } else {
+        const targetIndex = targetChar === 'A' ? sess.trackAIndex : sess.trackBIndex;
+        const curPos = this.engineMode === 'wasapi'
+          ? Math.max(0, Number(this.wasapiCurrentPositionSec) || 0)
+          : Math.max(0, Number(this.audioEl?.currentTime) || 0);
+        if (sess.loudnessMatch) {
+          this.audioEngine.state.lufs = true;
+          this.audioEngine.state.replayGainMode = 'track';
+          this.audioEngine.state.replayGainTargetLufs = -18;
+        }
+        if (this.activeTrackIndex !== targetIndex || !this.isPlaying) {
+          this.loadTrack(targetIndex, false);
+          await this.startPlayback(curPos);
+        }
+      }
+
+      if (activeNote) {
+        activeNote.textContent = slot === 'X'
+          ? `Now auditioning hidden X (Trial ${sess.results.length + 1} of ${sess.trials.length}) — click "X is A" or "X is B"`
+          : `Now auditioning reference ${slot} (${slot === 'A' ? sess.labelA : sess.labelB})`;
+      }
+    };
+
+    const recordVote = async (votedChar) => {
+      const sess = this.abxSession;
+      if (!sess || !sess.active) return;
+      const idx = sess.results.length;
+      if (idx >= sess.trials.length) return;
+      const actual = sess.trials[idx];
+      sess.results.push({
+        trial: idx + 1,
+        actual,
+        guess: votedChar,
+        correct: actual === votedChar
+      });
+      if (sess.results.length >= sess.trials.length) {
+        await finishAbxSession();
+      } else {
+        if (progressBadge) {
+          progressBadge.textContent = `Trial ${sess.results.length + 1} / ${sess.trials.length}`;
+        }
+        renderAbxResults(sess);
+        await auditionChoice('X');
+        syncAbxModalControls();
+      }
+    };
+
+    const closeModal = () => {
+      modal.classList.add('hidden');
+      if (this.abxSession?.active) {
+        void restorePreAbxState().catch(() => {});
+      }
+    };
+
+    openBtn.addEventListener('click', () => {
+      populateTrackBOptions();
+      resultsBox?.classList.toggle('hidden', !this.abxSession?.results?.length);
+      syncAbxModalControls();
+      modal.classList.remove('hidden');
+    });
+    closeBtn?.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) closeModal();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal();
+    });
+
+    loudnessBtn?.addEventListener('click', () => {
+      loudnessMatch = !loudnessMatch;
+      syncAbxModalControls();
+    });
+    modeBtns.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        selectedMode = btn.dataset.abxMode === 'tracks' ? 'tracks' : 'chain';
+        if (selectedMode === 'tracks') populateTrackBOptions();
+        syncAbxModalControls();
+      });
+    });
+
+    startBtn?.addEventListener('click', async () => {
+      if (this.abxSession?.active) {
+        await restorePreAbxState();
+      }
+      if (!this.displayedTracks.length) {
+        this.setToast('Load at least one track before starting an ABX blind test');
+        return;
+      }
+      if (selectedMode === 'tracks') {
+        const trackAIdx = Math.max(0, this.activeTrackIndex);
+        const trackBIdx = Math.max(0, Number(trackBSel?.value ?? trackAIdx) || 0);
+        if (trackAIdx === trackBIdx) {
+          this.setToast('Select a different Track B in the dropdown to compare two tracks');
+          return;
+        }
+      }
+      const totalTrials = Math.max(8, Math.min(16, Number(trialsSel?.value) || 12));
+      const trackAIdx = Math.max(0, this.activeTrackIndex);
+      const trackBIdx = Math.max(0, Number(trackBSel?.value ?? trackAIdx) || 0);
+      const trackA = this.displayedTracks[trackAIdx];
+      const trackB = this.displayedTracks[trackBIdx];
+      this.abxSession = {
+        active: true,
+        completed: false,
+        mode: selectedMode,
+        loudnessMatch,
+        trials: generateAbxTrialSequence(totalTrials),
+        results: [],
+        snapshotDsp: this.audioEngine.exportPersistState(),
+        trackAIndex: trackAIdx,
+        trackBIndex: trackBIdx,
+        labelA: selectedMode === 'chain' ? 'Active DSP Chain' : (trackA?.title || 'Track A'),
+        labelB: selectedMode === 'chain' ? 'Bit-Exact Flat' : (trackB?.title || 'Track B')
+      };
+      resultsBox?.classList.add('hidden');
+      if (logList) logList.replaceChildren();
+      if (progressBadge) progressBadge.textContent = `Trial 1 / ${totalTrials}`;
+      syncAbxModalControls();
+      await auditionChoice('A');
+    });
+
+    revealBtn?.addEventListener('click', () => { void finishAbxSession().catch(() => {}); });
+    playABtn?.addEventListener('click', () => { void auditionChoice('A').catch(() => {}); });
+    playBBtn?.addEventListener('click', () => { void auditionChoice('B').catch(() => {}); });
+    playXBtn?.addEventListener('click', () => { void auditionChoice('X').catch(() => {}); });
+    voteABtn?.addEventListener('click', () => { void recordVote('A').catch(() => {}); });
+    voteBBtn?.addEventListener('click', () => { void recordVote('B').catch(() => {}); });
   }
 
   /**

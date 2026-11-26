@@ -22,25 +22,42 @@ const logger = require('./services/loggerService.cjs');
 const {
   SUBTITLE_EXTENSIONS,
   IMAGE_EXTENSIONS,
+  SACD_ISO_EXTENSIONS,
+  PEQ_TXT_EXTENSIONS,
+  CONVOLVER_IR_EXTENSIONS,
   hasSafePathSyntax,
   canonicalizePath,
   resolveSafeVaultSubfolder,
-  resolveFromTrustedRoots
+  validateSafeFilePath,
+  resolveFromTrustedRoots,
+  validateSafeSacdIsoPath
 } = require('./services/pathSecurityService.cjs');
 const {
   resolveFfmpegBinary,
+  resolveWasapiEngineBinary,
   probeAudioStreamInfo,
   probeMediaStreams,
   decideVideoPlaybackStrategy,
   convertSrtToVtt,
   writeFfmpegMetadataOnDisk,
   measureEbuR128Loudness,
+  readReplayGainTagsForFile,
+  analyzeAlbumReplayGain,
+  inspectWavPackDsdHeader,
   listWasapiDevices,
+  listAsioDevices,
+  listSacdIsoTracks,
+  buildSacdCatalogTracks,
+  clearDeviceCapsCache,
+  probeWasapiDeviceCaps,
   needsLosslessPcmTranscode,
+  sanitizePeqWireSpec,
+  inspectWavHeader,
+  prepareConvolutionIrFile,
   NativeWasapiPlayer,
   WindowsVolumeBridge
 } = require('./services/audioBridgeService.cjs');
-const { updateMp3MetadataOnDisk } = require('./services/id3Service.cjs');
+const { updateMp3MetadataOnDisk, updateFlacVorbisTagsOnDisk } = require('./services/id3Service.cjs');
 const {
   parseYouTubeInputs,
   resolveYouTubeMetadata,
@@ -85,6 +102,9 @@ const watchedFiles = new Set(
     }
   })
 );
+if (libraryStore.convolverIrPath && inspectWavHeader(libraryStore.convolverIrPath).ok) {
+  registerAuthorizedMediaFile(libraryStore.convolverIrPath);
+}
 
 /**
  * Merges persisted user annotations (stars, tags, groups, custom BPM/Key/Energy) onto scanned tracks.
@@ -149,6 +169,7 @@ const volumeBridge = new WindowsVolumeBridge(
     }
   },
   () => {
+    clearDeviceCapsCache();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('vanta:audio-devices-changed');
     }
@@ -881,7 +902,11 @@ function registerIpcHandlers() {
           const res = updateMp3MetadataOnDisk(safeTarget, tagPatch);
           fileUpdated = Boolean(res?.ok);
           if (!res?.ok) fileWriteWarning = res?.error || 'Could not write ID3v2 tags to MP3';
-        } else if (['.flac', '.m4a', '.wav', '.aiff', '.aif', '.ogg', '.opus'].includes(ext)) {
+        } else if (ext === '.flac') {
+          const res = updateFlacVorbisTagsOnDisk(safeTarget, tagPatch);
+          fileUpdated = Boolean(res?.ok);
+          if (!res?.ok) fileWriteWarning = res?.error || 'Could not write Vorbis comments to FLAC';
+        } else if (['.m4a', '.wav', '.aiff', '.aif', '.ogg', '.opus', '.wv'].includes(ext)) {
           const res = await writeFfmpegMetadataOnDisk(safeTarget, tagPatch);
           fileUpdated = Boolean(res?.ok);
           if (!res?.ok) fileWriteWarning = res?.error || 'Could not write metadata tags to file';
@@ -1075,6 +1100,100 @@ function registerIpcHandlers() {
     return listWasapiDevices();
   });
 
+  registerSecureIpcHandler('vanta:list-asio-devices', async () => {
+    return listAsioDevices();
+  });
+
+  registerSecureIpcHandler('vanta:list-sacd-iso', async (_event, rawIsoPath) => {
+    const safeIso = resolveAuthorizedFile(rawIsoPath, SACD_ISO_EXTENSIONS);
+    if (!safeIso || !validateSafeSacdIsoPath(safeIso)) {
+      return { ok: false, error: 'Rejected non-SACD or unauthorized ISO path', areas: [] };
+    }
+    return listSacdIsoTracks(safeIso);
+  });
+
+  registerSecureIpcHandler('vanta:import-sacd-iso', async (_event, rawIsoPath = '') => {
+    let targetIso = '';
+    if (typeof rawIsoPath === 'string' && rawIsoPath.trim()) {
+      const fromRoots = resolveFromTrustedRoots(rawIsoPath.trim(), getTrustedExplorerRoots(), {
+        expect: 'file',
+        allowedExtensions: SACD_ISO_EXTENSIONS,
+        blockedSegments: BLOCKED_INGEST_DIR_NAMES
+      });
+      targetIso = validateSafeSacdIsoPath(fromRoots || '');
+    } else if (mainWindow) {
+      const res = await dialog.showOpenDialog(mainWindow, {
+        title: 'Import ScarletBook SACD Disc Image (.iso)',
+        filters: [{ name: 'SACD Disc Images', extensions: ['iso'] }],
+        properties: ['openFile']
+      });
+      if (res.canceled || !res.filePaths.length) {
+        return { canceled: true, tracks: [] };
+      }
+      targetIso = validateSafeSacdIsoPath(res.filePaths[0]) || '';
+    }
+    if (!targetIso) {
+      return { canceled: false, ok: false, error: 'Selected ISO is not a valid ScarletBook SACD disc image', tracks: [] };
+    }
+    const sacdInfo = await listSacdIsoTracks(targetIso);
+    if (!sacdInfo?.ok) {
+      return { canceled: false, ok: false, error: sacdInfo?.error || 'Could not parse SACD TOC', tracks: [] };
+    }
+    registerAuthorizedMediaFile(targetIso);
+    const tracks = buildSacdCatalogTracks(targetIso, sacdInfo);
+    return { canceled: false, ok: true, isoPath: targetIso, info: sacdInfo, tracks };
+  });
+
+  registerSecureIpcHandler('vanta:analyze-album-replaygain', async (_event, payload = {}) => {
+    const rawEntries = Array.isArray(payload?.tracks) ? payload.tracks : [];
+    const targetLufs = Number(payload?.targetLufs) === -14 ? -14.0 : -18.0;
+    const writeTags = Boolean(payload?.writeTags);
+    const validEntries = [];
+    for (const item of rawEntries) {
+      const rawPath = typeof item === 'string' ? item : item?.filePath;
+      const safePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
+      if (safePath) {
+        validEntries.push({ filePath: safePath, durationSec: Number(item?.durationSec) || 180 });
+      }
+    }
+    if (!validEntries.length) {
+      return { ok: false, error: 'No authorized audio tracks to analyze', tracks: [] };
+    }
+    const res = await analyzeAlbumReplayGain(validEntries, { targetLufs, writeTags });
+    libraryStore.loudnessCache = libraryStore.loudnessCache || {};
+    for (const tr of res.tracks || []) {
+      const audioHash = computeAudioPayloadFingerprint(tr.filePath);
+      const storeKey = audioHash ? `hash:${audioHash}` : tr.filePath;
+      const existing = libraryStore.loudnessCache[storeKey] || {};
+      libraryStore.loudnessCache[storeKey] = {
+        ...existing,
+        r128: {
+          integratedLufs: tr.integratedLufs,
+          truePeakDbfs: tr.truePeakDbfs,
+          targetLufs,
+          replayGainDb: tr.trackGainDb,
+          linearGain: Number(Math.pow(10, tr.trackGainDb / 20).toFixed(4)),
+          albumLufs: tr.albumLufs,
+          albumTruePeakDbfs: tr.albumTruePeakDbfs
+        },
+        tags: {
+          replayGainTrackGainDb: tr.trackGainDb,
+          replayGainTrackPeak: tr.trackPeakLinear,
+          replayGainAlbumGainDb: tr.albumGainDb,
+          replayGainAlbumPeak: tr.albumPeakLinear
+        }
+      };
+    }
+    saveLibraryStore(libraryStore, STORE_PATH);
+    return res;
+  });
+
+  registerSecureIpcHandler('vanta:probe-audio-caps', async (_event, payload = {}) => {
+    const deviceId = typeof payload === 'string' ? payload : String(payload?.deviceId || '');
+    const channels = Math.max(1, Math.min(8, Math.round(Number(payload?.channels) || 2)));
+    return probeWasapiDeviceCaps(deviceId, channels);
+  });
+
   registerSecureIpcHandler('vanta:probe-tech', async (_event, payload = {}) => {
     const rawPath = typeof payload === 'string' ? payload : payload?.filePath;
     const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
@@ -1103,12 +1222,13 @@ function registerIpcHandlers() {
     const audioHash = computeAudioPayloadFingerprint(filePath);
     const cache = libraryStore.loudnessCache || {};
     const { entry: cached } = resolveHashStoreEntry(cache, { audioHash, filePath });
+    const tags = cached?.tags || (await readReplayGainTagsForFile(filePath));
     if (cached && cached.probe && cached.r128) {
-      return cached;
+      return { ...cached, tags };
     }
     const probe = cached?.probe || (await probeAudioStreamInfo(filePath));
-    const r128 = await measureEbuR128Loudness(filePath, -14.0);
-    const info = { probe, r128 };
+    const r128 = await measureEbuR128Loudness(filePath, -18.0);
+    const info = { probe, r128, tags };
     const storeKey = audioHash ? `hash:${audioHash}` : filePath;
     libraryStore.loudnessCache = libraryStore.loudnessCache || {};
     libraryStore.loudnessCache[storeKey] = info;
@@ -1122,36 +1242,87 @@ function registerIpcHandlers() {
       exclusive = true,
       dop = false,
       deviceId = '',
+      backend = 'wasapi',
+      asioDriver = '',
+      asioRawDsd = false,
+      sacdArea = 0,
+      sacdTrack = 0,
       linearGain = 1.0,
       seekSec = 0,
-      dspSpec = ''
+      dspSpec = '',
+      peqSpec = '',
+      convolverIrPath = '',
+      convolverWetPct = 100,
+      pushMode = false,
+      bufferMs = 0,
+      preRollMs = 0,
+      fixedRateLock = false,
+      fixedTargetRate = 0
     } = payload;
-    const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
+    const isSacdIso = Number(sacdTrack) >= 1 && path.extname(String(rawPath || '')).toLowerCase() === '.iso';
+    const filePath = isSacdIso
+      ? (validateSafeSacdIsoPath(resolveAuthorizedFile(rawPath, SACD_ISO_EXTENSIONS) || '') || null)
+      : resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
     if (!filePath) {
       return { ok: false, error: 'Audio file not found or rejected by path policy' };
     }
+    const safeIrPath = convolverIrPath ? (resolveAuthorizedFile(convolverIrPath, CONVOLVER_IR_EXTENSIONS) || '') : '';
     try {
       const cache = libraryStore.loudnessCache || {};
       const cached = cache[filePath];
-      const probe = cached?.probe || (await probeAudioStreamInfo(filePath));
+      const probe = isSacdIso ? null : (cached?.probe || (await probeAudioStreamInfo(filePath)));
       await wasapiPlayer.play(filePath, {
         exclusive,
         dop: Boolean(dop),
         deviceId,
+        backend: backend === 'asio' ? 'asio' : 'wasapi',
+        asioDriver: String(asioDriver || ''),
+        asioRawDsd: Boolean(asioRawDsd),
+        sacdArea: Number(sacdArea) || 0,
+        sacdTrack: Number(sacdTrack) || 0,
         linearGain,
         seekSec,
         dspSpec,
+        peqSpec,
+        convolverIrPath: safeIrPath,
+        convolverWetPct: Number(convolverWetPct) || 0,
+        pushMode: Boolean(pushMode),
+        bufferMs,
+        preRollMs,
+        fixedRateLock: Boolean(fixedRateLock),
+        fixedTargetRate,
         probe
       });
-      return { ok: true, probe };
+      return {
+        ok: true,
+        probe: probe || wasapiPlayer.currentProbe || null,
+        caps: wasapiPlayer.activeCaps || null,
+        ratePlan: wasapiPlayer.activeRatePlan || null
+      };
     } catch (err) {
-      logger.error('WasapiEngine', 'Failed starting native WASAPI playback', { error: err.message });
+      logger.error('WasapiEngine', 'Failed starting native WASAPI/ASIO playback', { error: err.message });
       return { ok: false, error: err.message };
     }
   });
 
   registerSecureIpcHandler('vanta:wasapi-queue-next', async (_event, payload = {}) => {
-    const { filePath: rawPath, dop = false, linearGain = 1.0, seq = 0 } = payload;
+    const {
+      filePath: rawPath,
+      dop = false,
+      linearGain = 1.0,
+      seq = 0,
+      deviceId = '',
+      sacdTrack = 0,
+      exclusive = true,
+      pushMode = false,
+      bufferMs = 0,
+      preRollMs = 0,
+      fixedRateLock = false,
+      fixedTargetRate = 0
+    } = payload;
+    if (Number(sacdTrack) >= 1) {
+      return { ok: false, queued: false, reason: 'sacd_reopen' };
+    }
     const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_EXTENSIONS);
     if (!filePath) {
       return { ok: false, queued: false, error: 'Audio file not found or rejected by path policy' };
@@ -1164,6 +1335,13 @@ function registerIpcHandlers() {
         dop: Boolean(dop),
         linearGain,
         seq,
+        deviceId,
+        exclusive,
+        pushMode: Boolean(pushMode),
+        bufferMs,
+        preRollMs,
+        fixedRateLock: Boolean(fixedRateLock),
+        fixedTargetRate,
         probe
       });
       return { ...res, r128: cached?.r128 || null };
@@ -1173,16 +1351,128 @@ function registerIpcHandlers() {
   });
 
   registerSecureIpcHandler('vanta:wasapi-cmd', async (_event, cmd) => {
-    const cleanCmd = typeof cmd === 'string' ? cmd.trim().slice(0, 220) : '';
+    const cleanCmd = typeof cmd === 'string' ? cmd.trim().slice(0, 4096) : '';
     if (cleanCmd === 'STOP') {
-      await wasapiPlayer.stopAsync();
+      const stopTelemetry = await wasapiPlayer.stopAsync();
+      return { ok: true, ...(stopTelemetry || {}) };
     } else if (cleanCmd === 'CLEAR_QUEUE') {
       wasapiPlayer.clearQueuedNext();
       wasapiPlayer.sendCommand('CLEAR_QUEUE');
+    } else if (cleanCmd === 'PEQ_OFF' || cleanCmd === 'CONVOLVER_OFF') {
+      wasapiPlayer.sendCommand(cleanCmd);
+    } else if (cleanCmd.startsWith('PEQ_SPEC ')) {
+      const safePeq = sanitizePeqWireSpec(cleanCmd.slice(9));
+      if (safePeq) wasapiPlayer.sendCommand(`PEQ_SPEC ${safePeq}`);
+      else wasapiPlayer.sendCommand('PEQ_OFF');
+    } else if (/^CONVOLVER_WET [0-9]+(?:\.[0-9]+)?$/.test(cleanCmd)) {
+      wasapiPlayer.sendCommand(cleanCmd);
     } else if (/^(?:PAUSE|RESUME|LIMITER (?:ON|OFF)|GAIN [0-9.]+|DSP [0-9.,\-+|]+)$/.test(cleanCmd)) {
       wasapiPlayer.sendCommand(cleanCmd);
     }
     return { ok: true };
+  });
+
+  registerSecureIpcHandler('vanta:import-autoeq-txt', async (_event, rawTxtPath = '') => {
+    let targetPath = '';
+    if (typeof rawTxtPath === 'string' && rawTxtPath.trim()) {
+      targetPath = resolveFromTrustedRoots(rawTxtPath.trim(), getTrustedExplorerRoots(), {
+        expect: 'file',
+        allowedExtensions: PEQ_TXT_EXTENSIONS,
+        blockedSegments: BLOCKED_INGEST_DIR_NAMES
+      }) || '';
+    } else if (mainWindow) {
+      const res = await dialog.showOpenDialog(mainWindow, {
+        title: 'Import AutoEQ / EqualizerAPO Filter (.txt)',
+        filters: [{ name: 'AutoEQ / EqualizerAPO Profile', extensions: ['txt'] }],
+        properties: ['openFile']
+      });
+      if (res.canceled || !res.filePaths.length) {
+        return { canceled: true, ok: false };
+      }
+      targetPath = validateSafeFilePath(res.filePaths[0], { allowedExtensions: PEQ_TXT_EXTENSIONS }) || '';
+    }
+    if (!targetPath) {
+      return { canceled: false, ok: false, error: 'Rejected or inaccessible AutoEQ .txt file' };
+    }
+    try {
+      const st = fs.statSync(targetPath);
+      if (!st.isFile() || st.size <= 0 || st.size > 262144) {
+        return { canceled: false, ok: false, error: 'AutoEQ .txt file must be between 1 B and 256 KB' };
+      }
+      const text = fs.readFileSync(targetPath, 'utf8');
+      return {
+        canceled: false,
+        ok: true,
+        filePath: targetPath,
+        fileName: path.basename(targetPath),
+        text
+      };
+    } catch (err) {
+      return { canceled: false, ok: false, error: err.message };
+    }
+  });
+
+  registerSecureIpcHandler('vanta:pick-convolver-ir', async () => {
+    if (!mainWindow) return { canceled: true, ok: false };
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Load Room / Headphone Impulse Response (.wav)',
+      filters: [{ name: 'Impulse Response WAV', extensions: ['wav'] }],
+      properties: ['openFile']
+    });
+    if (res.canceled || !res.filePaths.length) {
+      return { canceled: true, ok: false };
+    }
+    const info = inspectWavHeader(res.filePaths[0]);
+    if (!info.ok || !info.filePath) {
+      return { canceled: false, ok: false, error: info.error || 'Unsupported IR WAV format' };
+    }
+    registerAuthorizedMediaFile(info.filePath);
+    libraryStore.convolverIrPath = info.filePath;
+    saveLibraryStore(libraryStore, STORE_PATH);
+    return {
+      canceled: false,
+      ok: true,
+      filePath: info.filePath,
+      fileName: path.basename(info.filePath),
+      sampleRate: info.sampleRate,
+      channels: info.channels,
+      bitsPerSample: info.bitsPerSample,
+      frames: info.frames,
+      durationSec: info.durationSec
+    };
+  });
+
+  registerSecureIpcHandler('vanta:load-convolver-ir', async (_event, payload = {}) => {
+    const enabled = payload?.enabled !== false;
+    const rawPath = typeof payload?.filePath === 'string' ? payload.filePath : '';
+    const wetPct = Number.isFinite(Number(payload?.wetPct))
+      ? Math.max(0, Math.min(100, Number(payload.wetPct)))
+      : 100;
+    if (!enabled || !rawPath.trim()) {
+      wasapiPlayer.sendCommand('CONVOLVER_OFF');
+      return { ok: true, active: false };
+    }
+    const safeIr = resolveAuthorizedFile(rawPath, CONVOLVER_IR_EXTENSIONS);
+    if (!safeIr) {
+      return { ok: false, active: false, error: 'IR file not found or rejected by path policy' };
+    }
+    const activeRate = wasapiPlayer.activeSampleRate || 48000;
+    const prep = await prepareConvolutionIrFile(safeIr, activeRate);
+    if (!prep.ok || !prep.preparedPath) {
+      return { ok: false, active: false, error: prep.error || 'IR preparation failed' };
+    }
+    if (wasapiPlayer.engineProc && wasapiPlayer.engineProc.exitCode === null && !wasapiPlayer.engineProc.killed) {
+      wasapiPlayer.sendCommand(`CONVOLVER_LOAD ${wetPct}|${prep.preparedPath}`);
+    }
+    return {
+      ok: true,
+      active: true,
+      filePath: safeIr,
+      fileName: path.basename(safeIr),
+      preparedPath: prep.preparedPath,
+      resampled: Boolean(prep.resampled),
+      ...(prep.info || {})
+    };
   });
 
   registerSecureIpcHandler('vanta:get-system-volume', () => {
@@ -1374,16 +1664,52 @@ app.whenReady().then(() => {
       const parsedUrl = new URL(request.url);
       const rawPath = parsedUrl.searchParams.get('path') || decodeURIComponent(parsedUrl.pathname.replace(/^\//, ''));
       const seekSec = Math.max(0, Number(parsedUrl.searchParams.get('ss')) || 0);
-      const filePath = resolveAuthorizedFile(rawPath, ALL_MEDIA_AND_IMAGE_EXTENSIONS);
+      const sacdTrack = Math.max(0, Number.parseInt(parsedUrl.searchParams.get('sacdTrack') || '0', 10) || 0);
+      const sacdArea = Math.max(0, Math.min(1, Number.parseInt(parsedUrl.searchParams.get('sacdArea') || '0', 10) || 0));
+      const isSacdIsoReq = sacdTrack >= 1 && path.extname(String(rawPath || '')).toLowerCase() === '.iso';
+      const filePath = isSacdIsoReq
+        ? (validateSafeSacdIsoPath(resolveAuthorizedFile(rawPath, SACD_ISO_EXTENSIONS) || '') || null)
+        : resolveAuthorizedFile(rawPath, ALL_MEDIA_AND_IMAGE_EXTENSIONS);
       if (!filePath) {
         logger.warn('MediaProtocol', `Requested media file not found or rejected: ${rawPath}`);
         return new Response('File not found', { status: 404 });
       }
-      // Transparently handle 4K Video remux/transcode OR audiophile lossless PCM decoding
+      // Transparently handle 4K Video remux/transcode OR audiophile lossless PCM/DSD/SACD decoding
       const ext = path.extname(filePath).toLowerCase();
       const mediaMode = parsedUrl.searchParams.get('mode') || '';
       const strategy = parsedUrl.searchParams.get('strategy') || 'direct';
       const audioIdx = Math.max(0, Math.min(31, Number.parseInt(parsedUrl.searchParams.get('a') || '0', 10) || 0));
+
+      if (isSacdIsoReq) {
+        const ffmpegBin = resolveFfmpegBinary();
+        const engineBin = resolveWasapiEngineBinary();
+        if (ffmpegBin && engineBin) {
+          const { buildHighPrecisionResampleArgs } = require('./services/audioBridgeService.cjs');
+          const extProc = spawn(
+            engineBin,
+            ['--sacd-extract-dff', filePath, '--sacd-area', String(sacdArea), '--sacd-track', String(sacdTrack)],
+            { windowsHide: true }
+          );
+          const ffArgs = [
+            '-hide_banner', '-loglevel', 'error',
+            ...(seekSec > 0 ? ['-ss', String(seekSec.toFixed(3))] : []),
+            '-f', 'iff', '-i', '-', '-vn',
+            ...buildHighPrecisionResampleArgs(0, 176400, { force: true, ditherMethod: 'shibata' }),
+            '-ar', '176400', '-ac', '2',
+            '-f', 'wav', '-acodec', 'pcm_s24le', '-'
+          ];
+          const ff = spawn(ffmpegBin, ffArgs, { windowsHide: true });
+          extProc.stdout.pipe(ff.stdin);
+          ff.stdin.on('error', () => {});
+          request.signal?.addEventListener('abort', () => {
+            try { ff.kill(); extProc.kill(); } catch {}
+          });
+          return new Response(Readable.toWeb(ff.stdout), {
+            status: 200,
+            headers: { 'Content-Type': 'audio/wav' }
+          });
+        }
+      }
 
       if (mediaMode === 'video' && (strategy === 'remux-copy' || strategy === 'transcode-h264')) {
         const ffmpegBin = resolveFfmpegBinary();
@@ -1421,8 +1747,9 @@ app.whenReady().then(() => {
           const ffArgs = ['-hide_banner', '-loglevel', 'error'];
           if (seekSec > 0) ffArgs.push('-ss', String(seekSec.toFixed(3)));
           ffArgs.push('-i', filePath, '-vn');
-          // Cap DSD (DSF/DFF) streams with 64-bit Kaiser-Sinc resampling + Shibata noise-shaping for Studio DSP WAV decoding
-          if (['.dsf', '.dff'].includes(ext)) {
+          // Cap DSD (DSF/DFF & WavPack DSD) streams with 64-bit Kaiser-Sinc resampling + Shibata noise-shaping for Studio DSP WAV decoding
+          const isWvDsdFile = ext === '.wv' && inspectWavPackDsdHeader(filePath).isWvDsd;
+          if (['.dsf', '.dff'].includes(ext) || isWvDsdFile) {
             const { buildHighPrecisionResampleArgs } = require('./services/audioBridgeService.cjs');
             ffArgs.push(
               ...buildHighPrecisionResampleArgs(0, 176400, { force: true, ditherMethod: 'shibata' }),

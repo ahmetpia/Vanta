@@ -33,8 +33,8 @@
       <!-- Status Pills, Engine Mode Switcher, Output DAC Selector, Theme & Window Controls -->
       <div class="topbar-right no-drag">
         <div class="segmented-group" data-testid="engine-mode-switcher" title="Switch between Shared Windows Audio Studio DSP and Native WASAPI Exclusive Bit-Perfect DAC">
-          <button class="seg-btn active" data-engine="dsp" title="Shared Windows Audio + 32-Bit Float EQ, Spatial & Crossfade (plays alongside YouTube & other apps)">🎛️ Studio DSP</button>
-          <button class="seg-btn" data-engine="wasapi" title="Bit-Perfect Direct DAC Access (exclusively locks audio device while playing; auto-releases on Pause)">⚡ WASAPI Exclusive</button>
+          <button class="seg-btn" data-engine="dsp" title="Shared Windows Audio + 32-Bit Float EQ, Spatial & Crossfade (plays alongside YouTube & other apps)">🎛️ Studio DSP</button>
+          <button class="seg-btn active" data-engine="wasapi" title="Bit-Perfect Direct DAC Access (exclusively locks audio device while playing; auto-releases on Pause)">⚡ WASAPI Exclusive</button>
         </div>
 
         <div id="audioOutputCombo" data-testid="audio-output-combo" class="vanta-combo no-drag" title="Select Hardware Audio Output / DAC">
@@ -552,6 +552,9 @@
                 <option value="energy-desc">Energy %</option>
               </select>
 
+              <button id="btnImportSacdIso" type="button" class="btn btn-ghost btn-compact-sm" title="Import ScarletBook SACD Disc Image (.iso)">
+                💿 + SACD ISO
+              </button>
               <button id="btnRepairDoctorInline" class="btn btn-ghost btn-compact-sm">
                 🩺 Quality Doctor: Healthy
               </button>
@@ -831,13 +834,14 @@
 
         <!-- Quick DSP Chips inside Now Playing -->
         <div class="chip-list chip-list-centered">
-          <button class="chip on" data-dsp="lufs" title="Non-destructive EBU R128 ReplayGain (-14.0 LUFS)">EBU R128</button>
+          <button class="chip" id="btnStudioDspPreset" data-testid="studio-dsp-preset-btn" title="One-click toggle between Bit-Perfect Pure (unprocessed) and Studio DSP Preset (EBU R128 + True-Peak Limiter)">🎛️ Studio Preset</button>
+          <button class="chip" data-dsp="lufs" title="Non-destructive EBU R128 ReplayGain (-14.0 LUFS)">EBU R128</button>
           <button class="chip" data-dsp="spatial" title="3D Binaural & Mid-Side Spatializer (160Hz+ stereo stage widening + micro Haas depth)">Spatial 3D</button>
           <button class="chip" data-dsp="crossfeed" title="Bauer/Meier Headphone Crossfeed (700Hz natural acoustic speaker stage)">Crossfeed</button>
           <button class="chip" data-dsp="bassBoost" title="Dynamic 70Hz Sub-Bass Shelf & 120Hz Punch">Bass Boost</button>
           <button class="chip" data-dsp="exciter" title="4.5kHz+ Harmonic Exciter / Crystalizer brilliance">Exciter</button>
           <button class="chip" data-dsp="reverb" title="18ms Pre-Delay Hall Reverb">Reverb</button>
-          <button class="chip on" data-dsp="limiter" title="True-Peak Clip Protection Limiter (-1.5 dBFS)">Limiter</button>
+          <button class="chip" data-dsp="limiter" title="True-Peak Clip Protection Limiter (-0.3 dBFS)">Limiter</button>
           <button class="chip" data-dsp="karaoke" title="Mid-Side Lead Vocal Cancellation">Karaoke</button>
           <button class="chip" data-dsp="vinyl" title="Analog Tube Warmth & Vinyl Texture">Vinyl Soul</button>
           <button class="chip" id="btnToggleDop" data-testid="dop-toggle-chip" title="Native DoP v1.1 (DSD over PCM) for DSD64/128/256 over WASAPI Exclusive DACs (auto-falls back to DXD PCM if DAC rejects DoP)">DoP v1.1</button>
@@ -1127,12 +1131,107 @@
           </div>
         </div>
         <div class="dsp-rack-header-actions">
-          <button id="btnResetBitPerfect" type="button" class="btn btn-ghost btn-compact-sm">
-            Bit-Perfect Reset
+          <button id="btnOpenAbxModal" type="button" class="btn btn-ghost btn-compact-sm" title="Launch Double-Blind ABX Listening Comparator with True-Peak Loudness Matching">
+            🧪 ABX Blind Test
+          </button>
+          <button id="btnApplyStudioPreset" type="button" class="btn btn-ghost btn-compact-sm" title="Enable Studio DSP Preset (EBU R128 + True-Peak Limiter)">
+            Studio DSP Preset
+          </button>
+          <button id="btnResetBitPerfect" type="button" class="btn btn-ghost btn-compact-sm" title="Reset all EQ, LUFS &amp; Limiter to strict Bit-Perfect Pure">
+            Bit-Perfect Pure
           </button>
           <button id="btnCloseDspRack" type="button" class="btn btn-ghost btn-dsp-close" aria-label="Close DSP Rack">
             ✕
           </button>
+        </div>
+      </div>
+
+      <!-- WASAPI & ASIO Hardware Transport, Pause Behavior & ReplayGain 2.0 Section -->
+      <div class="dsp-rack-section">
+        <div class="dsp-section-hdr">
+          <span class="dsp-section-title">WASAPI &amp; ASIO Hardware Transport (PurePath 64)</span>
+          <span id="dspHardwareCapsBadge" class="dsp-caps-badge">Endpoint: Probing...</span>
+        </div>
+        <div class="dsp-hw-grid">
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <span class="dsp-pitch-label">Output Backend &amp; ASIO</span>
+              <button type="button" class="chip" id="btnToggleAsioRawDsd" title="Stream Native 1-bit Raw DSD64..DSD1024 directly over ASIO hardware buffers without DoP/PCM conversion">Raw DSD512/1024</button>
+            </div>
+            <div class="dsp-rack-toggles">
+              <button type="button" class="chip on" data-output-backend="wasapi" title="Windows WASAPI Exclusive (Event/Push) + MMCSS Pro Audio">WASAPI Excl</button>
+              <button type="button" class="chip" data-output-backend="asio" title="Isolated Clean-Room Native ASIO Host with automatic WASAPI fallback">ASIO Host</button>
+              <select id="selectAsioDriver" class="dsp-rate-select dsp-asio-select" aria-label="ASIO Driver">
+                <option value="">Auto / Detect ASIO...</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <span class="dsp-pitch-label">ReplayGain 2.0 (EBU R128)</span>
+              <button type="button" class="chip" id="btnAnalyzeAlbumRg" title="Scan active album EBU R128 Album+Track Gain/Peak and write lossless ID3v2/FLAC tags">Analyze &amp; Tag Album</button>
+            </div>
+            <div class="dsp-rack-toggles">
+              <button type="button" class="chip" data-rg-mode="off" title="Bypass ReplayGain loudness normalization">Off</button>
+              <button type="button" class="chip on" data-rg-mode="track" title="Normalize each track individually">Track</button>
+              <button type="button" class="chip" data-rg-mode="album" title="Preserve intra-album track dynamics using Album Gain">Album</button>
+              <button type="button" class="chip on" data-rg-lufs="-18" title="Audiophile ReplayGain 2.0 (-18.0 LUFS)">-18 LUFS</button>
+              <button type="button" class="chip" data-rg-lufs="-14" title="Modern Streaming Reference (-14.0 LUFS)">-14 LUFS</button>
+            </div>
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <span class="dsp-pitch-label">Transport &amp; Pause</span>
+              <button type="button" class="chip" id="btnToggleHoldOnPause" data-testid="hold-on-pause-btn" title="When ON, keeps exclusive WASAPI endpoint open during Pause for 0 ms resume (other apps muted while paused). Default OFF releases DAC on Pause.">Release DAC on Pause</button>
+            </div>
+            <div class="dsp-rack-toggles">
+              <button type="button" class="chip on" id="btnWasapiModeEvent" data-testid="wasapi-mode-event-btn">Event-Driven</button>
+              <button type="button" class="chip" id="btnWasapiModePush" data-testid="wasapi-mode-push-btn">Push Mode</button>
+            </div>
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <span class="dsp-pitch-label">Volume Control Mode</span>
+            </div>
+            <div class="dsp-rack-toggles">
+              <button type="button" class="chip on" data-vol-mode="auto" title="Use Windows Hardware Endpoint Volume when supported, else 64-bit TPDF Software Volume">Auto HW/SW</button>
+              <button type="button" class="chip" data-vol-mode="software" title="Always attenuate in 64-bit PurePath + TPDF Dither, leaving Windows OS endpoint untouched">64-Bit SW Vol</button>
+              <button type="button" class="chip" data-vol-mode="fixed0db" title="Lock unity 0 dBFS output for external hardware pre-amps / headphone amps">Fixed 0 dBFS</button>
+            </div>
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <button type="button" class="chip" id="btnToggleFixedRateLock" title="Resample all tracks in 64-bit Kaiser-Sinc to a single locked sample rate to avoid DAC relay clicks">Fixed Rate Lock</button>
+              <select id="selectFixedTargetRate" class="dsp-rate-select" aria-label="Target Locked Sample Rate">
+                <option value="44100">44.1 kHz</option>
+                <option value="48000" selected>48 kHz</option>
+                <option value="88200">88.2 kHz</option>
+                <option value="96000">96 kHz</option>
+                <option value="176400">176.4 kHz</option>
+                <option value="192000">192 kHz</option>
+                <option value="352800">352.8 kHz</option>
+                <option value="384000">384 kHz</option>
+              </select>
+            </div>
+            <div class="dsp-rack-toggles">
+              <span class="dsp-mini-label">Pre-Roll:</span>
+              <button type="button" class="chip on" data-preroll-ms="0">0 ms</button>
+              <button type="button" class="chip" data-preroll-ms="50">50 ms</button>
+              <button type="button" class="chip" data-preroll-ms="150">150 ms</button>
+            </div>
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <span class="dsp-pitch-label">WASAPI Buffer Override</span>
+              <span id="wasapiBufferMsVal" class="dsp-slider-val">Auto</span>
+            </div>
+            <input id="wasapiBufferMsSlider" type="range" min="0" max="200" step="5" value="0" class="dsp-range" aria-label="WASAPI Buffer Override ms" />
+          </div>
         </div>
       </div>
 
@@ -1148,12 +1247,49 @@
         </div>
       </div>
 
+      <!-- 64-Bit Parametric EQ (AutoEQ .txt) & Uniform Partitioned FFT Convolver (.wav IR) -->
+      <div class="dsp-rack-section">
+        <div class="dsp-section-hdr">
+          <span class="dsp-section-title">Precision AutoEQ PEQ (32-Band) &amp; 64-Bit FFT Convolver</span>
+        </div>
+        <div class="dsp-hw-grid">
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <span class="dsp-pitch-label">AutoEQ / EqualizerAPO (.txt)</span>
+              <span id="peqSummaryBadge" class="dsp-slider-val dsp-mini-badge">No profile</span>
+            </div>
+            <div class="dsp-rack-toggles">
+              <button type="button" class="chip" id="btnImportAutoEqTxt" title="Import EqualizerAPO / Oratory1990 / Crinacle AutoEQ .txt filter file (up to 32 bands)">Import .txt</button>
+              <button type="button" class="chip" id="btnTogglePeqActive" disabled title="Enable or bypass loaded AutoEQ Parametric EQ">Bypassed</button>
+              <button type="button" class="chip" id="btnClearAutoEq" disabled title="Remove loaded AutoEQ profile">Clear</button>
+            </div>
+          </div>
+
+          <div class="dsp-slider-card">
+            <div class="dsp-slider-top">
+              <span class="dsp-pitch-label">Room / Headphone IR (.wav)</span>
+              <span id="convolverInfoBadge" class="dsp-slider-val dsp-mini-badge">No IR loaded</span>
+            </div>
+            <div class="dsp-rack-toggles">
+              <button type="button" class="chip" id="btnPickConvolverIr" title="Load Mono, Stereo, or 4ch True-Stereo .wav Impulse Response (64-bit Partitioned Overlap-Save FFT)">Load .wav IR</button>
+              <button type="button" class="chip" id="btnToggleConvolverActive" disabled title="Enable or bypass 64-bit FFT Convolver">Bypassed</button>
+              <button type="button" class="chip" id="btnClearConvolverIr" disabled title="Unload Convolution Impulse Response">Clear</button>
+            </div>
+            <div class="dsp-slider-top">
+              <span class="dsp-mini-label">Convolver Wet Mix</span>
+              <span id="convolverWetVal" class="dsp-slider-val">100%</span>
+            </div>
+            <input id="convolverWetSlider" type="range" min="0" max="100" step="1" value="100" class="dsp-range" aria-label="FFT Convolver Wet Mix Percentage" />
+          </div>
+        </div>
+      </div>
+
       <!-- Pro Spatial, Dynamics & Pitch Sliders -->
       <div class="dsp-rack-section">
         <div class="dsp-section-hdr">
           <span class="dsp-section-title">Spatial Stage, Dynamics &amp; Key Pitch</span>
           <div class="dsp-rack-toggles">
-            <button type="button" class="chip on" data-dsp="limiter" title="True-Peak Clip Protection Limiter (-1.5 dBFS)">True-Peak Limiter</button>
+            <button type="button" class="chip" data-dsp="limiter" title="True-Peak Clip Protection Limiter (-0.3 dBFS)">True-Peak Limiter</button>
             <button type="button" class="chip" data-dsp="nightMode" title="Night Listening Dynamic Compressor (lifts quiet vocals, tames loud peaks)">Night Mode</button>
           </div>
         </div>
@@ -1225,11 +1361,89 @@
             <div id="signalPathQualityBadge" class="signal-path-quality-badge tone-dsp">STUDIO DSP (32-BIT FLOAT)</div>
           </div>
         </div>
-        <button id="btnCloseSignalPath" type="button" class="btn btn-ghost btn-dsp-close" aria-label="Close Signal Path">
-          ✕
-        </button>
+        <div class="signal-path-header-right">
+          <span id="signalPathXrunBadge" class="signal-path-xrun-pill">XRUNs: 0</span>
+          <button id="btnCloseSignalPath" type="button" class="btn btn-ghost btn-dsp-close" aria-label="Close Signal Path">
+            ✕
+          </button>
+        </div>
+      </div>
+      <div class="signal-path-audit-bar">
+        <span id="signalPathBitAuditBadge" class="signal-path-audit-pill">Bit-Audit: Idle</span>
+        <span id="signalPathTruePeakBadge" class="signal-path-audit-pill">True Peak: -- dBTP</span>
+        <span id="signalPathDrBadge" class="signal-path-audit-pill">DR / Crest: --</span>
       </div>
       <div id="signalPathStagesList" class="signal-path-stages"></div>
+    </div>
+  </div>
+
+  <!-- Double-Blind ABX Comparator Modal (Statistically Verified Listening Test) -->
+  <div id="abxModal" data-testid="abx-modal" class="vanta-modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="abxModalTitle">
+    <div class="vanta-modal-card abx-modal-card">
+      <div class="vanta-modal-header dsp-rack-header">
+        <div class="dsp-rack-title-wrap">
+          <div class="vanta-modal-icon dsp-modal-icon-accent">🧪</div>
+          <div>
+            <h3 id="abxModalTitle" class="vanta-modal-title">Double-Blind ABX Audio Comparator</h3>
+            <div class="dsp-rack-subtitle">Cryptographically randomized X trials · True-Peak loudness matching · Exact binomial p-value verification</div>
+          </div>
+        </div>
+        <button id="btnCloseAbxModal" type="button" class="btn btn-ghost btn-dsp-close" aria-label="Close ABX Comparator">✕</button>
+      </div>
+
+      <div class="abx-setup-grid">
+        <div class="dsp-slider-card">
+          <div class="dsp-slider-top">
+            <span class="dsp-pitch-label">Comparison Mode</span>
+            <button id="btnAbxLoudnessMatch" type="button" class="chip on" title="Match perceived loudness at -18.0 LUFS to eliminate +0.3 dB loudness bias">Loudness Match (-18 LUFS)</button>
+          </div>
+          <div class="dsp-rack-toggles">
+            <button type="button" class="chip on" data-abx-mode="chain">DSP Chain vs Bit-Exact</button>
+            <button type="button" class="chip" data-abx-mode="tracks">Track A vs Track B</button>
+            <select id="abxTrialsSelect" class="dsp-rate-select" aria-label="ABX Trials">
+              <option value="8">8 Trials</option>
+              <option value="12" selected>12 Trials</option>
+              <option value="16">16 Trials</option>
+            </select>
+          </div>
+          <div id="abxTrackBWrap" class="abx-trackb-row hidden">
+            <span class="dsp-mini-label">Track B:</span>
+            <select id="abxTrackBSelect" class="dsp-rate-select dsp-asio-select" aria-label="Track B for ABX Comparison"></select>
+          </div>
+        </div>
+      </div>
+
+      <div class="abx-stage-card">
+        <div class="abx-stage-top">
+          <span id="abxProgressBadge" class="dsp-caps-badge">Ready to start blind session</span>
+          <div class="abx-stage-actions-top">
+            <button id="btnStartAbxSession" type="button" class="btn btn-primary btn-compact-sm">Start Blind Test</button>
+            <button id="btnRevealAbxEarly" type="button" class="btn btn-ghost btn-compact-sm hidden">Finish &amp; Reveal</button>
+          </div>
+        </div>
+
+        <div id="abxActiveNote" class="abx-active-note">Audition A, B, and randomized X during playback, then vote whether X matches A or B.</div>
+
+        <div class="abx-audition-row">
+          <button id="btnAbxPlayA" type="button" class="btn btn-ghost abx-audition-btn" disabled>Audition A</button>
+          <button id="btnAbxPlayB" type="button" class="btn btn-ghost abx-audition-btn" disabled>Audition B</button>
+          <button id="btnAbxPlayX" type="button" class="btn btn-primary abx-audition-btn" disabled>Audition X (Hidden)</button>
+        </div>
+
+        <div class="abx-vote-row">
+          <button id="btnAbxVoteA" type="button" class="btn btn-ghost abx-vote-btn" disabled>X is A</button>
+          <button id="btnAbxVoteB" type="button" class="btn btn-ghost abx-vote-btn" disabled>X is B</button>
+        </div>
+      </div>
+
+      <div id="abxResultsBox" class="abx-results-box hidden">
+        <div class="abx-results-hdr">
+          <span id="abxScoreBadge" class="dsp-caps-badge">Score: 0 / 0</span>
+          <span id="abxPValueBadge" class="signal-path-xrun-pill">p = 1.000</span>
+        </div>
+        <div id="abxVerdictSummary" class="abx-verdict-text"></div>
+        <div id="abxTrialLogList" class="abx-trial-log"></div>
+      </div>
     </div>
   </div>
 
