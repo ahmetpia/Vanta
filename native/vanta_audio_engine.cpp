@@ -2084,7 +2084,7 @@ int main(int argc, char** argv) {
             std::memcpy(carry.data(), raw.data() + usedBytes, rem);
         }
         if (!ok && bytesRead == 0) {
-            return wholeFrames;
+            carry.clear();
         }
         return wholeFrames;
     };
@@ -2145,7 +2145,7 @@ int main(int argc, char** argv) {
                             stagedDspConfig.limiter = true;
                             snap = stagedDspConfig;
                         }
-                        dspConfigSeq.fetch_add(1, std::memory_order_release);
+                        dspConfigSeq.fetch_add(1);
                         emitDspStateEvent(snap, linearGain.load());
                     } else if (cmd == "LIMITER OFF") {
                         DspConfigSnapshot snap;
@@ -2154,7 +2154,7 @@ int main(int argc, char** argv) {
                             stagedDspConfig.limiter = false;
                             snap = stagedDspConfig;
                         }
-                        dspConfigSeq.fetch_add(1, std::memory_order_release);
+                        dspConfigSeq.fetch_add(1);
                         emitDspStateEvent(snap, linearGain.load());
                     } else if (cmd.rfind("DSP ", 0) == 0) {
                         DspConfigSnapshot nextCfg = ParseDspSpec(cmd.substr(4));
@@ -2162,7 +2162,7 @@ int main(int argc, char** argv) {
                             std::lock_guard<std::mutex> lk(dspConfigMutex);
                             stagedDspConfig = nextCfg;
                         }
-                        dspConfigSeq.fetch_add(1, std::memory_order_release);
+                        dspConfigSeq.fetch_add(1);
                         emitDspStateEvent(nextCfg, linearGain.load());
                     } else if (cmd.rfind("GAIN ", 0) == 0) {
                         float g = std::strtof(cmd.c_str() + 5, nullptr);
@@ -2370,7 +2370,7 @@ int main(int argc, char** argv) {
 
     PurePathDspRack64 dspRack;
     dspRack.ApplyConfig(chosenWfx.Format.nSamplesPerSec, initialDsp);
-    uint64_t seenDspSeq = dspConfigSeq.load(std::memory_order_acquire);
+    uint64_t seenDspSeq = dspConfigSeq.load();
 
     TruePeakLimiter64 truePeakLimiter;
     truePeakLimiter.Configure(chosenWfx.Format.nSamplesPerSec, -0.3);
@@ -2386,7 +2386,7 @@ int main(int argc, char** argv) {
     ULONGLONG lastTelemetryTick = GetTickCount64();
 
     while (!stopRequested.load()) {
-        const uint64_t latestSeq = dspConfigSeq.load(std::memory_order_acquire);
+        const uint64_t latestSeq = dspConfigSeq.load();
         if (latestSeq != seenDspSeq) {
             DspConfigSnapshot nextSnap;
             {
