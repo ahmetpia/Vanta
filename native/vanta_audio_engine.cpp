@@ -199,8 +199,8 @@ public:
           m_data(m_capacity * m_channels, SampleT{}) {}
 
     void Reconfigure(size_t capacityFrames, uint32_t channels) {
-        m_writePos.store(0, std::memory_order_relaxed);
-        m_readPos.store(0, std::memory_order_relaxed);
+        m_writePos.store(0);
+        m_readPos.store(0);
         m_capacity = capacityFrames > 0 ? capacityFrames : 1024;
         m_channels = channels > 0 ? channels : 2;
         m_data.assign(m_capacity * m_channels, SampleT{});

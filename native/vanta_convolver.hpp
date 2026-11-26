@@ -364,7 +364,7 @@ struct ConvolverSlot64 {
     bool Prepare(const WavIrData& rawIr, uint32_t targetRate, double wet01) {
         enabled = false;
         sampleRate = targetRate > 0 ? targetRate : 48000u;
-        wetMix.store(std::clamp(wet01, 0.0, 1.0), std::memory_order_relaxed);
+        wetMix.store(std::clamp(wet01, 0.0, 1.0));
         fltLL = IrFilterSpectrum64{};
         fltLR = IrFilterSpectrum64{};
         fltRL = IrFilterSpectrum64{};
@@ -499,7 +499,7 @@ struct ConvolverSlot64 {
             wetR += EvalHeadFir(inHistory[0], curIdx, fltLR.headTaps);
         }
 
-        const double w = wetMix.load(std::memory_order_relaxed);
+        const double w = wetMix.load();
         const double d = 1.0 - w;
         sampleL = dryL * d + wetL * w;
         sampleR = dryR * d + wetR * w;
@@ -533,8 +533,8 @@ public:
     }
 
     bool LoadFromWavData(const WavIrData& wav, uint32_t targetRate, double wet01, std::string& outErr, size_t* outTapCount = nullptr) {
-        const int pub = m_publishedSlot.load(std::memory_order_acquire);
-        const int ren = m_renderSlot.load(std::memory_order_acquire);
+        const int pub = m_publishedSlot.load();
+        const int ren = m_renderSlot.load();
         int freeIdx = -1;
         for (int i = 0; i < 3; ++i) {
             if (i != pub && i != ren) {
@@ -549,46 +549,46 @@ public:
             return false;
         }
         if (outTapCount) *outTapCount = m_slots[freeIdx]->tapCount;
-        m_wetMixAtomic.store(std::clamp(wet01, 0.0, 1.0), std::memory_order_relaxed);
-        m_publishedSlot.store(freeIdx, std::memory_order_release);
+        m_wetMixAtomic.store(std::clamp(wet01, 0.0, 1.0));
+        m_publishedSlot.store(freeIdx);
         return true;
     }
 
     void Disable() {
-        m_publishedSlot.store(-1, std::memory_order_release);
+        m_publishedSlot.store(-1);
     }
 
     void SetWetMix(double wet01) {
         const double clamped = std::clamp(wet01, 0.0, 1.0);
-        m_wetMixAtomic.store(clamped, std::memory_order_relaxed);
-        const int pub = m_publishedSlot.load(std::memory_order_acquire);
+        m_wetMixAtomic.store(clamped);
+        const int pub = m_publishedSlot.load();
         if (pub >= 0 && pub < 3 && m_slots[pub]) {
-            m_slots[pub]->wetMix.store(clamped, std::memory_order_relaxed);
+            m_slots[pub]->wetMix.store(clamped);
         }
     }
 
     bool IsActive() const {
-        return m_publishedSlot.load(std::memory_order_acquire) >= 0;
+        return m_publishedSlot.load() >= 0;
     }
 
     double GetWetMix() const {
-        return m_wetMixAtomic.load(std::memory_order_relaxed);
+        return m_wetMixAtomic.load();
     }
 
     // Audio render thread ONLY: locks slot via atomic exchange index without blocking.
     inline ConvolverSlot64* AcquireActiveForRender() {
-        const int pub = m_publishedSlot.load(std::memory_order_acquire);
-        m_renderSlot.store(pub, std::memory_order_seq_cst);
-        const double w = m_wetMixAtomic.load(std::memory_order_relaxed);
+        const int pub = m_publishedSlot.load();
+        m_renderSlot.store(pub);
+        const double w = m_wetMixAtomic.load();
         if (pub >= 0 && pub < 3 && m_slots[pub] && m_slots[pub]->enabled) {
-            m_slots[pub]->wetMix.store(w, std::memory_order_relaxed);
+            m_slots[pub]->wetMix.store(w);
             return m_slots[pub].get();
         }
         return nullptr;
     }
 
     inline void ReleaseRenderSlot() {
-        m_renderSlot.store(-1, std::memory_order_release);
+        m_renderSlot.store(-1);
     }
 
 private:

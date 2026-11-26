@@ -535,7 +535,7 @@ public:
     }
 
     void PublishChannelData(const std::vector<BYTE>& interleavedStaging, bool silent) {
-        const long idx = m_activeIndex.load(std::memory_order_acquire);
+        const long idx = m_activeIndex.load();
         if (idx < 0 || idx > 1 || !m_buffersCreated) {
             if (m_filledEvent) SetEvent(m_filledEvent);
             return;
@@ -658,7 +658,7 @@ private:
 
     void HandleBufferSwitch(long idx) {
         if (m_stopping.load() || !m_buffersCreated) return;
-        m_activeIndex.store(idx, std::memory_order_release);
+        m_activeIndex.store(idx);
         if (m_needFillEvent) SetEvent(m_needFillEvent);
         if (m_filledEvent) {
             const DWORD wr = WaitForSingleObject(m_filledEvent, 45);

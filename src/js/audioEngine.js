@@ -368,12 +368,15 @@ export function parseAutoEqTxt(rawText = '') {
       continue;
     }
 
-    if (!/^Filter\b/i.test(line)) {
+    const colonIdx = line.indexOf(':');
+    const hdrPrefix = colonIdx > 0 ? line.slice(0, colonIdx).trim() : '';
+    const hdrRest = colonIdx > 0 ? line.slice(colonIdx + 1).trim() : '';
+    if (!/^Filter(?:\s+\d+)?$/i.test(hdrPrefix)) {
       skippedLines++;
       continue;
     }
 
-    const filterHdr = /^Filter\s+\d*\s*:\s*(ON|OFF)\s+([A-Za-z]+)\b(.*)$/i.exec(line);
+    const filterHdr = /^(ON|OFF)\s+([A-Za-z]+)(?:\s+(.*))?$/i.exec(hdrRest);
     if (!filterHdr) {
       skippedLines++;
       continue;
@@ -528,7 +531,7 @@ export function generateAbxTrialSequence(totalTrials = 12, rngBytesFn = null) {
   } else if (globalThis.crypto?.getRandomValues) {
     globalThis.crypto.getRandomValues(bytes);
   } else {
-    for (let i = 0; i < count; i++) bytes[i] = Math.floor(Math.random() * 256);
+    throw new Error('Cryptographic RNG unavailable for blind ABX trial generation');
   }
   return Array.from(bytes, (b) => ((b & 1) === 0 ? 'A' : 'B'));
 }
@@ -1884,7 +1887,9 @@ export class VantaAudioEngine {
 
     if (this.irDryGain && this.irWetGain) {
       const useIr = Boolean(this.state.convolverEnabled && this.irConvolverNode?.buffer);
-      const irWet = useIr ? Math.max(0, Math.min(1, (Number(this.state.convolverWetPct) ?? 100) / 100)) : 0.0;
+      const rawWet = this.state.convolverWetPct ?? 100;
+      const wetNum = Number.isFinite(Number(rawWet)) ? Number(rawWet) : 100;
+      const irWet = useIr ? Math.max(0, Math.min(1, wetNum / 100)) : 0.0;
       this.irWetGain.gain.setTargetAtTime(irWet, now, 0.025);
       this.irDryGain.gain.setTargetAtTime(useIr ? (1.0 - irWet) : 1.0, now, 0.025);
     }

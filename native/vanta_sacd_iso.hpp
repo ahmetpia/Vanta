@@ -19,6 +19,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vanta_sacd {
@@ -328,15 +329,15 @@ public:
         }
         // "CMPR"
         const char* cmprTag = sawAnyDstFrame ? "DST " : "DSD ";
-        const char* cmprLabel = sawAnyDstFrame ? "DST Encoded" : "not compressed";
-        const uint8_t labelLen = static_cast<uint8_t>(std::strlen(cmprLabel));
+        const std::string_view cmprLabel = sawAnyDstFrame ? "DST Encoded" : "not compressed";
+        const uint8_t labelLen = static_cast<uint8_t>(cmprLabel.size());
         const uint64_t cmprRawSize = 5ULL + labelLen;
         const uint64_t cmprPad = cmprRawSize & 1ULL;
         propSub.insert(propSub.end(), {'C', 'M', 'P', 'R'});
         WriteBe64(propSub, cmprRawSize);
         propSub.insert(propSub.end(), cmprTag, cmprTag + 4);
         propSub.push_back(labelLen);
-        propSub.insert(propSub.end(), cmprLabel, cmprLabel + labelLen);
+        propSub.insert(propSub.end(), cmprLabel.data(), cmprLabel.data() + labelLen);
         if (cmprPad) propSub.push_back(0);
 
         std::vector<uint8_t> hdrBuf;
