@@ -542,7 +542,11 @@ export class ScoreStudioController {
     // Right Dock shortcut
     document.getElementById('btnDockOpenScoreStudio')?.addEventListener('click', () => {
       const track = this.host.getActiveTrack?.();
-      this.open(track);
+      void this.open(track).catch((err) => {
+        window.vantaAPI?.logClientEvent?.('warn', 'Score Studio open failed', {
+          error: err?.message || String(err)
+        });
+      });
     });
 
     document.addEventListener('keydown', (e) => {

@@ -173,7 +173,7 @@ function computeScoreCacheKeys(filePath, opts = {}) {
   const mode = opts.mode === 'htdemucs' ? 'htdemucs' : 'direct';
   const focus = sanitizeCacheToken(opts.focusProfile || 'solo');
   const stemsKey = Array.isArray(opts.stems) && opts.stems.length
-    ? [...new Set(opts.stems.map((s) => String(s).toLowerCase()).filter((s) => VALID_STEMS.has(s)))].sort().join('-')
+    ? [...new Set(opts.stems.map((s) => String(s).toLowerCase()).filter((s) => VALID_STEMS.has(s)))].sort((a, b) => a.localeCompare(b, 'en')).join('-')
     : 'other';
   const win = normalizeTranscriptionWindow(opts);
   const winTag = win.startSec > 0 || win.durationSec > 0 ? `_w${win.startSec}_${win.durationSec}` : '';
