@@ -58,6 +58,20 @@ import {
   hasPlaylistReferenceCycle,
   executeFlowGraph
 } from '../src/js/playlistFlowEngine.js';
+import {
+  normalizeRawNotes,
+  annotateAndCleanNotes,
+  estimateTempoAndMeter,
+  detectMusicalKey,
+  recognizeChordsViterbi,
+  assignGrandStaffHands,
+  buildScoreModel,
+  parseTimeWindowInput,
+  normalizeAnalysisWindowBounds
+} from '../src/js/scoreAnalyzer.js';
+import { buildMidiBytes, buildMusicXml, encodePcmToWavBytes } from '../src/js/scoreExporter.js';
+import { renderScoreAudioWav } from '../src/js/scoreSynth.js';
+import { buildVexVoiceData } from '../src/js/scoreStudioUI.js';
 
 const require = createRequire(import.meta.url);
 const {
@@ -132,8 +146,17 @@ const {
   resolveFromTrustedRoots,
   SUBTITLE_EXTENSIONS,
   SACD_ISO_EXTENSIONS,
-  PLAYLIST_EXTENSIONS
+  PLAYLIST_EXTENSIONS,
+  SCORE_EXPORT_EXTENSIONS
 } = require('../electron/services/pathSecurityService.cjs');
+const {
+  DEFAULT_MAX_WINDOW_SEC,
+  normalizeTranscriptionWindow,
+  computeScoreCacheKeys,
+  getTranscriptionEngineStatus,
+  buildPreconditionAudioFilter,
+  transcribeAudioFile
+} = require('../electron/services/transcriptionService.cjs');
 
 describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
   it('1. YouTube Multi-URL / Video ID Parser extracts & deduplicates watch, short, and raw IDs', async () => {
@@ -2729,5 +2752,392 @@ describe('VANTA — Personal Audio & Video OS Verification Suite', () => {
       null
     );
     fs.rmSync(tmpExportDir, { recursive: true, force: true });
+  });
+
+  it('27. VANTA Score Studio: Harmonic Ghost Pruning, [40,220] BPM & 12/8 Meter, Viterbi Chords, DP Split & Export', async () => {
+    // 1. Harmonic ghost annotation & same-pitch fragment merging
+    const rawWithGhosts = [
+      { start_s: 0.0, end_s: 0.45, pitch: 43, amplitude: 0.72, velocity: 90 },   // G2 fundamental
+      { start_s: 0.01, end_s: 0.35, pitch: 55, amplitude: 0.28, velocity: 35 },  // Weak G3 octave ghost (+12)
+      { start_s: 0.02, end_s: 0.30, pitch: 62, amplitude: 0.22, velocity: 28 },  // Weak D4 12th ghost (+19)
+      { start_s: 0.0, end_s: 0.90, pitch: 67, amplitude: 0.76, velocity: 96 },   // Real melody G4
+      { start_s: 0.92, end_s: 1.40, pitch: 67, amplitude: 0.70, velocity: 88 }   // Re-articulation gap 20ms -> should merge
+    ];
+    const norm = normalizeRawNotes(rawWithGhosts);
+    const cleaned = annotateAndCleanNotes(norm, { harmonicFilterStrength: 0.7, minConfidence: 0.2 });
+    assert.equal(cleaned.stats.overtoneCount, 2);
+    assert.equal(cleaned.active.length, 2);
+    const mergedG4 = cleaned.active.find((n) => n.pitch === 67);
+    assert.ok(mergedG4 && mergedG4.mergedCount === 2);
+
+    // 1b. Sustain-pedal delayed arpeggio strikes (>85ms after bass) & louder fresh strikes stay preserved
+    const pedalArpeggio = [
+      { start_s: 1.0, end_s: 2.8, pitch: 45, amplitude: 0.78, velocity: 98 },   // A2 sustained bass
+      { start_s: 1.24, end_s: 2.0, pitch: 57, amplitude: 0.48, velocity: 65 },  // Delayed A3 (+12) arpeggio
+      { start_s: 1.48, end_s: 2.2, pitch: 64, amplitude: 0.45, velocity: 62 },  // Delayed E4 (+19) arpeggio
+      { start_s: 2.86, end_s: 3.6, pitch: 45, amplitude: 0.84, velocity: 104 }  // Fresh Bar 2 A2 strike
+    ];
+    const arpClean = annotateAndCleanNotes(normalizeRawNotes(pedalArpeggio), {
+      harmonicFilterStrength: 0.65,
+      minConfidence: 0.32
+    });
+    assert.equal(arpClean.stats.overtoneCount, 0);
+    assert.equal(arpClean.active.length, 4);
+
+    // 1c. Intro silence >0.25s anchors Bar 1 to first musical downbeat automatically
+    const introOffsetNotes = [];
+    for (let bar = 0; bar < 4; bar++) {
+      const bT = 1.08 + bar * 2.0; // 120 BPM 4/4 starting at 1.08s
+      introOffsetNotes.push({ start_s: bT, end_s: bT + 1.9, pitch: 45, amplitude: 0.82, velocity: 100 });
+      for (let e = 0; e < 8; e++) {
+        introOffsetNotes.push({ start_s: bT + e * 0.25, end_s: bT + e * 0.25 + 0.2, pitch: 60 + (e % 4) * 4, amplitude: 0.75, velocity: 90 });
+      }
+    }
+    const alignedModel = buildScoreModel(introOffsetNotes, { splitMode: 'smart' });
+    assert.equal(alignedModel.timeSignature, '4/4');
+    assert.ok(Math.abs(alignedModel.beatOffsetSec - 1.08) <= 0.15, `Expected beatOffsetSec ~1.08, got ${alignedModel.beatOffsetSec}`);
+    assert.ok(alignedModel.measures[0].trebleEvents.length + alignedModel.measures[0].bassEvents.length >= 6);
+
+    // 1d. Elastic rubato measure tracking aligns changing bar lengths cleanly & smooths 16th timing jitter
+    const rubatoBarTimes = [1.0, 3.05, 5.15, 7.05, 8.90, 10.75, 12.60];
+    const rubatoChords = [45, 45, 50, 43, 48, 41]; // A, A, D, G, C, F
+    const rubatoNotes = [];
+    for (let b = 0; b < rubatoChords.length; b++) {
+      const t0 = rubatoBarTimes[b];
+      const barDur = rubatoBarTimes[b + 1] - t0;
+      const bassRoot = rubatoChords[b];
+      rubatoNotes.push({ start_s: t0, end_s: t0 + barDur * 0.9, pitch: bassRoot, amplitude: 0.85, velocity: 100 });
+      for (let e = 0; e < 8; e++) {
+        // Introduce +/-25ms expressive timing jitter on 8th notes
+        const jitter = (e % 2 === 1 ? 0.024 : -0.015);
+        const nt = t0 + (e / 8) * barDur + (e > 0 ? jitter : 0);
+        rubatoNotes.push({ start_s: nt, end_s: nt + (barDur / 8) * 0.9, pitch: bassRoot + 12 + (e % 3) * 4, amplitude: 0.72, velocity: 88 });
+      }
+    }
+    const rubatoModel = buildScoreModel(rubatoNotes, { splitMode: 'smart' });
+    assert.equal(rubatoModel.timeSignature, '4/4');
+    // Bar 4 (~7.05s, G? no Bar 3 is D at 5.15, Bar 4 is G at 7.05, Bar 5 is C at 8.90) downbeats should align within 0.25s
+    assert.ok(Math.abs(rubatoModel.measures[2].startSec - 5.15) <= 0.25, `Bar 3 misaligned: ${rubatoModel.measures[2].startSec}`);
+    assert.ok(Math.abs(rubatoModel.measures[3].startSec - 7.05) <= 0.25, `Bar 4 misaligned: ${rubatoModel.measures[3].startSec}`);
+    // 8th-note phrasing jitter stabilizes onto multiples of 240 ticks
+    const odd16ths = rubatoModel.measures[2].trebleEvents.filter((ev) => ev.startTickInMeasure % 240 !== 0);
+    assert.equal(odd16ths.length, 0);
+
+    // 2. Slow ballad 63 BPM in 12/8 compound time (G -> Em -> C -> D progression)
+    const eighthSec = 60 / (63 * 3); // dotted quarter = 63 BPM
+    const progression = [
+      { bass: [43, 50, 55, 59], mel: [[62, 0, 3], [64, 3, 1], [67, 4, 2]] }, // G
+      { bass: [40, 47, 52, 55], mel: [[67, 0, 3], [66, 3, 1], [64, 4, 2]] }, // Em
+      { bass: [48, 55, 60, 64], mel: [[64, 0, 3], [62, 3, 1], [60, 4, 2]] }, // C
+      { bass: [50, 57, 62, 66], mel: [[62, 0, 4], [66, 4, 2]] }              // D
+    ];
+    const scoreNotes = [];
+    progression.forEach((bar, bIdx) => {
+      const bStart = bIdx * 6 * eighthSec;
+      scoreNotes.push({ start_s: bStart, end_s: bStart + 5.8 * eighthSec, pitch: bar.bass[0], amplitude: 0.75, velocity: 92 });
+      bar.bass.slice(1).forEach((p, idx) => {
+        scoreNotes.push({
+          start_s: bStart + (idx + 1) * eighthSec,
+          end_s: bStart + (idx + 3) * eighthSec,
+          pitch: p,
+          amplitude: 0.65,
+          velocity: 80
+        });
+      });
+      bar.mel.forEach(([p, off, len]) => {
+        scoreNotes.push({
+          start_s: bStart + off * eighthSec,
+          end_s: bStart + (off + len) * eighthSec,
+          pitch: p,
+          amplitude: 0.85,
+          velocity: 105
+        });
+      });
+    });
+
+    const tempoRes = estimateTempoAndMeter(normalizeRawNotes(scoreNotes), { bpmHint: 63 });
+    assert.ok(tempoRes.bpm >= 60 && tempoRes.bpm <= 130, `Expected ballad/compound tempo, got ${tempoRes.bpm}`);
+
+    const model = buildScoreModel(scoreNotes, {
+      bpm: 63,
+      timeSignature: '12/8',
+      harmonicFilterStrength: 0.6,
+      splitMode: 'smart'
+    });
+    assert.equal(model.key.vexKey, 'G');
+    assert.equal(model.tempo, 63);
+    assert.equal(model.timeSignature, '12/8');
+    assert.ok(model.totalMeasures >= 2);
+    const detectedChords = model.chords.map((c) => c.symbol).filter((s) => s !== 'N.C.');
+    assert.ok(detectedChords.includes('G'), `Expected G chord in ${detectedChords.join(',')}`);
+    assert.ok(detectedChords.includes('Em'), `Expected Em chord in ${detectedChords.join(',')}`);
+    assert.ok(detectedChords.includes('C'), `Expected C chord in ${detectedChords.join(',')}`);
+    assert.ok(detectedChords.includes('D'), `Expected D chord in ${detectedChords.join(',')}`);
+
+    // 3. DP Grand Staff splits bass roots to 'bass' and melody to 'treble'
+    const bassHands = model.notes.filter((n) => n.pitch <= 50);
+    const trebleHands = model.notes.filter((n) => n.pitch >= 64);
+    assert.ok(bassHands.every((n) => n.hand === 'bass'));
+    assert.ok(trebleHands.every((n) => n.hand === 'treble'));
+
+    // 4. Barline crossing generates tieStart & tieEnd across adjacent measures
+    const tieModel = buildScoreModel([
+      { start_s: 1.5, end_s: 3.0, pitch: 60, amplitude: 0.8, velocity: 90 }
+    ], { bpm: 120, timeSignature: '4/4' });
+    assert.ok(tieModel.measures[0].trebleEvents[0]?.tieStart === true);
+    assert.ok(tieModel.measures[1].trebleEvents[0]?.tieEnd === true);
+
+    // 5. Binary Type-1 MIDI serialization validity
+    const midiBytes = buildMidiBytes(model, { title: 'Perfect Test' });
+    assert.equal(Buffer.from(midiBytes.slice(0, 4)).toString('ascii'), 'MThd');
+    assert.equal((midiBytes[8] << 8) | midiBytes[9], 1);   // Type-1 SMF
+    assert.equal((midiBytes[10] << 8) | midiBytes[11], 3); // 3 tracks (Conductor + Treble + Bass)
+    assert.equal(Buffer.from(midiBytes.slice(14, 18)).toString('ascii'), 'MTrk');
+
+    // 6. MusicXML 4.0 serialization & XML escaping
+    const xml = buildMusicXml(tieModel, { title: 'Rock & Roll <Live>', artist: 'VANTA' });
+    assert.match(xml, /<work-title>Rock &amp; Roll &lt;Live&gt;<\/work-title>/);
+    assert.match(xml, /<staves>2<\/staves>/);
+    assert.match(xml, /<tie type="start"\/>/);
+    assert.match(xml, /<tie type="stop"\/>/);
+
+    // 7. RIFF/WAVE PCM16 audio encoding (clamping, stereo interleaving, header validity)
+    const chL = new Float32Array([0.0, 1.5, -1.5, 0.5]);
+    const chR = new Float32Array([-0.5, 0.25, -0.25, 0.0]);
+    const wav = encodePcmToWavBytes([chL, chR], 44100);
+    assert.equal(Buffer.from(wav.slice(0, 4)).toString('ascii'), 'RIFF');
+    assert.equal(Buffer.from(wav.slice(8, 12)).toString('ascii'), 'WAVE');
+    assert.equal(wav.length, 44 + 4 * 2 * 2);
+    const wavView = new DataView(wav.buffer);
+    assert.equal(wavView.getUint16(22, true), 2);     // stereo
+    assert.equal(wavView.getUint32(24, true), 44100); // sampleRate
+    assert.equal(wavView.getInt16(44 + 4, true), 32767);  // L[1] clamped +1.0
+    assert.equal(wavView.getInt16(44 + 8, true), -32768); // L[2] clamped -1.0
+
+    // 8. Pure Float32 offline score audio synthesis produces valid audible RIFF/WAVE
+    const synthWav = await renderScoreAudioWav(model, { playbackRate: 1.0 });
+    assert.equal(Buffer.from(synthWav.slice(0, 4)).toString('ascii'), 'RIFF');
+    assert.ok(synthWav.length > 44100 * 4, 'Synthesized score WAV should contain >1s stereo PCM frames');
+
+    // 9. Analysis time-window parser and long-track (>8 min) range clamping
+    assert.equal(parseTimeWindowInput('12:30'), 750);
+    assert.equal(parseTimeWindowInput('1:05:20'), 3920);
+    assert.equal(parseTimeWindowInput('90'), 90);
+    assert.equal(parseTimeWindowInput('12:75'), null);
+    assert.equal(parseTimeWindowInput('bad-time'), null);
+    assert.equal(parseTimeWindowInput(-5), null);
+
+    const shortWin = normalizeAnalysisWindowBounds({ startSec: 0, endSec: 200, trackDurationSec: 200 });
+    assert.equal(shortWin.isFullTrack, true);
+    assert.equal(shortWin.isLongTrack, false);
+    assert.equal(shortWin.requestDurationSec, 0);
+
+    const longStartCap = normalizeAnalysisWindowBounds({
+      startSec: 0,
+      endSec: 900,
+      trackDurationSec: 3600,
+      changedEdge: 'start'
+    });
+    assert.equal(longStartCap.isLongTrack, true);
+    assert.equal(longStartCap.exceedsMaxCap, true);
+    assert.equal(longStartCap.startSec, 0);
+    assert.equal(longStartCap.endSec, 480);
+    assert.equal(longStartCap.requestDurationSec, 480);
+
+    const longEndSlide = normalizeAnalysisWindowBounds({
+      startSec: 100,
+      endSec: 1500,
+      trackDurationSec: 3600,
+      changedEdge: 'end'
+    });
+    assert.equal(longEndSlide.exceedsMaxCap, true);
+    assert.equal(longEndSlide.startSec, 1020);
+    assert.equal(longEndSlide.endSec, 1500);
+    assert.equal(longEndSlide.requestStartSec, 1020);
+    assert.equal(longEndSlide.requestDurationSec, 480);
+
+    // 10. VexFlow 5 camelCase Voice time signature (numBeats / beatValue) & exact 3/4 rests
+    const voiceArgs = [];
+    const mockVf = {
+      Dot: { buildAndAttach: () => {} },
+      StaveNote: class { constructor(spec) { this.spec = spec; } },
+      Voice: class {
+        static Mode = { STRICT: 1, SOFT: 2 };
+        constructor(spec) { this.spec = spec; this.mode = 1; voiceArgs.push(spec); }
+        setMode(m) { this.mode = m; return this; }
+        addTickables(n) { this.tickables = n; }
+      }
+    };
+    const empty34 = buildVexVoiceData(mockVf, [], { startTick: 0, endTick: 1440, num: 3, den: 4 }, 'treble');
+    assert.deepEqual(voiceArgs[0], { numBeats: 3, beatValue: 4 });
+    assert.equal(empty34.voice.mode, mockVf.Voice.Mode.STRICT);
+    assert.equal(empty34.staveNotes[0].spec.duration, 'hr');
+    assert.equal(empty34.staveNotes[0].spec.dots, 1);
+
+    // 11. Polyphonic 2-Voice splitting preserves sustained lower accompaniment under moving upper melody
+    const polyEvents = [
+      { sourceNoteId: 1, pitch: 55, noteName: 'G3', vexKey: 'g/3', startTickInMeasure: 0, durTicks: 1920 },
+      { sourceNoteId: 2, pitch: 71, noteName: 'B4', vexKey: 'b/4', startTickInMeasure: 480, durTicks: 480 },
+      { sourceNoteId: 3, pitch: 72, noteName: 'C5', vexKey: 'c/5', startTickInMeasure: 960, durTicks: 480 }
+    ];
+    const polyBar = buildVexVoiceData(mockVf, polyEvents, { startTick: 0, endTick: 1920, num: 4, den: 4 }, 'treble');
+    assert.equal(polyBar.voices.length, 2);
+    assert.equal(polyBar.voiceNoteLists[0][1].spec.stemDirection, 1);
+    assert.equal(polyBar.voiceNoteLists[1][0].spec.stemDirection, -1);
+    assert.equal(polyBar.voiceNoteLists[1][0].spec.duration, 'w');
+
+    // 12. Unbiased compound 6/8 pulse detection vs high-BPM trap & steady 4/4 classification
+    const compound68Notes = [];
+    const eighth63 = 60 / 63 / 3;
+    for (let bar = 0; bar < 12; bar++) {
+      const t0 = bar * 6 * eighth63;
+      compound68Notes.push({ startSec: t0, endSec: t0 + eighth63 * 2.5, pitch: 43, amplitude: 0.9, velocity: 95 });
+      compound68Notes.push({ startSec: t0 + 3 * eighth63, endSec: t0 + 5.5 * eighth63, pitch: 43, amplitude: 0.85, velocity: 90 });
+      for (let e = 0; e < 6; e++) {
+        const te = t0 + e * eighth63;
+        compound68Notes.push({ startSec: te, endSec: te + eighth63 * 0.8, pitch: 67 + (e % 3) * 2, amplitude: e % 3 === 0 ? 0.82 : 0.65, velocity: 80 });
+      }
+    }
+    const compEst = estimateTempoAndMeter(compound68Notes);
+    assert.equal(compEst.timeSignature, '6/8', `Expected 6/8 compound meter, got ${compEst.bpm} ${compEst.timeSignature}`);
+    assert.ok(compEst.bpm >= 60 && compEst.bpm <= 67, `Expected ~63 BPM for 6/8 groove, got ${compEst.bpm}`);
+
+    const house44Notes = [];
+    const beat125 = 60 / 125;
+    for (let beat = 0; beat < 48; beat++) {
+      const tb = beat * beat125;
+      house44Notes.push({ startSec: tb, endSec: tb + beat125 * 0.7, pitch: beat % 4 === 0 ? 41 : 48, amplitude: beat % 4 === 0 ? 0.92 : 0.75, velocity: 90 });
+    }
+    const houseEst = estimateTempoAndMeter(house44Notes);
+    assert.equal(houseEst.timeSignature, '4/4', `Expected 4/4 meter, got ${houseEst.bpm} ${houseEst.timeSignature}`);
+  });
+
+  it('28. Transcription Service, HTDemucs Binary Resolution, Security Guards & End-to-End Direct Pipeline', async () => {
+    const status = getTranscriptionEngineStatus();
+    assert.equal(status.hasFfmpeg, true);
+    assert.equal(status.hasBasicPitch, true);
+    assert.equal(status.hasStemEngine, true);
+
+    assert.match(buildPreconditionAudioFilter('solo'), /adelay=150:all=1/);
+    assert.match(buildPreconditionAudioFilter('melody'), /highpass=f=110/);
+    assert.match(buildPreconditionAudioFilter('chords'), /0\.65\*c0-0\.35\*c1/);
+    assert.match(buildPreconditionAudioFilter('bass'), /lowpass=f=280/);
+
+    assert.deepEqual(normalizeTranscriptionWindow({ startSec: -10, durationSec: 2 }), {
+      startSec: 0,
+      durationSec: 5
+    });
+    assert.deepEqual(normalizeTranscriptionWindow({ startSec: 120, durationSec: 9999 }), {
+      startSec: 120,
+      durationSec: DEFAULT_MAX_WINDOW_SEC
+    });
+    assert.deepEqual(normalizeTranscriptionWindow({ startSec: 600, endSec: 900 }), {
+      startSec: 600,
+      durationSec: 300
+    });
+
+    // Security validations for Scores & Models vault subfolders and SCORE_EXPORT_EXTENSIONS
+    const tmpVault = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-score-vault-'));
+    try {
+      assert.ok(resolveSafeVaultSubfolder(tmpVault, 'scores'));
+      assert.ok(resolveSafeVaultSubfolder(tmpVault, 'models'));
+      assert.equal(resolveSafeVaultSubfolder(tmpVault, 'scores/../windows'), null);
+      assert.ok(validateSafeFilePath(path.join(tmpVault, 'out.musicxml'), { allowedExtensions: SCORE_EXPORT_EXTENSIONS, mustExist: false }));
+      assert.ok(validateSafeFilePath(path.join(tmpVault, 'out.mid'), { allowedExtensions: SCORE_EXPORT_EXTENSIONS, mustExist: false }));
+      assert.ok(validateSafeFilePath(path.join(tmpVault, 'out.pdf'), { allowedExtensions: SCORE_EXPORT_EXTENSIONS, mustExist: false }));
+      assert.ok(validateSafeFilePath(path.join(tmpVault, 'out.mp3'), { allowedExtensions: SCORE_EXPORT_EXTENSIONS, mustExist: false }));
+      assert.ok(validateSafeFilePath(path.join(tmpVault, 'out.wav'), { allowedExtensions: SCORE_EXPORT_EXTENSIONS, mustExist: false }));
+      assert.equal(validateSafeFilePath(path.join(tmpVault, 'CON.mid'), { allowedExtensions: SCORE_EXPORT_EXTENSIONS, mustExist: false }), null);
+      assert.equal(validateSafeFilePath(path.join(tmpVault, 'bad.exe'), { allowedExtensions: SCORE_EXPORT_EXTENSIONS, mustExist: false }), null);
+      assert.equal(validateSafeFilePath('-bad.mid', { allowedExtensions: SCORE_EXPORT_EXTENSIONS, mustExist: false }), null);
+
+      // Generate a 22.05 kHz WAV with G3 + D4 + B4 right at t=0.00s to verify 150ms pre-roll & cache hit
+      const sr = 22050;
+      const nSamples = sr * 2;
+      const wavPath = path.join(tmpVault, 'g_chord_test.wav');
+      const buf = Buffer.alloc(44 + nSamples * 2);
+      buf.write('RIFF', 0);
+      buf.writeUInt32LE(36 + nSamples * 2, 4);
+      buf.write('WAVEfmt ', 8);
+      buf.writeUInt32LE(16, 16);
+      buf.writeUInt16LE(1, 20);
+      buf.writeUInt16LE(1, 22);
+      buf.writeUInt32LE(sr, 24);
+      buf.writeUInt32LE(sr * 2, 28);
+      buf.writeUInt16LE(2, 32);
+      buf.writeUInt16LE(16, 34);
+      buf.write('data', 36);
+      buf.writeUInt32LE(nSamples * 2, 40);
+      const freqs = [196.0, 293.66, 392.0, 493.88];
+      for (let i = 0; i < nSamples; i++) {
+        const t = i / sr;
+        let v = 0;
+        for (const f of freqs) v += 0.2 * Math.sin(2 * Math.PI * f * t);
+        buf.writeInt16LE(Math.round(Math.max(-1, Math.min(1, v)) * 28000), 44 + i * 2);
+      }
+      fs.writeFileSync(wavPath, buf);
+
+      const legacyKeys = computeScoreCacheKeys(wavPath, { mode: 'direct', focusProfile: 'solo' });
+      const winKeys = computeScoreCacheKeys(wavPath, { mode: 'direct', focusProfile: 'solo', startSec: 600, durationSec: 180 });
+      assert.ok(!legacyKeys.cacheKey.includes('_w'));
+      assert.match(winKeys.cacheKey, /_w600_180$/);
+      assert.match(winKeys.stemCacheKey, /_w600_180$/);
+
+      const firstRun = await transcribeAudioFile(wavPath, {
+        mode: 'direct',
+        focusProfile: 'solo',
+        vaultRoot: tmpVault
+      });
+      assert.equal(firstRun.cached, false);
+      assert.equal(firstRun.windowStartSec, 0);
+      assert.equal(firstRun.requestedDurationSec, 0);
+      assert.ok(firstRun.notes.length >= 2, `Expected >=2 detected notes, got ${firstRun.notes.length}`);
+
+      const secondRun = await transcribeAudioFile(wavPath, {
+        mode: 'direct',
+        focusProfile: 'solo',
+        vaultRoot: tmpVault
+      });
+      assert.equal(secondRun.cached, true);
+      assert.equal(secondRun.notes.length, firstRun.notes.length);
+
+      // Generate a 12s two-section WAV (0..6s E3 164.81Hz, 6..12s C5 523.25Hz) & extract only [6..12s]
+      const nWinSamples = sr * 12;
+      const winWavPath = path.join(tmpVault, 'two_stage_window.wav');
+      const winBuf = Buffer.alloc(44 + nWinSamples * 2);
+      winBuf.write('RIFF', 0);
+      winBuf.writeUInt32LE(36 + nWinSamples * 2, 4);
+      winBuf.write('WAVEfmt ', 8);
+      winBuf.writeUInt32LE(16, 16);
+      winBuf.writeUInt16LE(1, 20);
+      winBuf.writeUInt16LE(1, 22);
+      winBuf.writeUInt32LE(sr, 24);
+      winBuf.writeUInt32LE(sr * 2, 28);
+      winBuf.writeUInt16LE(2, 32);
+      winBuf.writeUInt16LE(16, 34);
+      winBuf.write('data', 36);
+      winBuf.writeUInt32LE(nWinSamples * 2, 40);
+      for (let i = 0; i < nWinSamples; i++) {
+        const t = i / sr;
+        const hz = t < 6.0 ? 164.81 : 523.25;
+        winBuf.writeInt16LE(Math.round(0.75 * Math.sin(2 * Math.PI * hz * t) * 28000), 44 + i * 2);
+      }
+      fs.writeFileSync(winWavPath, winBuf);
+
+      const sliceRes = await transcribeAudioFile(winWavPath, {
+        mode: 'direct',
+        focusProfile: 'solo',
+        startSec: 6,
+        durationSec: 6,
+        vaultRoot: tmpVault
+      });
+      assert.equal(sliceRes.cached, false);
+      assert.equal(sliceRes.windowStartSec, 6);
+      assert.equal(sliceRes.requestedDurationSec, 6);
+      assert.ok(sliceRes.durationSec >= 5.0 && sliceRes.durationSec <= 6.5, `Unexpected slice duration ${sliceRes.durationSec}`);
+      assert.ok(sliceRes.notes.some((n) => n.pitch >= 70 && n.pitch <= 74), `Expected C5 (~MIDI 72) in slice 6..12s, got ${sliceRes.notes.map((n) => n.pitch).join(',')}`);
+    } finally {
+      fs.rmSync(tmpVault, { recursive: true, force: true });
+    }
   });
 });

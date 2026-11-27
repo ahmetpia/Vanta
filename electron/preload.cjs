@@ -26,6 +26,12 @@ contextBridge.exposeInMainWorld('vantaAPI', {
   saveSmartPlaylist: (playlist) => ipcRenderer.invoke('vanta:save-smart-playlist', playlist),
   deleteSmartPlaylist: (id) => ipcRenderer.invoke('vanta:delete-smart-playlist', { id }),
   exportFlowM3u8: (payload) => ipcRenderer.invoke('vanta:export-flow-m3u8', payload),
+  getScoreEngineStatus: () => ipcRenderer.invoke('vanta:get-score-engine-status'),
+  ensureHtdemucsModel: () => ipcRenderer.invoke('vanta:ensure-htdemucs-model'),
+  getCachedScore: (payload) => ipcRenderer.invoke('vanta:get-cached-score', payload),
+  transcribeTrack: (payload) => ipcRenderer.invoke('vanta:transcribe-track', payload),
+  cancelTranscription: (payload) => ipcRenderer.invoke('vanta:cancel-transcription', payload),
+  exportScore: (payload) => ipcRenderer.invoke('vanta:export-score', payload),
   pickPlaylistCover: (playlistId) => ipcRenderer.invoke('vanta:pick-playlist-cover', { playlistId }),
   getFxVideo: () => ipcRenderer.invoke('vanta:get-fx-video'),
   pickFxVideo: () => ipcRenderer.invoke('vanta:pick-fx-video'),
@@ -82,5 +88,10 @@ contextBridge.exposeInMainWorld('vantaAPI', {
     const handler = (_event, keyAction) => callback(keyAction);
     ipcRenderer.on('vanta:media-key', handler);
     return () => ipcRenderer.removeListener('vanta:media-key', handler);
+  },
+  onTranscriptionProgress: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('vanta:transcription-progress', handler);
+    return () => ipcRenderer.removeListener('vanta:transcription-progress', handler);
   }
 });

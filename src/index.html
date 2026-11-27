@@ -137,6 +137,17 @@
           <span>AI Remix</span>
         </button>
 
+        <button id="btnNavScoreStudio" class="nav-item" data-nav="score" data-testid="nav-score-studio">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2">
+            <path d="M9 18V5l12-2v13" />
+            <circle cx="6" cy="18" r="3" />
+            <circle cx="18" cy="16" r="3" />
+            <path d="M9 9l12-2" />
+          </svg>
+          <span>Score Studio</span>
+          <span class="nav-badge">MIDI</span>
+        </button>
+
         <!-- LIBRARY -->
         <div class="nav-section-header">Library</div>
 
@@ -767,6 +778,24 @@
           >
             🎛️ Studio DSP · Shared Audio Ready ▾
           </button>
+          <div id="dockScoreChordStrip" class="dock-chord-strip" data-testid="dock-chord-strip">
+            <div class="dock-chord-main">
+              <span id="dockChordCurrent" class="dock-chord-current" title="Active Harmonic Chord">--</span>
+              <div class="dock-chord-meta">
+                <span id="dockChordNext" class="dock-chord-next">Score Ready</span>
+                <span id="dockChordKey" class="dock-chord-key">Key --</span>
+              </div>
+            </div>
+            <button
+              id="btnDockOpenScoreStudio"
+              data-testid="dock-open-score-btn"
+              type="button"
+              class="btn btn-ghost dock-score-btn"
+              title="Open VANTA Score Studio (Sheet Music, Chords &amp; Stem Transcription)"
+            >
+              🎼 Score
+            </button>
+          </div>
           <div class="stage-box dock-wave-stage-box">
             <div id="vizModeSwitcher" class="viz-mode-bar" data-testid="viz-mode-switcher" title="Select Pro Audio Visualization Mode">
               <button type="button" class="viz-pill active" data-viz="prism">Aurora</button>
@@ -1581,6 +1610,206 @@
     </div>
   </div>
 
+  <!-- VANTA Score Studio Fullscreen Modal (HTDemucs 4-Stem + Basic Pitch + Grand Staff & Practice Mode) -->
+  <div id="scoreStudioModal" data-testid="score-studio-modal" class="vanta-modal-backdrop flow-studio-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="scoreStudioTitle">
+    <div class="vanta-modal-card score-studio-modal-card">
+      <div class="score-studio-topbar">
+        <div class="score-brand-col">
+          <div class="score-title-row">
+            <h3 id="scoreStudioTitle" class="vanta-modal-title flow-studio-heading">Score Studio</h3>
+            <span id="scoreEngineBadge" class="flow-dag-badge ok">HTDemucs (MIT) + Basic Pitch Ready</span>
+          </div>
+          <div class="score-track-subrow">
+            <span id="scoreTrackTitle" class="score-track-name">No Track Selected</span>
+            <span id="scoreTrackMeta" class="score-track-meta">Select a track to extract notes &amp; chords</span>
+          </div>
+        </div>
+
+        <div class="score-top-controls">
+          <div id="scoreModeGroup" class="segmented-group" title="Transcription Engine Mode">
+            <button type="button" class="seg-btn active" data-score-mode="htdemucs">🎛️ HTDemucs 4-Stem</button>
+            <button type="button" class="seg-btn" data-score-mode="direct">⚡ Fast Direct</button>
+          </div>
+
+          <div id="scoreStemsWrap" class="score-stems-group" title="Select separated stems to transcribe">
+            <button type="button" class="chip on active" data-score-stem="other">Keys/Guitar</button>
+            <button type="button" class="chip" data-score-stem="vocals">Vocals</button>
+            <button type="button" class="chip" data-score-stem="bass">Bass</button>
+          </div>
+
+          <div id="scoreFocusWrap" class="score-focus-wrap hidden">
+            <select id="scoreFocusSelect" class="filter-select" aria-label="Direct Acoustic Focus">
+              <option value="solo">Solo / Piano</option>
+              <option value="melody">Lead Melody</option>
+              <option value="chords">Accompaniment / Chords</option>
+              <option value="bass">Bassline</option>
+              <option value="full">Full Mix</option>
+            </select>
+          </div>
+
+          <div id="scoreWindowWrap" class="score-window-group" title="Analysis time window (up to 8:00 max per pass for long tracks)">
+            <span class="score-window-lbl">Range</span>
+            <input id="scoreWinStartInput" data-testid="score-win-start" type="text" class="filter-num score-win-input" value="0:00" aria-label="Analysis window start time" title="Start time (mm:ss or hh:mm:ss)" />
+            <span class="score-window-sep">–</span>
+            <input id="scoreWinEndInput" data-testid="score-win-end" type="text" class="filter-num score-win-input" value="8:00" aria-label="Analysis window end time" title="End time (max 8:00 per pass)" />
+            <button id="btnScoreWinCursor" data-testid="score-win-cursor-btn" type="button" class="btn btn-ghost score-mini-btn" title="Anchor window start to current playhead position">Cursor</button>
+            <span id="scoreWindowCapBadge" class="score-win-badge hidden" title="Track exceeds 8:00 max analysis window; pick any Start–End slice">Max 8:00</span>
+          </div>
+
+          <button id="btnScoreDownloadModel" type="button" class="btn btn-ghost explorer-hdr-btn hidden" title="Download MIT HTDemucs weights (165 MB)">⬇ HTDemucs Model</button>
+          <button id="btnScoreAnalyze" data-testid="score-analyze-btn" type="button" class="btn btn-primary explorer-hdr-btn">▶ Analyze Track</button>
+          <button id="btnScoreReanalyze" type="button" class="btn btn-ghost explorer-hdr-btn" title="Force fresh re-analysis ignoring cache">⟳ Re-Analyze</button>
+          <button id="btnScoreCancel" type="button" class="btn btn-ghost btn-danger-ghost explorer-hdr-btn hidden">✕ Cancel</button>
+          <button id="btnScoreMaximizeWin" type="button" class="btn btn-ghost btn-dsp-close" title="Maximize / Restore Window" aria-label="Maximize Window">⛶</button>
+          <button id="btnCloseScoreStudio" type="button" class="btn btn-ghost btn-dsp-close" aria-label="Close Score Studio">✕</button>
+        </div>
+      </div>
+
+      <div id="scoreProgressWrap" class="score-progress-wrap hidden">
+        <div class="score-progress-track">
+          <div id="scoreProgressFill" class="score-progress-fill"></div>
+        </div>
+        <span id="scoreProgressLabel" class="score-progress-label">Preparing...</span>
+      </div>
+
+      <!-- Instant Live Theory & Practice Toolbar -->
+      <div class="score-controls-ribbon">
+        <label class="score-ctrl-item" title="Suppress octave &amp; fifth harmonic ghost notes cleanly">
+          <span>Harmonic Filter</span>
+          <input id="scoreHarmonicSlider" type="range" min="0" max="100" value="65" />
+          <span id="scoreHarmonicVal" class="score-ctrl-val">65%</span>
+        </label>
+
+        <label class="score-ctrl-item" title="Minimum note confidence amplitude threshold">
+          <span>Confidence</span>
+          <input id="scoreConfidenceSlider" type="range" min="15" max="85" value="32" />
+          <span id="scoreConfidenceVal" class="score-ctrl-val">0.32</span>
+        </label>
+
+        <div class="score-ctrl-item">
+          <span>BPM</span>
+          <input id="scoreBpmInput" type="number" min="40" max="220" value="100" class="filter-num score-bpm-num" aria-label="Score BPM" />
+          <button id="btnScoreHalfBpm" type="button" class="btn btn-ghost score-mini-btn" title="Half Tempo (÷2)">÷2</button>
+          <button id="btnScoreDoubleBpm" type="button" class="btn btn-ghost score-mini-btn" title="Double Tempo (×2)">×2</button>
+        </div>
+
+        <label class="score-ctrl-item">
+          <span>Meter</span>
+          <select id="scoreMeterSelect" class="filter-select" aria-label="Time Signature">
+            <option value="">Auto</option>
+            <option value="4/4">4/4</option>
+            <option value="3/4">3/4</option>
+            <option value="6/8">6/8</option>
+            <option value="12/8">12/8</option>
+          </select>
+        </label>
+
+        <label class="score-ctrl-item">
+          <span>Key</span>
+          <select id="scoreKeySelect" class="filter-select" aria-label="Musical Key">
+            <option value="">Auto</option>
+            <option value="C maj">C maj</option>
+            <option value="G maj">G maj</option>
+            <option value="D maj">D maj</option>
+            <option value="A maj">A maj</option>
+            <option value="E maj">E maj</option>
+            <option value="F maj">F maj</option>
+            <option value="Bb maj">Bb maj</option>
+            <option value="A min">A min</option>
+            <option value="E min">E min</option>
+            <option value="B min">B min</option>
+            <option value="F# min">F# min</option>
+            <option value="C# min">C# min</option>
+            <option value="D min">D min</option>
+            <option value="G min">G min</option>
+            <option value="C min">C min</option>
+          </select>
+        </label>
+
+        <label class="score-ctrl-item">
+          <span>Hands</span>
+          <select id="scoreSplitSelect" class="filter-select" aria-label="Grand Staff Hand Split">
+            <option value="smart">Smart DP Split</option>
+            <option value="fixed">Fixed C4 Split</option>
+            <option value="treble-only">Treble Only</option>
+            <option value="bass-only">Bass Only</option>
+          </select>
+        </label>
+
+        <label class="score-ctrl-item">
+          <span>Transpose</span>
+          <select id="scoreTransposeSelect" class="filter-select" aria-label="Transpose Semitones">
+            <option value="-5">-5 st</option>
+            <option value="-4">-4 st</option>
+            <option value="-3">-3 st</option>
+            <option value="-2">-2 st</option>
+            <option value="-1">-1 st</option>
+            <option value="0" selected>0 st</option>
+            <option value="1">+1 st</option>
+            <option value="2">+2 st</option>
+            <option value="3">+3 st</option>
+            <option value="4">+4 st</option>
+            <option value="5">+5 st</option>
+          </select>
+        </label>
+
+        <div id="scoreAuditionGroup" class="segmented-group" title="Compare Original Audio vs Extracted MIDI Synth">
+          <button type="button" class="seg-btn active" data-audition="original">Original</button>
+          <button type="button" class="seg-btn" data-audition="mix">Mix + Synth</button>
+          <button type="button" class="seg-btn" data-audition="synth">MIDI Solo</button>
+        </div>
+
+        <div id="scoreSpeedGroup" class="segmented-group" title="Pitch-Preserving Practice Speed">
+          <button type="button" class="seg-btn" data-speed="0.5">0.5x</button>
+          <button type="button" class="seg-btn" data-speed="0.75">0.75x</button>
+          <button type="button" class="seg-btn active" data-speed="1">1.0x</button>
+        </div>
+      </div>
+
+      <!-- Main Score + Piano Roll Body -->
+      <div class="score-studio-body">
+        <div class="score-sheet-pane">
+          <div class="score-pane-hdr">
+            <div class="score-page-controls">
+              <button id="btnScorePrevPage" type="button" class="btn btn-ghost score-mini-btn">‹ Prev</button>
+              <span id="scorePageLabel" class="score-page-label">Bars --</span>
+              <button id="btnScoreNextPage" type="button" class="btn btn-ghost score-mini-btn">Next ›</button>
+              <button id="btnScoreAutoFollow" type="button" class="chip on active" title="Auto-turn score pages during playback">Auto-Follow</button>
+            </div>
+            <span id="scoreStatsSummary" class="score-stats-summary">No transcription loaded for this track</span>
+          </div>
+          <div id="scoreSheetContainer" data-testid="score-sheet-container" class="score-sheet-container"></div>
+        </div>
+
+        <div class="score-roll-pane">
+          <div class="score-pane-hdr">
+            <span class="score-roll-title">Piano Roll · Click note to audition · Click ruler to seek · Shift+Click bar to loop</span>
+            <div class="score-loop-controls">
+              <span id="scoreInspectorTip" class="score-inspector-tip"></span>
+              <span id="scoreLoopLabel" class="score-loop-label">Shift+Click bar to loop A–B</span>
+              <button id="btnScoreClearLoop" type="button" class="btn btn-ghost score-mini-btn" disabled>Clear Loop</button>
+            </div>
+          </div>
+          <div class="score-roll-canvas-wrap">
+            <canvas id="scorePianoRollCanvas" data-testid="score-piano-roll-canvas"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-studio-footer">
+        <button id="btnScorePlayToggle" type="button" class="btn btn-primary">▶ Play / Pause</button>
+        <div class="flow-footer-actions">
+          <button id="btnExportScorePdf" type="button" class="btn btn-ghost" disabled>⬇ Export .pdf</button>
+          <button id="btnExportScoreMidi" type="button" class="btn btn-ghost" disabled>⬇ Export .mid</button>
+          <button id="btnExportScoreXml" type="button" class="btn btn-ghost" disabled>⬇ Export .musicxml</button>
+          <button id="btnExportScoreAudio" type="button" class="btn btn-ghost" disabled>⬇ Export Audio</button>
+          <button id="btnExportScoreSvg" type="button" class="btn btn-ghost" disabled>⬇ Export .svg</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="./vendor/vexflow-bravura.js"></script>
   <script type="module" src="./js/app.js"></script>
 </body>
 </html>

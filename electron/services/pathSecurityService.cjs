@@ -9,6 +9,7 @@ const SACD_ISO_EXTENSIONS = new Set(['.iso']);
 const PEQ_TXT_EXTENSIONS = new Set(['.txt']);
 const CONVOLVER_IR_EXTENSIONS = new Set(['.wav']);
 const PLAYLIST_EXTENSIONS = new Set(['.m3u8', '.m3u']);
+const SCORE_EXPORT_EXTENSIONS = new Set(['.mid', '.musicxml', '.svg', '.pdf', '.wav', '.mp3']);
 
 const WINDOWS_RESERVED_DEVICE_RE = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i;
 
@@ -19,6 +20,8 @@ const VAULT_SUBFOLDER_MAP = Object.freeze({
   covers: 'Covers',
   'covers/playlists': path.join('Covers', 'playlists'),
   exports: 'Exports',
+  scores: 'Scores',
+  models: 'Models',
   logs: 'logs'
 });
 
@@ -355,6 +358,7 @@ module.exports = {
   PEQ_TXT_EXTENSIONS,
   CONVOLVER_IR_EXTENSIONS,
   PLAYLIST_EXTENSIONS,
+  SCORE_EXPORT_EXTENSIONS,
   VAULT_SUBFOLDER_MAP,
   hasSafePathSyntax,
   canonicalizePath,

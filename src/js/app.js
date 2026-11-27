@@ -40,6 +40,7 @@ import {
 import { CAMELOT_KEY_MAP } from './mirAnalyzer.js';
 import { executeFlowGraph } from './playlistFlowEngine.js';
 import { FlowStudioController } from './flowStudioUI.js';
+import { ScoreStudioController } from './scoreStudioUI.js';
 
 const REKORDBOX_COLUMNS = [
   { id: 'num', label: '#', width: 32, minWidth: 28, locked: true, defaultVisible: true, sortAsc: '', sortDesc: '' },
@@ -187,6 +188,17 @@ class VantaStudioApp {
       onToggleMaximizeWin: () => window.vantaAPI?.windowControl?.('maximize'),
       onToast: (msg) => this.setToast(msg)
     });
+    this.scoreStudio = new ScoreStudioController({
+      getActiveTrack: () => this.currentLoadedTrack || this.displayedTracks[this.activeTrackIndex] || null,
+      getPositionSec: () => Math.max(0, Number(this._lastTimelinePosSec) || 0),
+      togglePlay: () => this.togglePlay(),
+      seekToSeconds: (sec, triggerPlay) => this.seekToSeconds(sec, triggerPlay),
+      setPracticePlaybackRate: (rate) => this.setPracticePlaybackRate(rate),
+      setScoreMuteOriginal: (muted) => this.setScoreMuteOriginal(muted),
+      onToast: (msg) => this.setToast(msg)
+    });
+    this._lastTimelinePosSec = 0;
+    this._scoreMuteOriginal = false;
     this.activeTrackTags = null;
     this.lastReplayGainInfo = null;
     this.sacdVirtualTracks = [];
@@ -2044,6 +2056,7 @@ class VantaStudioApp {
   updateTimelineUi(positionSec, durationSec) {
     if (!Number.isFinite(durationSec) || durationSec <= 0) return;
     const safePos = Math.max(0, Number(positionSec) || 0);
+    this._lastTimelinePosSec = safePos;
     const totalSec = Math.max(durationSec, safePos);
     const ratio = Math.max(0, Math.min(1, safePos / totalSec));
     this.visualizer.setProgress(ratio);
@@ -2059,6 +2072,7 @@ class VantaStudioApp {
     const remEl = document.getElementById('timeRemainingLabel');
     if (elEl) elEl.textContent = `${String(Math.floor(cur / 60)).padStart(2, '0')}:${String(cur % 60).padStart(2, '0')}`;
     if (remEl) remEl.textContent = `-${String(Math.floor(rem / 60)).padStart(2, '0')}:${String(rem % 60).padStart(2, '0')}`;
+    this.scoreStudio?.syncPlayhead(safePos);
   }
 
   /**
@@ -3892,6 +3906,8 @@ class VantaStudioApp {
       }
     }
     this.currentLoadedTrack = incomingTrack;
+    this._lastTimelinePosSec = 0;
+    void this.scoreStudio?.onTrackChanged(incomingTrack).catch(() => {});
     if (prevKey !== incomingKey) {
       this._pausedTrackKey = null;
     }
@@ -4421,6 +4437,10 @@ class VantaStudioApp {
   handleSidebarSwitch(navId) {
     if (navId === 'explorer') {
       void this.toggleComputerExplorer().catch(() => {});
+      return;
+    }
+    if (navId === 'score') {
+      void this.scoreStudio?.open(this.currentLoadedTrack || this.displayedTracks[this.activeTrackIndex] || null).catch(() => {});
       return;
     }
     this.activeNav = navId;
@@ -8465,25 +8485,10 @@ class VantaStudioApp {
 
     const seekToRatio = (ratio, triggerPlay = true) => {
       const clamped = Math.max(0.0, Math.min(0.995, ratio));
-      const track = this.displayedTracks[this.activeTrackIndex];
       const totalSec = getActiveTotalDuration();
-      const targetSec = totalSec * clamped;
-      this.updateTimelineUi(targetSec, totalSec);
-
-      if (this.engineMode === 'wasapi' && window.vantaAPI && track?.filePath && !track.isVideo) {
-        this.wasapiCurrentPositionSec = targetSec;
-        this.wasapiResumeSec = targetSec;
-        this.wasapiPausedTrackKey = this._getTrackUniqueKey(track);
-        if (triggerPlay && this.isPlaying) {
-          void this.startPlayback(targetSec).catch(() => {});
-        }
-        return;
-      }
-
-      if (track) {
-        this._seekStudioMedia(track, targetSec, triggerPlay);
-      }
+      this.seekToSeconds(totalSec * clamped, triggerPlay);
     };
+    this._getActiveTotalDuration = getActiveTotalDuration;
 
     const timelineTrack = document.getElementById('masterTimelineTrack');
     const hoverTip = document.getElementById('timelineHoverTip');
@@ -9401,6 +9406,71 @@ class VantaStudioApp {
     } else {
       this.updateBatchProgressRing(100, '100% Saved');
       this.setToast(`Completed: ${okCount}/${parsed.totalCount} track(s) tagged with ID3v2 & saved to C:\\Vanta\\VantaVault`);
+    }
+  }
+
+  /**
+   * Seeks active playback (WASAPI Exclusive or Studio DSP) to an exact timestamp in seconds.
+   * Used by both the master timeline scrubber and Score Studio measure click / A-B loop.
+   * @param {number} targetSec - Target position in seconds.
+   * @param {boolean} [triggerPlay=true] - Resume playback if currently active.
+   */
+  seekToSeconds(targetSec, triggerPlay = true) {
+    const track = this.displayedTracks[this.activeTrackIndex] || this.currentLoadedTrack;
+    const totalSec = this._getActiveTotalDuration ? this._getActiveTotalDuration() : (Number(track?.durationSec) || 232);
+    const clampedSec = Math.max(0, Math.min(Math.max(0.5, totalSec - 0.1), Number(targetSec) || 0));
+    this.updateTimelineUi(clampedSec, totalSec);
+
+    if (this.engineMode === 'wasapi' && window.vantaAPI && track?.filePath && !track.isVideo) {
+      this.wasapiCurrentPositionSec = clampedSec;
+      this.wasapiResumeSec = clampedSec;
+      this.wasapiPausedTrackKey = this._getTrackUniqueKey(track);
+      if (triggerPlay && this.isPlaying) {
+        void this.startPlayback(clampedSec).catch(() => {});
+      }
+      return;
+    }
+
+    if (track) {
+      this._seekStudioMedia(track, clampedSec, triggerPlay);
+    }
+  }
+
+  /**
+   * Sets pitch-preserving practice playback speed for Score Studio Practice Mode.
+   * @param {number} rate - Speed multiplier in [0.5, 1.5].
+   */
+  setPracticePlaybackRate(rate) {
+    const next = Math.max(0.5, Math.min(1.5, Number(rate) || 1.0));
+    this.audioEngine.state.playbackRate = next;
+    if (Math.abs(next - 1.0) > 0.001 && this.engineMode === 'wasapi') {
+      void this.setEngineMode('dsp', true).catch(() => {});
+    }
+    [this.audioEl, this.deckBEl, this.videoEl].forEach((deck) => {
+      if (!deck) return;
+      deck.preservesPitch = true;
+      deck.playbackRate = next;
+    });
+    const speedBtn = document.getElementById('btnPlaybackSpeed');
+    if (speedBtn) speedBtn.textContent = `${next.toFixed(2)}x`;
+  }
+
+  /**
+   * Temporarily mutes/unmutes original track audio during Score Studio MIDI Solo auditioning.
+   * @param {boolean} muted - True to silence original audio while keeping clock running.
+   */
+  setScoreMuteOriginal(muted) {
+    this._scoreMuteOriginal = Boolean(muted);
+    const effectiveMuted = this.isMuted || this._scoreMuteOriginal;
+    const volMode = this.audioEngine?.state?.volumeMode || 'auto';
+    const studioVol = volMode === 'fixed0db'
+      ? (effectiveMuted ? 0 : 1.0)
+      : (effectiveMuted ? 0 : this.masterVolumeLinear);
+    this.audioEngine.setVolume(studioVol);
+
+    if (this.engineMode === 'wasapi' && this.isPlaying && window.vantaAPI) {
+      const gain = effectiveMuted ? 0 : this.getEffectiveWasapiGain();
+      window.vantaAPI.wasapiCmd(`GAIN ${gain.toFixed(4)}`).catch(() => {});
     }
   }
 }

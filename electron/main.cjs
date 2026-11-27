@@ -2,6 +2,7 @@
 
 const path = require('node:path');
 const fs = require('node:fs');
+const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const {
   app,
@@ -26,6 +27,7 @@ const {
   PEQ_TXT_EXTENSIONS,
   CONVOLVER_IR_EXTENSIONS,
   PLAYLIST_EXTENSIONS,
+  SCORE_EXPORT_EXTENSIONS,
   hasSafePathSyntax,
   canonicalizePath,
   resolveSafeVaultSubfolder,
@@ -58,6 +60,13 @@ const {
   NativeWasapiPlayer,
   WindowsVolumeBridge
 } = require('./services/audioBridgeService.cjs');
+const {
+  getTranscriptionEngineStatus,
+  getCachedTranscription,
+  cancelTranscriptionJob,
+  ensureHtdemucsModel,
+  transcribeAudioFile
+} = require('./services/transcriptionService.cjs');
 const { updateMp3MetadataOnDisk, updateFlacVorbisTagsOnDisk } = require('./services/id3Service.cjs');
 const {
   parseYouTubeInputs,
@@ -229,10 +238,22 @@ function ensureVaultDirectories() {
     path.join(VAULT_ROOT, 'Local'),
     path.join(VAULT_ROOT, 'Covers', 'playlists'),
     path.join(VAULT_ROOT, 'Exports'),
+    path.join(VAULT_ROOT, 'Scores'),
+    path.join(VAULT_ROOT, 'Models'),
     path.join(VAULT_ROOT, 'logs')
   ];
   for (const d of dirs) {
     fs.mkdirSync(d, { recursive: true });
+  }
+}
+
+/**
+ * Helper to broadcast transcription / HTDemucs progress to the renderer window.
+ * @param {object} progressData - `{ jobId, stage, pct, detail }`.
+ */
+function sendTranscriptionProgress(progressData) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('vanta:transcription-progress', progressData);
   }
 }
 
@@ -1114,6 +1135,241 @@ function registerIpcHandlers() {
     } catch (err) {
       logger.error('FlowExporter', 'Failed writing M3U8 playlist file', { error: err.message });
       return { canceled: false, ok: false, error: err.message || 'Could not write playlist file.' };
+    }
+  });
+
+  registerSecureIpcHandler('vanta:get-score-engine-status', () => {
+    return getTranscriptionEngineStatus(VAULT_ROOT);
+  });
+
+  registerSecureIpcHandler('vanta:ensure-htdemucs-model', async () => {
+    try {
+      return await ensureHtdemucsModel(VAULT_ROOT, (prog) => {
+        sendTranscriptionProgress({
+          jobId: 'model-download',
+          stage: 'model',
+          pct: prog.pct,
+          detail: `Downloading MIT HTDemucs weights (${Math.round(prog.downloadedBytes / 1048576)} / ${Math.round(prog.totalBytes / 1048576)} MB)`
+        });
+      });
+    } catch (err) {
+      logger.error('Transcription', 'Failed ensuring HTDemucs model', { error: err.message });
+      return { ok: false, error: err.message };
+    }
+  });
+
+  registerSecureIpcHandler('vanta:get-cached-score', (_event, payload = {}) => {
+    const safeMedia = resolveAuthorizedFile(payload?.filePath, ALL_MEDIA_EXTENSIONS);
+    if (!safeMedia) return null;
+    return getCachedTranscription(safeMedia, payload, VAULT_ROOT);
+  });
+
+  registerSecureIpcHandler('vanta:transcribe-track', async (_event, payload = {}) => {
+    const safeMedia = resolveAuthorizedFile(payload?.filePath, ALL_MEDIA_EXTENSIONS);
+    if (!safeMedia) {
+      return { ok: false, error: 'Unauthorized or missing media file path.' };
+    }
+    try {
+      const result = await transcribeAudioFile(safeMedia, {
+        jobId: payload?.jobId,
+        mode: payload?.mode === 'htdemucs' ? 'htdemucs' : 'direct',
+        focusProfile: payload?.focusProfile || 'solo',
+        stems: Array.isArray(payload?.stems) ? payload.stems : ['other'],
+        startSec: Number(payload?.startSec) || 0,
+        durationSec: Number(payload?.durationSec) || 0,
+        force: Boolean(payload?.force),
+        vaultRoot: VAULT_ROOT,
+        onProgress: (prog) => sendTranscriptionProgress(prog)
+      });
+      return { ok: true, result };
+    } catch (err) {
+      logger.error('Transcription', 'Transcription failed', { filePath: safeMedia, error: err.message });
+      return { ok: false, error: err.message || 'Transcription failed' };
+    }
+  });
+
+  registerSecureIpcHandler('vanta:cancel-transcription', (_event, payload = {}) => {
+    const cancelled = cancelTranscriptionJob(payload?.jobId);
+    return { ok: true, cancelled };
+  });
+
+  registerSecureIpcHandler('vanta:export-score', async (_event, payload = {}) => {
+    if (!mainWindow) return { canceled: true, ok: false };
+    const format = String(payload?.format || 'midi').toLowerCase();
+    const formatMeta = {
+      midi: {
+        ext: 'mid',
+        filters: [{ name: 'Standard MIDI File', extensions: ['mid'] }]
+      },
+      musicxml: {
+        ext: 'musicxml',
+        filters: [{ name: 'MusicXML 4.0 Score', extensions: ['musicxml'] }]
+      },
+      svg: {
+        ext: 'svg',
+        filters: [{ name: 'Scalable Vector Sheet Music', extensions: ['svg'] }]
+      },
+      pdf: {
+        ext: 'pdf',
+        filters: [{ name: 'Print-Ready Sheet Music PDF', extensions: ['pdf'] }]
+      },
+      audio: {
+        ext: 'mp3',
+        filters: [
+          { name: 'MP3 Practice Audio (*.mp3)', extensions: ['mp3'] },
+          { name: 'Lossless PCM WAV (*.wav)', extensions: ['wav'] }
+        ]
+      }
+    }[format];
+    if (!formatMeta) {
+      return { canceled: false, ok: false, error: 'Unsupported score export format.' };
+    }
+
+    const rawName = String(payload?.title || 'VANTA_Score').trim();
+    let safeSlug = rawName.replace(/[^a-zA-Z0-9._-]+/g, '_');
+    while (safeSlug.startsWith('_')) safeSlug = safeSlug.slice(1);
+    while (safeSlug.endsWith('_')) safeSlug = safeSlug.slice(0, -1);
+    if (!safeSlug) safeSlug = 'VANTA_Score';
+
+    const exportsDir = path.join(VAULT_ROOT, 'Exports');
+    fs.mkdirSync(exportsDir, { recursive: true });
+
+    const saveRes = await dialog.showSaveDialog(mainWindow, {
+      title: `Export VANTA Score (.${formatMeta.ext})`,
+      defaultPath: path.join(exportsDir, `${safeSlug}.${formatMeta.ext}`),
+      filters: formatMeta.filters
+    });
+    if (saveRes.canceled || !saveRes.filePath) {
+      return { canceled: true, ok: false };
+    }
+
+    const safeOutPath = validateSafeFilePath(saveRes.filePath, {
+      allowedExtensions: SCORE_EXPORT_EXTENSIONS,
+      mustExist: false
+    });
+    if (!safeOutPath) {
+      logger.warn('ScoreExporter', 'Rejected unsafe score export path', { targetPath: saveRes.filePath });
+      return { canceled: false, ok: false, error: 'Export path rejected by VANTA security policy.' };
+    }
+
+    try {
+      if (format === 'midi') {
+        const bytes = payload?.bytes instanceof Uint8Array || Buffer.isBuffer(payload?.bytes)
+          ? Buffer.from(payload.bytes)
+          : Array.isArray(payload?.bytes)
+            ? Buffer.from(payload.bytes)
+            : Buffer.from(String(payload?.base64 || ''), 'base64');
+        if (!bytes.length || bytes.length > 25 * 1024 * 1024) {
+          return { canceled: false, ok: false, error: 'Invalid MIDI byte payload.' };
+        }
+        fs.writeFileSync(safeOutPath, bytes);
+      } else if (format === 'audio') {
+        const wavBuf = payload?.bytes instanceof Uint8Array || Buffer.isBuffer(payload?.bytes)
+          ? Buffer.from(payload.bytes)
+          : Array.isArray(payload?.bytes)
+            ? Buffer.from(payload.bytes)
+            : Buffer.alloc(0);
+        if (wavBuf.length < 44 || wavBuf.length > 150 * 1024 * 1024) {
+          return { canceled: false, ok: false, error: 'Invalid synthesized WAV audio payload.' };
+        }
+        const outExt = path.extname(safeOutPath).toLowerCase();
+        if (outExt === '.wav') {
+          fs.writeFileSync(safeOutPath, wavBuf);
+        } else {
+          const ffmpegBin = resolveFfmpegBinary();
+          if (!ffmpegBin) {
+            return { canceled: false, ok: false, error: 'FFmpeg binary not found for MP3 encoding.' };
+          }
+          const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-score-audio-'));
+          const tmpWav = path.join(tmpDir, 'render.wav');
+          try {
+            fs.writeFileSync(tmpWav, wavBuf);
+            await new Promise((resolve, reject) => {
+              execFile(
+                ffmpegBin,
+                ['-hide_banner', '-loglevel', 'error', '-y', '-i', tmpWav, '-codec:a', 'libmp3lame', '-b:a', '192k', safeOutPath],
+                { timeout: 60000, windowsHide: true },
+                (err) => (err ? reject(err) : resolve())
+              );
+            });
+          } finally {
+            try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+          }
+        }
+      } else if (format === 'pdf') {
+        const svgPages = Array.isArray(payload?.svgPages) ? payload.svgPages.filter((s) => typeof s === 'string' && s.includes('<svg')) : [];
+        if (!svgPages.length || svgPages.length > 200) {
+          return { canceled: false, ok: false, error: 'No score pages supplied for PDF export.' };
+        }
+        const escHtml = (s) =>
+          String(s || '')
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#39;');
+        const sanitizeSvg = (raw) =>
+          String(raw || '')
+            .replace(/<script[\s\S]*?<\/script>/gi, '')
+            .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, '')
+            .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+
+        const safeTitle = escHtml(payload?.title || 'VANTA Score');
+        const safeArtist = escHtml(payload?.artist || 'VANTA Score Studio');
+        const safeMeta = escHtml(payload?.metaLine || '');
+        const totalPages = svgPages.length;
+        const pageSections = svgPages
+          .map((svgStr, idx) => {
+            const hdr =
+              idx === 0
+                ? `<div class="doc-hdr"><div class="doc-title">${safeTitle}</div><div class="doc-sub">${safeArtist}${safeMeta ? ` · ${safeMeta}` : ''}</div></div>`
+                : `<div class="page-hdr"><span>${safeTitle}</span><span>${safeMeta}</span></div>`;
+            return `<section class="print-page${idx === totalPages - 1 ? ' last' : ''}">${hdr}<div class="svg-wrap">${sanitizeSvg(svgStr)}</div><div class="page-ftr"><span>VANTA Score Studio</span><span>Page ${idx + 1} / ${totalPages}</span></div></section>`;
+          })
+          .join('');
+
+        const printHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';"><style>@page{size:A4 portrait;margin:10mm 11mm;}*{box-sizing:border-box;margin:0;padding:0;}body{background:#fff;color:#0f172a;font-family:'Segoe UI',Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact;}.print-page{display:flex;flex-direction:column;min-height:273mm;page-break-after:always;}.print-page.last{page-break-after:auto;}.doc-hdr{text-align:center;padding-bottom:6px;margin-bottom:8px;border-bottom:1.5px solid #cbd5e1;}.doc-title{font-size:20px;font-weight:700;letter-spacing:-0.01em;color:#0f172a;}.doc-sub{font-size:11px;color:#475569;margin-top:2px;}.page-hdr,.page-ftr{display:flex;justify-content:space-between;font-size:9.5px;color:#64748b;padding:2px 0;}.page-hdr{border-bottom:1px solid #e2e8f0;margin-bottom:6px;}.svg-wrap{flex:1 1 auto;}.svg-wrap svg{width:100%;height:auto;display:block;}.page-ftr{border-top:1px solid #e2e8f0;margin-top:auto;padding-top:4px;}</style></head><body>${pageSections}</body></html>`;
+
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-score-pdf-'));
+        const tmpHtml = path.join(tmpDir, 'score_print.html');
+        let printWin = null;
+        try {
+          fs.writeFileSync(tmpHtml, printHtml, 'utf8');
+          printWin = new BrowserWindow({
+            show: false,
+            width: 960,
+            height: 1280,
+            webPreferences: {
+              javascript: false,
+              sandbox: true,
+              contextIsolation: true,
+              nodeIntegration: false,
+              webSecurity: true
+            }
+          });
+          await printWin.loadFile(tmpHtml);
+          const pdfBuf = await printWin.webContents.printToPDF({
+            printBackground: true,
+            pageSize: 'A4',
+            margins: { top: 0, bottom: 0, left: 0, right: 0 }
+          });
+          fs.writeFileSync(safeOutPath, pdfBuf);
+        } finally {
+          if (printWin && !printWin.isDestroyed()) printWin.destroy();
+          try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+        }
+      } else {
+        const text = String(payload?.text || '');
+        if (!text || text.length > 50 * 1024 * 1024) {
+          return { canceled: false, ok: false, error: 'Invalid score text payload.' };
+        }
+        fs.writeFileSync(safeOutPath, text, 'utf8');
+      }
+      logger.info('ScoreExporter', `Exported ${path.extname(safeOutPath)} score to ${safeOutPath}`);
+      return { canceled: false, ok: true, filePath: safeOutPath };
+    } catch (err) {
+      logger.error('ScoreExporter', 'Failed writing score export file', { error: err.message });
+      return { canceled: false, ok: false, error: err.message || 'Could not write score export file.' };
     }
   });
 
